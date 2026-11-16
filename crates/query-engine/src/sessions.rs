@@ -104,6 +104,9 @@ impl QueryEngine {
         let session: Arc<dyn Session> = match connected {
             Ok(s) => {
                 tracing::info!(connection = connection_id, ?kind, tab = tab_id, sandbox, ms = started.elapsed().as_millis() as u64, "connected");
+                if let Some(f) = s.detected_flavor() {
+                    self.remember_flavor(connection_id, f);
+                }
                 Arc::from(s)
             }
             Err(e) => {
@@ -449,6 +452,23 @@ impl QueryEngine {
     pub fn leave_tab(&self, tab_id: &str) {
         self.outputs.leave_tab(tab_id);
         self.outputs_changed();
+    }
+
+    /// Record a flavor the server revealed on the connection (its `flavor`
+    /// option, e.g. `redshift` behind a DNS alias): the AI policy and the
+    /// form read it from the configuration (a Redshift read-only session
+    /// isn't taken as enforced by the server).
+    pub(crate) fn remember_flavor(&self, connection_id: &str, flavor: &str) {
+        let ws = self.workspace();
+        let Ok(mut p) = ws.get_connection(connection_id) else { return };
+        if p.config.opt("flavor").is_some_and(|f| f.eq_ignore_ascii_case(flavor)) {
+            return;
+        }
+        p.config.options.insert("flavor".into(), flavor.into());
+        match ws.save_connection(p) {
+            Ok(_) => tracing::info!(connection = connection_id, flavor, "server flavor recorded on the connection"),
+            Err(e) => tracing::warn!(connection = connection_id, flavor, error = %e, "could not record the server's flavor"),
+        }
     }
 
     /// Close the database sessions of a run key (keeps its outputs).

@@ -2,8 +2,10 @@
 
 use crate::config::Conn;
 use crate::error::map_err;
+use crate::types::MONEY_NOTICE;
 use crate::types::col_type;
 use crate::types::convert_typed;
+use crate::types::money_exact;
 use databrain_connector_core::BatchBuilder;
 use databrain_connector_core::ConnState;
 use databrain_connector_core::ConnectorKind;
@@ -123,6 +125,8 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
     let mut builder: Option<BatchBuilder> = None;
     // Per column: money (the driver's float is turned back into exact text).
     let mut money: Vec<bool> = Vec::new();
+    // A money value too large to come through the driver exactly: said once.
+    let mut money_inexact = false;
     let mut extra_sets = 0usize;
     let mut rows = 0usize;
     let max = opts.max_rows.unwrap_or(usize::MAX);
@@ -154,13 +158,22 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
                     continue;
                 }
                 let Some(b) = builder.as_mut() else { continue };
-                b.push_row(row.into_iter().enumerate().map(|(i, v)| convert_typed(v, money.get(i).copied().unwrap_or(false))));
+                b.push_row(row.into_iter().enumerate().map(|(i, v)| {
+                    let m = money.get(i).copied().unwrap_or(false);
+                    if m && matches!(&v, tiberius::ColumnData::F64(Some(f)) if !money_exact(*f)) {
+                        money_inexact = true;
+                    }
+                    convert_typed(v, m)
+                }));
                 rows += 1;
                 if rows >= max {
                     // The caller keeps no more rows.
                     let last = if b.is_empty() { None } else { Some(b.finish()?) };
                     for n in b.notices(None) {
                         tx.send(StreamEvent::Notice(n)).await;
+                    }
+                    if money_inexact {
+                        tx.send(StreamEvent::Notice(MONEY_NOTICE.into())).await;
                     }
                     if limit.abandon {
                         return Ok(Ended::Stopped { last, unread: true });
@@ -190,6 +203,9 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
     }
     for n in builder.as_ref().map(|b| b.notices(None)).unwrap_or_default() {
         tx.send(StreamEvent::Notice(n)).await;
+    }
+    if money_inexact {
+        tx.send(StreamEvent::Notice(MONEY_NOTICE.into())).await;
     }
     if extra_sets > 0 {
         tx.send(StreamEvent::Notice(format!("{extra_sets} additional result set(s) not shown"))).await;

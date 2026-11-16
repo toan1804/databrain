@@ -310,6 +310,100 @@ mod tests {
         assert_eq!(r.num_rows(), 1);
     }
 
+    /// A fake server that records each request. A query gets a header and
+    /// `rows` rows: all of them at once (the result ends), or with `slow`,
+    /// three and then nothing for a while (the query still running).
+    fn recording_server(rows: usize, slow: bool) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let log = log.clone();
+                // One thread per request: a KILL comes while the query streams.
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    let mut b = [0u8; 4096];
+                    loop {
+                        let Ok(n) = c.read(&mut b) else { return };
+                        req.extend_from_slice(&b[..n]);
+                        let text = String::from_utf8_lossy(&req).to_lowercase();
+                        let Some(end) = text.find("\r\n\r\n") else { continue };
+                        let len = text.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                        if n == 0 || req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&req).into_owned();
+                    log.lock().unwrap().push(req.clone());
+                    let whole = |c: &mut std::net::TcpStream, body: &str| {
+                        let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    };
+                    if req.contains("currentDatabase()") {
+                        return whole(&mut c, "currentDatabase()\nString\ndefault\n");
+                    }
+                    if req.contains("KILL QUERY") {
+                        return whole(&mut c, "");
+                    }
+                    let mut body = String::from("n\nUInt64\n");
+                    if !slow {
+                        for i in 0..rows {
+                            body.push_str(&format!("{i}\n"));
+                        }
+                        return whole(&mut c, &body);
+                    }
+                    let _ = write!(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                    body.push_str("0\n1\n2\n");
+                    let _ = write!(c, "{:x}\r\n{body}\r\n", body.len());
+                    let _ = c.flush();
+                    std::thread::sleep(Duration::from_secs(5));
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    async fn fake_session(port: u16) -> Box<dyn Session> {
+        use databrain_auth::InlineCredentialSource;
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user: "default".into() });
+        cfg.host = Some("127.0.0.1".into());
+        cfg.port = Some(port);
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "default".into() }, Some(secrecy::SecretString::from("pw"))));
+        ClickhouseConnector.connect(&cfg, creds).await.unwrap()
+    }
+
+    /// The query id a request was sent with.
+    fn query_id(req: &str) -> Option<String> {
+        let q = req.split_once("query_id=")?.1;
+        Some(q.split(['&', ' ']).next()?.to_string())
+    }
+
+    /// The row limit stops a query still running on the server (KILL QUERY
+    /// with its id), not only the reading; one whose result had ended isn't
+    /// killed.
+    #[tokio::test]
+    async fn the_row_limit_stops_the_query_on_the_server() {
+        let opts = || ExecOptions { max_rows: Some(2), ..Default::default() };
+        let (port, seen) = recording_server(3, true);
+        let s = fake_session(port).await;
+        let run = s.execute(databrain_connector_core::Statement::internal("SELECT number FROM numbers(1e12)"), opts()).await.unwrap().collect();
+        let r = tokio::time::timeout(Duration::from_secs(4), run).await.expect("not waiting for the rest").unwrap();
+        assert_eq!(r.num_rows(), 2);
+        let reqs = seen.lock().unwrap().clone();
+        let select = reqs.iter().find(|r| r.contains("numbers(1e12)")).and_then(|r| query_id(r)).unwrap();
+        let kill = reqs.iter().find(|r| r.contains("KILL QUERY")).expect("a KILL QUERY was sent");
+        assert!(kill.contains(&select) && !query_id(kill).is_some_and(|k| k == select), "killed by its id, from a request of its own: {kill}");
+
+        // Ended at the limit: nothing to stop.
+        let (port, seen) = recording_server(2, false);
+        let s = fake_session(port).await;
+        let r = s.execute(databrain_connector_core::Statement::internal("SELECT number FROM numbers(2)"), opts()).await.unwrap().collect().await.unwrap();
+        assert_eq!(r.num_rows(), 2);
+        assert!(!seen.lock().unwrap().iter().any(|r| r.contains("KILL QUERY")));
+    }
+
     /// Live test: set DATABRAIN_CLICKHOUSE_HOST (+ _PORT, _USER, _PASSWORD).
     #[ignore = "live: needs DATABRAIN_CLICKHOUSE_HOST (cargo test -- --ignored)"]
     #[tokio::test]

@@ -104,6 +104,15 @@ pub enum TxState {
 pub trait Session: Send + Sync {
     fn kind(&self) -> ConnectorKind;
 
+    /// A flavor the server revealed that the configuration didn't say
+    /// (Postgres: `redshift`, reached through a DNS alias, PrivateLink or a
+    /// tunnel). The engine records it on the connection (its `flavor`
+    /// option), so what depends on it (read-only not enforced by the
+    /// server) holds from then on.
+    fn detected_flavor(&self) -> Option<&'static str> {
+        None
+    }
+
     async fn server_version(&self) -> Result<String>;
 
     async fn ping(&self) -> Result<()>;

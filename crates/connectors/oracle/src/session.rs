@@ -670,11 +670,11 @@ mod tests {
         let r = exec("declare x number; begin for i in 1 .. 3000 loop dbms_output.put_line(rpad('x', 20, 'x') || i); end loop; end;").await.unwrap();
         assert_eq!(r.notices.len(), 1, "{driver}");
         assert_eq!(r.notices[0].lines().count(), 3000, "{driver}: lines over several reads");
-        // A line longer than one read holds: cut, marked, and the next one kept.
+        // The longest line DBMS_OUTPUT holds comes whole, and the next one after it.
         let r = exec("begin dbms_output.put_line(rpad('y', 32767, 'y')); dbms_output.put_line('next'); end;").await.unwrap();
         let lines: Vec<&str> = r.notices[0].lines().collect();
         assert!(
-            lines.len() == 2 && lines[0].ends_with('…') && lines[0].len() <= 8000 && lines[1] == "next",
+            lines.len() == 2 && lines[0].len() == 32767 && lines[0].bytes().all(|b| b == b'y') && lines[1] == "next",
             "{driver}: {:?}",
             lines.iter().map(|l| l.len()).collect::<Vec<_>>()
         );

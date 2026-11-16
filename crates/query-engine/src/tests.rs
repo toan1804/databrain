@@ -978,6 +978,34 @@ fn a_scripts_results_stay_near_the_budget() {
     assert!(kept <= 16 * MB + 10 * (64 << 10), "{} MB", kept / MB);
 }
 
+/// A script whose results are each cut at their memory cap (the run loop
+/// stops each statement's stream) runs every statement: the stop of one
+/// never reaches the next (SQLite's interrupt is for the whole connection).
+#[tokio::test(flavor = "multi_thread")]
+async fn results_cut_at_their_cap_dont_stop_the_next_statement() {
+    let f = fixture(EnvTag::Dev);
+    f.engine.outputs().set_budget(0); // the 16 MB floor
+    let one = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 100) select i, randomblob(100000) as b from n";
+    let sql = [one; 6].join(";\n");
+    for round in 0..10 {
+        let mut r = req(&f, &sql);
+        // Every other round each result is cut at once (a row limit of one).
+        r.row_limit = if round % 2 == 0 { None } else { Some(1) };
+        r.tab_id = format!("cut{round}");
+        let evs = tokio::time::timeout(Duration::from_secs(60), wait_job(&f, &started(f.engine.run(r).unwrap()))).await.expect("no hang");
+        let failed: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::StatementFailed { index, error, .. } => Some(format!("{index}: {}", error.message)),
+                _ => None,
+            })
+            .collect();
+        assert!(failed.is_empty(), "round {round}: {failed:?}");
+        let done = evs.iter().filter(|e| matches!(e, JobEvent::StatementFinished { result: Some(_), .. })).count();
+        assert_eq!(done, 6, "round {round}");
+    }
+}
+
 /// Lowering the budget frees older results at once (the latest of a tab stays).
 #[tokio::test]
 async fn a_lower_budget_frees_older_results() {
@@ -1314,4 +1342,26 @@ async fn rerunning_one_output_keeps_the_tabs_other_results() {
     let other = RunRequest { tab_id: "tab2".into(), ..req(&f, "select 1") };
     let e = f.engine.rerun_output(other, &after[0].handle).unwrap_err();
     assert!(e.message.contains("another tab"), "{}", e.message);
+}
+
+/// A flavor the server revealed (Redshift behind an alias) is recorded on
+/// the connection once, so a read-only Redshift connection reached that way
+/// is no longer taken as enforced by the server.
+#[test]
+fn a_revealed_flavor_is_recorded_on_the_connection() {
+    let f = fixture(EnvTag::Dev);
+    let mut p = f.engine.workspace().get_connection(&f.conn_id).unwrap();
+    p.config.kind = databrain_connector_core::ConnectorKind::Postgres;
+    p.config.host = Some("warehouse.corp.example".into());
+    p.config.read_only = true;
+    f.engine.workspace().save_connection(p).unwrap();
+    let before = f.engine.workspace().get_connection(&f.conn_id).unwrap();
+    assert!(!before.config.is_redshift() && before.config.server_read_only(), "an alias: taken as Postgres");
+    f.engine.remember_flavor(&f.conn_id, "redshift");
+    let after = f.engine.workspace().get_connection(&f.conn_id).unwrap();
+    assert!(after.config.is_redshift() && !after.config.server_read_only());
+    assert_eq!(after.config.host, before.config.host, "nothing else changes");
+    // Again: nothing to save.
+    f.engine.remember_flavor(&f.conn_id, "redshift");
+    assert_eq!(f.engine.workspace().get_connection(&f.conn_id).unwrap().updated_at, after.updated_at);
 }

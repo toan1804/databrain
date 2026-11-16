@@ -136,6 +136,7 @@ impl Connector for DuckdbConnector {
             sandboxed: sandbox,
             conn: Arc::new(Mutex::new(FileConn { conn, _db: db })),
             state: Default::default(),
+            running: Default::default(),
         }))
     }
 }

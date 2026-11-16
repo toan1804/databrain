@@ -37,6 +37,116 @@ pub(crate) fn names_transaction(sql: &str) -> bool {
 /// be set inside one (released at once), and inside one that failed the
 /// server refuses it with its own code. None when the answer is neither
 /// (Redshift, a lost connection): the statement's text stays the guess.
+/// Open the cursor [`fetch_cursor`] reads, for `sql` when it is one read
+/// (`SELECT`, `WITH`, `VALUES`, `TABLE`) a cursor can hold. Under a
+/// savepoint: a statement a cursor can't hold (a CTE that writes) fails
+/// without aborting the transaction, and is then run as it is (false).
+async fn declare_cursor(client: &tokio_postgres::Client, sql: &str) -> bool {
+    use databrain_connector_core::sql::{StatementKind, classify};
+    if classify(sql, ConnectorKind::Postgres).kind != StatementKind::Read {
+        return false;
+    }
+    let body = sql.trim().trim_end_matches(';').trim_end();
+    if client.simple_query("SAVEPOINT databrain_cursor").await.is_err() {
+        return false;
+    }
+    // A line break before the end: a trailing `-- comment` stays a comment.
+    let declared = client.simple_query(&format!("DECLARE {CURSOR} NO SCROLL CURSOR FOR {body}\n")).await.is_ok();
+    if !declared {
+        let _ = client.simple_query("ROLLBACK TO SAVEPOINT databrain_cursor").await;
+    }
+    let _ = client.simple_query("RELEASE SAVEPOINT databrain_cursor").await;
+    declared
+}
+
+/// Whether a read cut by the row limit goes through a cursor: only inside a
+/// transaction (outside it, the connection can be cancelled or replaced
+/// freely), and not on Redshift: it has no SAVEPOINT, and the failed one
+/// would abort the user's transaction.
+pub(crate) fn cursor_for_limit(redshift: bool, in_transaction: bool) -> bool {
+    in_transaction && !redshift
+}
+
+/// The cursor a read cut by the row limit inside a transaction is fetched through.
+const CURSOR: &str = "databrain_rows";
+
+/// Fetch the rows a read keeps (up to `max`) from [`CURSOR`], then close it.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_cursor(
+    client: &tokio_postgres::Client,
+    max: usize,
+    types: &[ColType],
+    geo: &[bool],
+    builder: &mut BatchBuilder,
+    opts: &ExecOptions,
+    tx: &StreamSender,
+    finished: &AtomicBool,
+) -> Result<()> {
+    let mut rows = 0usize;
+    let mut res = Ok(());
+    'fetch: while rows < max && !opts.cancel.is_cancelled() {
+        let n = (max - rows).min(opts.batch_size.max(1));
+        let msgs = match client.simple_query(&format!("FETCH FORWARD {n} FROM {CURSOR}")).await {
+            Ok(m) => m,
+            Err(e) => {
+                res = Err(map_err(&e));
+                break;
+            }
+        };
+        let mut got = 0usize;
+        for m in msgs {
+            if let SimpleQueryMessage::Row(row) = m {
+                builder.push_row(types.iter().enumerate().map(|(i, t)| match row.get(i) {
+                    None => Value::Null,
+                    Some(s) if geo[i] => wkb::hex_ewkb_to_ewkt(s).map(Value::Text).unwrap_or_else(|| Value::Text(s.to_string())),
+                    Some(s) => parse_text(*t, s),
+                }));
+                got += 1;
+                // The rows it keeps are all here: finished before they reach
+                // the engine, whose cut at the row limit cancels the stream
+                // (a cancel sent to the server now would abort the transaction).
+                if rows + got >= max {
+                    finished.store(true, Ordering::SeqCst);
+                }
+                if builder.is_full() {
+                    match builder.finish() {
+                        Ok(b) => {
+                            if !tx.send(StreamEvent::Batch(b)).await {
+                                break 'fetch;
+                            }
+                        }
+                        Err(e) => {
+                            res = Err(e);
+                            break 'fetch;
+                        }
+                    }
+                }
+            }
+        }
+        rows += got;
+        if got < n {
+            break;
+        }
+    }
+    finished.store(true, Ordering::SeqCst);
+    // An error aborted the transaction: no cursor is left to close.
+    if res.is_ok() {
+        let _ = client.simple_query(&format!("CLOSE {CURSOR}")).await;
+    }
+    res?;
+    if opts.cancel.is_cancelled() {
+        return Err(ConnectorError::cancelled());
+    }
+    if !builder.is_empty() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
+        return Ok(());
+    }
+    for n in builder.notices(Some("infinity dates")) {
+        tx.send(StreamEvent::Notice(n)).await;
+    }
+    tx.send(StreamEvent::Done(ExecSummary::default())).await;
+    Ok(())
+}
+
 pub(crate) async fn server_in_transaction(client: &tokio_postgres::Client) -> Option<bool> {
     use tokio_postgres::error::SqlState;
     match client.simple_query("SAVEPOINT databrain_tx_probe").await {
@@ -79,6 +189,17 @@ async fn run_statement(link: &Arc<Link>, sql: String, opts: ExecOptions, tx: Str
         return Ok(());
     }
 
+    // A read cut by the row limit inside a transaction: through a cursor,
+    // fetching only the rows it keeps (otherwise the rest of the result is
+    // read to its end: a cancel would abort the transaction, and a new
+    // connection would lose it).
+    if let Some(max) = opts.max_rows
+        && cursor_for_limit(link.redshift, link.state.in_transaction())
+        && declare_cursor(&client, &sql).await
+    {
+        return fetch_cursor(&client, max, &types, &geo, &mut builder, &opts, &tx, &finished).await;
+    }
+
     let stream = client.simple_query_raw(&sql).await.map_err(|e| map_err(&e))?;
     futures::pin_mut!(stream);
     let mut seen_first_set = false;
@@ -115,9 +236,16 @@ async fn run_statement(link: &Arc<Link>, sql: String, opts: ExecOptions, tx: Str
             SimpleQueryMessage::CommandComplete(_) => {}
             _ => {}
         }
-        if opts.cancel.is_cancelled() {
-            return Err(ConnectorError::cancelled());
+        // Stop: `execute` asks the server to cancel, and the cancellation
+        // error ends this loop. Returning here instead (a row was ready when
+        // Stop came) left the query running on the server and the
+        // connection reading the rest before the next statement.
+        if opts.cancel.is_cancelled() && !builder.is_empty() {
+            let _ = builder.finish();
         }
+    }
+    if opts.cancel.is_cancelled() {
+        return Err(ConnectorError::cancelled());
     }
     if stopped {
         // The rest of the result is still coming, and the connection reads

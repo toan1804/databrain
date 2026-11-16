@@ -76,6 +76,17 @@ pub(crate) fn money_text(f: f64) -> String {
     format!("{sign}{}.{:04}", abs / 10_000, abs % 10_000)
 }
 
+/// Whether a `money` value came through the driver's float exactly: up to
+/// 2^53 ten-thousandths (about ±900 billion). The driver (tiberius) adds
+/// the stored integer's two halves as a float before DataBrain sees it, so
+/// past that the last digits are already lost.
+pub(crate) fn money_exact(f: f64) -> bool {
+    (f * 10_000.0).abs() < 9_007_199_254_740_992.0
+}
+
+/// Said once per result when a `money` value was too large to come through exactly.
+pub(crate) const MONEY_NOTICE: &str = "Some money values are larger than about ±900 billion: the SQL Server driver reads money as a floating-point number, so their last digits may be off. CAST(column AS decimal(19, 4)) in the query gives them exactly.";
+
 /// A `datetime`'s time of day in microseconds: SQL Server counts 1/300 s
 /// and shows it rounded to the millisecond (`.997`, not `.996666`).
 pub(crate) fn datetime_micros(fragments: u32) -> i64 {
@@ -176,6 +187,11 @@ mod tests {
         assert_eq!(money_text(0.1), "0.1000");
         assert_eq!(money_text(-12.3456), "-12.3456");
         assert_eq!(money_text(-0.0001), "-0.0001");
+        // Up to 2^53 ten-thousandths a value comes through exactly; past it,
+        // its last digits were lost in the driver, and the result says so.
+        assert!(money_exact(900_719_925_474.099_1) && money_exact(-900_719_925_474.099_1));
+        assert!(money_exact(922_337_203.685_4));
+        assert!(!money_exact(900_719_925_474.099_3) && !money_exact(-922_337_203_685_477.0));
         let Value::Text(t) = convert_typed(ColumnData::F64(Some(1.5)), true) else { panic!() };
         assert_eq!(t, "1.5000");
         assert!(matches!(convert_typed(ColumnData::F64(Some(1.5)), false), Value::Float(_)), "a float column stays a float");

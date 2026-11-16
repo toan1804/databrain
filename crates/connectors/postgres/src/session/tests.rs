@@ -379,3 +379,102 @@ async fn live_transaction_state_after_a_failed_statement() {
     assert_eq!(s.transaction_state(), TxState::None);
     assert!(run("drop table kb_tx_child, kb_tx_parent").await);
 }
+
+/// Live: inside a transaction the row limit fetches only the rows it keeps
+/// (through a cursor) instead of reading the result to its end; the
+/// transaction stays usable; a read a cursor can't hold (a CTE that writes)
+/// runs as before, and the transaction isn't aborted by trying.
+#[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
+#[tokio::test]
+async fn live_row_limit_in_a_transaction_reads_only_its_rows() {
+    let Some(s) = live_session().await else {
+        panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
+    };
+    let s = &s;
+    let run = |sql: &'static str, max: Option<usize>| async move {
+        let opts = ExecOptions { max_rows: max, ..Default::default() };
+        let r = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            s.execute(databrain_connector_core::Statement::internal(sql), opts).await.unwrap().collect().await
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{sql}: no answer in 20 s"));
+        r.unwrap_or_else(|e| panic!("{sql}: {e}"))
+    };
+    let rows = |c: &databrain_connector_core::Collected| c.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    run("drop table if exists kb_rl", None).await;
+    run("create table kb_rl (id int)", None).await;
+    run("begin", None).await;
+    run("insert into kb_rl values (1)", None).await;
+    // 20 000 rows at 1 ms each: about 20 s when read to the end.
+    let t = std::time::Instant::now();
+    let c = run("select g, pg_sleep(0.001) from generate_series(1, 20000) g", Some(10)).await;
+    assert_eq!(rows(&c), 10);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "read to the end: {:?}", t.elapsed());
+    // Still in the transaction, and it still works.
+    assert_eq!(s.transaction_state(), databrain_connector_core::TxState::Open);
+    assert_eq!(rows(&run("select count(*) from kb_rl", Some(10)).await), 1);
+    // A CTE that writes can't be a cursor: it runs as before, nothing aborted.
+    assert_eq!(rows(&run("with w as (insert into kb_rl values (2) returning id) select id from w", Some(10)).await), 1);
+    run("commit", None).await;
+    let c = run("select count(*)::text from kb_rl", None).await;
+    let n = databrain_connector_core::arrow::util::display::array_value_to_string(c.batches[0].column(0), 0).unwrap();
+    assert_eq!(n, "2", "both inserts committed");
+    run("drop table kb_rl", None).await;
+}
+
+/// Live: Stop while rows are coming stops the query on the server: the
+/// next statement on the session answers at once (it waited for the rest
+/// of the result when Stop came while a row was ready).
+#[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
+#[tokio::test]
+async fn live_stop_while_rows_arrive_cancels_on_the_server() {
+    let Some(s) = live_session().await else {
+        panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
+    };
+    let cancel = databrain_connector_core::CancellationToken::new();
+    let opts = ExecOptions { cancel: cancel.clone(), batch_size: 10, ..Default::default() };
+    // Rows as fast as the server sends them (a row is ready whenever Stop
+    // comes), for longer than the test waits.
+    let mut st = s.execute(databrain_connector_core::Statement::internal("select g from generate_series(1, 100000000) g"), opts).await.unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(ev) = st.next().await {
+            if matches!(ev, Ok(databrain_connector_core::StreamEvent::Batch(_))) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("a first batch");
+    assert!(first);
+    cancel.cancel();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let mut err = None;
+        while let Some(ev) = st.next().await {
+            if let Err(e) = ev {
+                err = Some(e);
+            }
+        }
+        err
+    })
+    .await
+    .expect("the stream ends");
+    assert!(err.is_some_and(|e| e.is_cancelled()), "cancelled");
+    let t = std::time::Instant::now();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        s.execute(databrain_connector_core::Statement::internal("select 1"), ExecOptions::default()).await.unwrap().collect().await.unwrap()
+    })
+    .await
+    .expect("the session answers");
+    assert!(t.elapsed() < std::time::Duration::from_secs(3), "waited {:?} for the rest of the result", t.elapsed());
+}
+
+/// The row limit's cursor is used inside a transaction, never on Redshift
+/// (no SAVEPOINT there: the failed one would abort the user's transaction).
+#[test]
+fn the_row_limit_cursor_is_off_on_redshift() {
+    use crate::exec::cursor_for_limit;
+    assert!(cursor_for_limit(false, true));
+    assert!(!cursor_for_limit(false, false), "outside a transaction: not needed");
+    assert!(!cursor_for_limit(true, true), "Redshift: refused");
+}

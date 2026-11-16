@@ -1,5 +1,6 @@
 //! The MySQL session: query execution and schema introspection.
 
+use crate::config::Opener;
 use crate::error::map_err;
 use crate::exec::Ctx;
 use crate::exec::replace_conn;
@@ -23,7 +24,6 @@ use databrain_connector_core::Session;
 use databrain_connector_core::TableColumns;
 use databrain_connector_core::quote_ident;
 use mysql_async::Conn;
-use mysql_async::Opts;
 use mysql_async::consts::StatusFlags;
 use mysql_async::prelude::*;
 use std::sync::Arc;
@@ -37,7 +37,9 @@ pub struct MysqlSession {
     pub(crate) conn: Arc<Mutex<Conn>>,
     /// Thread id of `conn` (it changes when the connection is replaced).
     pub(crate) conn_id: Arc<AtomicU32>,
-    pub(crate) opts: Opts,
+    /// Opens the side connections (stop a statement, replace the
+    /// connection), reading the credential each time.
+    pub(crate) opener: Arc<Opener>,
     /// What the connection carries (transactions, SET, USE, temp tables).
     pub(crate) state: Arc<ConnState>,
     /// Read-only connection: read-only is set again before each statement
@@ -70,8 +72,8 @@ impl MysqlSession {
     /// Kill the running query using a short-lived side connection. Its
     /// side connection is given 5 s; a statement it didn't stop is handled
     /// by the caller (see `execute`).
-    pub(crate) async fn kill_query(opts: Opts, id: u32) {
-        if let Ok(Ok(mut c)) = tokio::time::timeout(Duration::from_secs(5), Conn::new(opts)).await {
+    pub(crate) async fn kill_query(opener: &Opener, id: u32) {
+        if let Some(mut c) = opener.open(Duration::from_secs(5)).await {
             let _ = c.query_drop(format!("KILL QUERY {id}")).await;
             let _ = c.disconnect().await;
         }
@@ -118,7 +120,7 @@ impl Session for MysqlSession {
         let ctx = Ctx {
             conn: self.conn.clone(),
             conn_id: self.conn_id.clone(),
-            opts: self.opts.clone(),
+            opener: self.opener.clone(),
             state: self.state.clone(),
             finished: Arc::new(AtomicBool::new(false)),
             read_only: self.read_only,
@@ -135,7 +137,7 @@ impl Session for MysqlSession {
                     // server (e.g. stopped at the row limit just now).
                     let kill = !ctx.finished.load(Ordering::SeqCst);
                     if kill {
-                        Self::kill_query(ctx.opts.clone(), ctx.conn_id.load(Ordering::SeqCst)).await;
+                        Self::kill_query(&ctx.opener, ctx.conn_id.load(Ordering::SeqCst)).await;
                     }
                     match tokio::time::timeout(Duration::from_secs(10), &mut work).await {
                         Ok(r) => {
@@ -554,6 +556,87 @@ mod tests {
         s.execute(databrain_connector_core::Statement::internal(sql), opts).await?.collect().await
     }
 
+    /// The root password from the environment, counting how often it is read.
+    struct Counting(databrain_auth::InlineCredentialSource, std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl databrain_auth::CredentialSource for Counting {
+        async fn get(&self) -> std::result::Result<databrain_auth::Credential, databrain_auth::AuthError> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.get().await
+        }
+    }
+
+    fn live_cfg() -> ConnectionConfig {
+        let host = std::env::var("DATABRAIN_MYSQL_HOST").expect("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)");
+        let user = std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into());
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, databrain_auth::AuthMethod::Password { user });
+        cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
+        cfg
+    }
+
+    fn counting(cfg: &ConnectionConfig) -> Arc<Counting> {
+        let user = match &cfg.auth {
+            databrain_auth::AuthMethod::Password { user } => user.clone(),
+            _ => unreachable!(),
+        };
+        let pw = std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from);
+        Arc::new(Counting(databrain_auth::InlineCredentialSource::new(databrain_auth::AuthMethod::Password { user }, pw), Default::default()))
+    }
+
+    /// The credential isn't kept for the connections the session opens
+    /// later: replacing a connection still receiving a result cut at the
+    /// row limit reads it from its source again.
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_new_connections_read_the_credential_again() {
+        let cfg = live_cfg();
+        let creds = counting(&cfg);
+        let s = MysqlConnector.connect(&cfg, creds.clone()).await.unwrap();
+        assert_eq!(creds.1.load(Ordering::SeqCst), 1);
+        let opts = ExecOptions { max_rows: Some(10), ..Default::default() };
+        // Millions of rows, without changing the session (it stays replaceable).
+        let sql = "select a.ordinal_position from information_schema.columns a, information_schema.columns b";
+        let c = tokio::time::timeout(Duration::from_secs(30), live_run(&*s, sql, opts)).await.expect("in time").unwrap();
+        assert_eq!(c.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+        assert!(creds.1.load(Ordering::SeqCst) >= 2, "the replacement connection read the credential");
+        // And it works.
+        tokio::time::timeout(Duration::from_secs(10), live_run(&*s, "select 1", ExecOptions::default())).await.expect("in time").unwrap();
+    }
+
+    /// A CA file: with the server's CA, Require connects (the chain is
+    /// checked) and so does Verify (the chain and host name); with another
+    /// CA both are refused, Prefer too (no plaintext retry on a certificate
+    /// error). `DATABRAIN_MYSQL_CA`: the CA that signed the server's
+    /// certificate, which names the host connected to (127.0.0.1);
+    /// `DATABRAIN_MYSQL_OTHER_CA`: another one. (macOS refuses a server
+    /// certificate valid longer than Apple allows for added CAs, like
+    /// MySQL's generated 10-year one: use one of a year.)
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST, DATABRAIN_MYSQL_CA and DATABRAIN_MYSQL_OTHER_CA (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_ca_file_verifies_the_server() {
+        let ca = std::env::var("DATABRAIN_MYSQL_CA").expect("DATABRAIN_MYSQL_CA");
+        let other = std::env::var("DATABRAIN_MYSQL_OTHER_CA").expect("DATABRAIN_MYSQL_OTHER_CA");
+        let open = |mode: databrain_connector_core::SslMode, file: String| async move {
+            let mut cfg = live_cfg();
+            cfg.ssl_mode = mode;
+            cfg.options.insert(crate::config::SSL_ROOT_CERT.into(), file);
+            let creds = counting(&cfg);
+            tokio::time::timeout(Duration::from_secs(20), MysqlConnector.connect(&cfg, creds)).await.expect("in time")
+        };
+        use databrain_connector_core::SslMode::*;
+        let s = open(Require, ca.clone()).await.expect("Require with the server's CA");
+        let cipher = live_run(&*s, "show session status like 'Ssl_cipher'", ExecOptions::default()).await.unwrap();
+        let v = databrain_connector_core::arrow::util::display::array_value_to_string(cipher.batches[0].column(1), 0).unwrap();
+        assert!(!v.is_empty(), "encrypted");
+        assert!(open(VerifyFull, ca).await.is_ok(), "Verify with the server's CA and host");
+        assert!(open(Require, other.clone()).await.is_err(), "Require with another CA refused");
+        assert!(open(VerifyFull, other.clone()).await.is_err(), "Verify with another CA refused");
+        // Prefer with a CA checks the chain too: no plaintext retry on a certificate error.
+        assert!(open(Prefer, other).await.is_err(), "Prefer with another CA refused");
+    }
+
     /// The row limit stops a read, but a procedure (not a read) runs to its
     /// end: its write after the rows happens, and a notice says the rest of
     /// its rows were discarded.
@@ -651,19 +734,13 @@ mod tests {
         // cancel does): it ends the statement on the server too. `run`
         // directly, with no outer cancel to send the kill.
         {
-            let opts = Opts::from_url(&format!(
-                "mysql://{}:{}@{}:{}",
-                std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into()),
-                std::env::var("DATABRAIN_MYSQL_PASSWORD").unwrap_or_default(),
-                std::env::var("DATABRAIN_MYSQL_HOST").unwrap(),
-                std::env::var("DATABRAIN_MYSQL_PORT").unwrap_or_else(|_| "3306".into())
-            ))
-            .unwrap();
-            let conn = Conn::new(opts.clone()).await.unwrap();
+            let cfg = live_cfg();
+            let opener = Arc::new(Opener { creds: counting(&cfg), cfg, tls: false });
+            let conn = Conn::new(opener.opts().await.unwrap()).await.unwrap();
             let ctx = crate::exec::Ctx {
                 conn_id: Arc::new(AtomicU32::new(conn.id())),
                 conn: Arc::new(Mutex::new(conn)),
-                opts,
+                opener,
                 state: Default::default(),
                 finished: Arc::new(AtomicBool::new(false)),
                 read_only: false,

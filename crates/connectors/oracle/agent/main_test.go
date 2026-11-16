@@ -3,15 +3,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/sijms/go-ora/v2/network"
 )
@@ -158,4 +163,89 @@ func TestFrameLimit(t *testing.T) {
 	if err := w.frame('B', make([]byte, 100)); err != nil || buf.Len() != 105 {
 		t.Fatalf("%v, %d bytes", err, buf.Len())
 	}
+}
+
+// reqFrame is a request as DataBrain sends it.
+func reqFrame(t *testing.T, r map[string]any) []byte {
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := make([]byte, 5)
+	binary.BigEndian.PutUint32(h[:4], uint32(len(b)))
+	h[4] = 'J'
+	return append(h, b...)
+}
+
+func TestDataBrainGoneStopsTheStatementAndTheHelper(t *testing.T) {
+	inR, inW := io.Pipe()
+	started := make(chan struct{})
+	var handled []uint64
+	var mu sync.Mutex
+	done := make(chan struct{})
+	stopped := make(chan error, 1)
+	go func() {
+		defer close(done)
+		serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+			mu.Lock()
+			handled = append(handled, r.ID)
+			mu.Unlock()
+			if r.ID == 1 {
+				close(started)
+				<-ctx.Done() // a long statement: until it is cancelled
+				stopped <- ctx.Err()
+			}
+			return nil
+		}, func() { t.Error("a statement that stopped must not make the helper exit") })
+	}()
+	go func() {
+		_, _ = inW.Write(append(reqFrame(t, map[string]any{"id": 1, "op": "query"}), reqFrame(t, map[string]any{"id": 2, "op": "query"})...))
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request didn't start")
+	}
+	// Request 2 is read and queued, then DataBrain goes away.
+	time.Sleep(50 * time.Millisecond)
+	inW.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the helper kept running after its stdin closed")
+	}
+	if err := <-stopped; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the running statement was not cancelled: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(handled) != "[1]" {
+		t.Fatalf("a request queued before it went away ran: %v", handled)
+	}
+}
+
+func TestAStatementThatDoesNotStopMakesTheHelperExit(t *testing.T) {
+	old := gracePeriod
+	gracePeriod = 100 * time.Millisecond
+	defer func() { gracePeriod = old }()
+	inR, inW := io.Pipe()
+	started, release, exited := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+		close(started)
+		<-release // ignores the cancel
+		return nil
+	}, func() { close(exited) })
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "query"})) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request didn't start")
+	}
+	inW.Close()
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stuck statement kept the helper alive")
+	}
+	close(release)
 }

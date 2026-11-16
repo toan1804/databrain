@@ -21,6 +21,8 @@ pub struct PgSession {
     pub(crate) read_only: bool,
     /// Amazon Redshift (PostgreSQL 8.0 catalog): its own metadata queries.
     pub(crate) redshift: bool,
+    /// Redshift found at connect time, not in the configuration.
+    pub(crate) detected_redshift: bool,
 }
 
 impl PgSession {
@@ -31,6 +33,10 @@ impl PgSession {
 
 #[async_trait]
 impl Session for PgSession {
+    fn detected_flavor(&self) -> Option<&'static str> {
+        self.detected_redshift.then_some("redshift")
+    }
+
     fn kind(&self) -> ConnectorKind {
         ConnectorKind::Postgres
     }
