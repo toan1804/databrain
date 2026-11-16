@@ -801,7 +801,16 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(20), "returned after {:?}", t.elapsed());
         assert_eq!(e.kind, ErrorKind::Cancelled);
         assert!(e.message.contains("opened a new one"), "{}", e.message);
-        assert_eq!(running(&*root, "kb_stuck").await, "0", "the stuck statement's connection was ended");
+        // The KILL from the new connection ends it on the server a moment later.
+        let mut left = String::new();
+        for _ in 0..50 {
+            left = running(&*root, "kb_stuck").await;
+            if left == "0" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(left, "0", "the stuck statement's connection was ended");
         let r = tokio::time::timeout(Duration::from_secs(5), live_run(&*s, "select 8", ExecOptions::default())).await.expect("the session answers");
         assert_eq!(cell(&r.unwrap()), "8");
         drop(s);
