@@ -1615,6 +1615,18 @@ async fn missed_runs_follow_the_jobs_policy() {
         assert_eq!(st.workspace.job_runs(&job.id, 50).unwrap().len(), runs);
         assert!(st.workspace.get_job(&job.id).unwrap().last_scheduled_at.unwrap() >= now);
         assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty(), "and it isn't due again until tomorrow");
+
+        // Skip, but the time was missed because the job was running then (a
+        // run by hand that lasted past it): it runs once that run has ended.
+        st.workspace.backdate_job_for_tests(&job.id, now - 3 * 24 * hour).unwrap();
+        let mut busy = st.workspace.start_job_run(&job.id, "manual").unwrap();
+        let slot = two_h_ago.timestamp_millis() / 60_000 * 60_000;
+        st.workspace.backdate_job_run_for_tests(busy.id, slot - 5 * 60_000).unwrap();
+        busy.status = "success".into();
+        busy.finished_at = Some(slot + 20 * 60_000);
+        st.workspace.update_job_run(&busy).unwrap();
+        assert_eq!(databrain_app::jobs::tick(&st.job_ctx()), vec![job.id.clone()], "missed while busy: it runs");
+        finished(&st, &job.id).await;
     })
     .await;
 }

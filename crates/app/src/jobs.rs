@@ -1876,6 +1876,10 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
                 release();
                 continue;
             }
+            // Skip is for times missed while nothing ran the scheduler: a time
+            // missed because the job was still running (a run by hand, a slow
+            // run, a "run after" chain) runs once it ends.
+            Due::Skip { mark } if fresh.as_ref().is_some_and(|f| ran_at_its_time(ctx, f, now)) => mark,
             Due::Skip { mark } => {
                 tracing::info!(job = %j.id, "scheduled runs missed while nothing was running are skipped (the job's setting)");
                 let _ = ctx.workspace.mark_job_scheduled(&j.id, mark);
@@ -1901,13 +1905,32 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
     started
 }
 
+/// Whether one of `job`'s recent runs was going at a scheduled time not yet
+/// counted (missed for being busy, not while nothing was running).
+fn ran_at_its_time(ctx: &JobCtx, job: &Job, now: i64) -> bool {
+    let base = job.schedule_base_at(now);
+    ctx.workspace.job_runs(&job.id, 5).unwrap_or_default().iter().any(|r| {
+        let end = r.finished_at.unwrap_or(now).min(now);
+        job.schedule.next_after(base.max(r.started_at - 1)).is_some_and(|slot| slot <= end)
+    })
+}
+
 /// Let go of a job the scheduler claimed and didn't start: unless a run of
 /// the job started in this process meanwhile (a job that runs after
 /// another, between the scheduler's check and its claim), which holds the
 /// lease (same owner) and must keep it.
 #[doc(hidden)]
 pub fn let_go(ctx: &JobCtx, job_id: &str) {
-    if !ctx.jobs.is_running(job_id) {
+    release_unless_running(ctx, job_id);
+}
+
+/// Release this process's lease on `job_id` unless a run of it started
+/// here: checked and released under the `running` lock, so a run starting
+/// meanwhile ([`start_as`] adds itself there before it claims the lease)
+/// can't have its lease released under it.
+fn release_unless_running(ctx: &JobCtx, job_id: &str) {
+    let running = ctx.jobs.running.lock();
+    if !running.contains_key(job_id) {
         let _ = ctx.workspace.release_job(job_id, &ctx.jobs.owner);
     }
 }
@@ -1935,7 +1958,7 @@ pub fn give_back(ctx: &JobCtx, job_id: &str, mark: i64, before: Option<i64>, e: 
     }
     if !transient(e) {
         tracing::warn!(job = %job_id, error = %e.message, "scheduled job can't start; it is tried at its next time");
-        let _ = ctx.workspace.release_job(job_id, &ctx.jobs.owner);
+        release_unless_running(ctx, job_id);
         return;
     }
     tracing::warn!(job = %job_id, error = %e.message, "scheduled job did not start; it is tried again on the next tick");
@@ -1944,7 +1967,7 @@ pub fn give_back(ctx: &JobCtx, job_id: &str, mark: i64, before: Option<i64>, e: 
         Ok(false) => tracing::info!(job = %job_id, "the slot was used by another runner meanwhile: left as it is"),
         Err(err) => tracing::warn!(job = %job_id, error = %err, "the slot could not be given back"),
     }
-    let _ = ctx.workspace.release_job(job_id, &ctx.jobs.owner);
+    release_unless_running(ctx, job_id);
 }
 
 /// Start a run and wait for it to end (command line). Returns the run as saved.

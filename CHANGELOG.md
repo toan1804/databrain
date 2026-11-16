@@ -13,6 +13,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 - Jobs run at most 4 steps at once, and 2 on one connection, unless the job's limits say otherwise. A step that doesn't stop within 30 s of being stopped is left behind, so the run ends.
 - When clocks change, a scheduled time that doesn't exist runs at the first time after it, and a repeated time runs once.
+- Schedules "every N minutes" follow the job's time zone: one that divides a day into hours (every 2 h, 6 h, 1 day) runs at the same clock times all year (every day at midnight, summer and winter alike; around a clock change one gap is an hour longer or shorter), and shorter ones keep exact gaps. A schedule of every 0 minutes is refused (it ran every minute).
+- "Skip" missed runs skips only times missed while nothing was running; a time missed because the job was still running (a run by hand, a slow run) runs once that run ends.
 - A load step's dry run gets the job's parameters (SQL using them failed before).
 - The assistant's job tools refuse arguments they can't set by name (an unknown field or step name), instead of dropping them silently.
 - An export step writes to a temporary `.databrain-<job>-<step>.….part` file next to the target, then moves it into place: a failed or stopped export leaves the old file whole. Leftover temporary files of the step's earlier runs are removed.

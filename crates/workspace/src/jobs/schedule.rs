@@ -402,6 +402,7 @@ impl JobSchedule {
             return Some(e);
         }
         match self.mode {
+            ScheduleMode::Interval if self.minutes == 0 => Some("every 0 minutes: choose at least 1 minute".into()),
             ScheduleMode::Interval if self.minutes > MAX_MINUTES => Some(format!("every {} minutes is more than a year ({MAX_MINUTES} minutes)", self.minutes)),
             ScheduleMode::Interval => None,
             ScheduleMode::Daily | ScheduleMode::Monthly => {
@@ -477,12 +478,21 @@ impl JobSchedule {
             None
         };
         match self.mode {
+            ScheduleMode::Interval if self.minutes > 60 && 1440 % self.minutes == 0 => {
+                // Hours dividing a day (every 2 h, 6 h, 1 day): the wall clock's
+                // slots from midnight (00:00, 06:00, …) in summer and winter
+                // alike, resolved like daily times when clocks change (the gap
+                // around a change is an hour longer or shorter).
+                let times: Vec<NaiveTime> =
+                    (0..1440).step_by(self.minutes.max(1) as usize).filter_map(|m| NaiveTime::from_hms_opt(m / 60, m % 60, 0)).collect();
+                days(3, &|_| true, &times)
+            }
             ScheduleMode::Interval => {
                 let step = i64::from(self.minutes.max(1)) * 60_000;
-                // Aligned to the zone's standard-time clock (every 15 min → :00,
-                // :15, …): one offset all year, so the runs stay exactly `step`
-                // apart when clocks change (with the offset of the moment, a day
-                // interval ran twice within an hour when clocks went back).
+                // An hour or less (every 15 min → :00, :15, …, the same marks in
+                // summer), or not dividing a day (90 min, 2 days): aligned to the
+                // zone's standard-time clock, one offset all year, so the runs
+                // stay exactly `step` apart when clocks change.
                 let offset = standard_offset_ms(z, start.year());
                 let local = after_ms + offset;
                 Some((local.div_euclid(step) + 1) * step - offset)
@@ -802,7 +812,7 @@ mod tests {
     #[test]
     fn intervals_keep_their_gaps_when_clocks_change() {
         let ny = Tz::America__New_York;
-        for minutes in [90u32, 120, 1440, 45, 60] {
+        for minutes in [100u32, 2880, 45, 60] {
             let s = JobSchedule { minutes, time_zone: "America/New_York".into(), ..sched(ScheduleMode::Interval) };
             // Clocks go back (2026-11-01) and forward (2026-03-08).
             for from in [at(ny, 2026, 10, 30, 0, 0), at(ny, 2026, 3, 6, 0, 0)] {
@@ -820,6 +830,27 @@ mod tests {
         let q = JobSchedule { minutes: 15, time_zone: "America/New_York".into(), ..sched(ScheduleMode::Interval) };
         assert_eq!(q.next_after(at(ny, 2026, 7, 1, 9, 7)), Some(at(ny, 2026, 7, 1, 9, 15)));
         assert_eq!(q.next_after(at(ny, 2026, 1, 1, 9, 7)), Some(at(ny, 2026, 1, 1, 9, 15)));
+    }
+
+    /// Hours that divide a day keep their wall-clock times all year: every
+    /// day at midnight, every 6 h at 00/06/12/18, in summer too; around a
+    /// clock change one gap is an hour longer or shorter, never two runs at once.
+    #[test]
+    fn day_dividing_intervals_keep_their_wall_clock_times() {
+        let ny = Tz::America__New_York;
+        let every = |minutes| JobSchedule { minutes, time_zone: "America/New_York".into(), ..sched(ScheduleMode::Interval) };
+        for (m, d) in [(1, 15), (7, 15)] {
+            assert_eq!(every(1440).next_after(at(ny, 2026, m, d, 9, 0)), Some(at(ny, 2026, m, d + 1, 0, 0)), "month {m}");
+            assert_eq!(every(360).next_after(at(ny, 2026, m, d, 9, 0)), Some(at(ny, 2026, m, d, 12, 0)), "month {m}");
+            assert_eq!(every(120).next_after(at(ny, 2026, m, d, 9, 0)), Some(at(ny, 2026, m, d, 10, 0)), "month {m}");
+        }
+        for minutes in [90u32, 120, 360, 1440] {
+            for from in [at(ny, 2026, 10, 30, 0, 0), at(ny, 2026, 3, 6, 0, 0)] {
+                let g = gaps(&every(minutes), from, 4 * 1440 / minutes as usize);
+                let m = i64::from(minutes);
+                assert!(g.iter().all(|x| (*x - m).abs() <= 60) && g.iter().filter(|x| **x != m).count() <= 1, "{minutes} min from {from}: {g:?}");
+            }
+        }
     }
 
     #[test]
@@ -922,5 +953,8 @@ mod tests {
         let every = |minutes| JobSchedule { enabled: true, minutes, ..Default::default() }.problem();
         assert_eq!(every(MAX_MINUTES), None);
         assert!(every(MAX_MINUTES + 1).is_some_and(|p| p.contains("more than a year")));
+        assert!(every(0).is_some_and(|p| p.contains("0 minutes")), "0 would run every minute");
+        assert_eq!(every(1), None);
+        assert_eq!(JobSchedule { enabled: false, minutes: 0, ..Default::default() }.problem(), None, "off");
     }
 }
