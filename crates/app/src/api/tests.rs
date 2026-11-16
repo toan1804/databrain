@@ -1186,6 +1186,33 @@ async fn ai_job_runs_are_sandboxed() {
 /// the assistant wrote before can't come back as the user's; a save on the
 /// current version goes through. A copy of the assistant's step
 /// ("Duplicate") stays the assistant's; a new step of the user's is theirs.
+/// A user's save judges the assistant's mark by its SQL and connections
+/// only: pointing the assistant's load at another table, mode or keys keeps
+/// it the assistant's (so its SQL stays under the AI rules).
+#[test]
+fn a_users_new_target_keeps_the_assistants_load_the_assistants() {
+    let (st, _sink, _dir) = state();
+    let job: databrain_workspace::Job = serde_json::from_value(serde_json::json!({
+        "name": "Targets",
+        "nodes": [
+            {"id": "l", "name": "ai_load", "kind": "load", "sql": "select 1 as id", "target_connection_id": "pg", "target_table": "t", "ai_sql": true}
+        ]
+    }))
+    .unwrap();
+    let opened = st.workspace.save_job(job).unwrap();
+    let mut edit = opened.clone();
+    let n = edit.nodes.iter_mut().find(|n| n.id == "l").unwrap();
+    n.target_table = Some("other".into());
+    n.load_mode = databrain_workspace::LoadMode::Replace;
+    n.key_columns = vec!["id".into()];
+    let saved = save_job(&st, edit).unwrap();
+    assert!(saved.nodes[0].ai_sql, "still the assistant's SQL");
+    // Its SQL changed by the user: the user's.
+    let mut edit = saved.clone();
+    edit.nodes[0].sql = "select 2 as id".into();
+    assert!(!save_job(&st, edit).unwrap().nodes[0].ai_sql);
+}
+
 #[test]
 fn job_saves_follow_the_version_and_copies_keep_the_ai_mark() {
     let (st, _sink, _dir) = state();

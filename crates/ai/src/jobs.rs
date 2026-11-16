@@ -647,7 +647,7 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
                 }
                 if !o.ai_sql && n.ai_sql {
                     out.push(format!(
-                        "step {} becomes the assistant's: its SQL, connection or the rows it reads change, so it runs under the AI rules",
+                        "step {} becomes the assistant's: its SQL, connection, the rows it reads or where it writes change, so it runs under the AI rules",
                         n.name
                     ));
                 }
@@ -665,12 +665,11 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
     out
 }
 
-/// Apply `update_job` arguments to `old`: steps whose name is kept (or
-/// renamed via `rename`) keep their id, place and history; `taken` = other
-/// jobs' output names. Returns the new job and notes for the model.
 /// Mark the steps whose SQL the AI wrote (`JobNode::ai_sql`): every step of
-/// a new job; in a changed job, the steps that are new or whose SQL moved
-/// or changed against `old`. A step the AI left as it was keeps its mark.
+/// a new job; in a changed job, the steps that are new or whose SQL,
+/// connections or where they write ([`JobNode::same_effect`]: a load's
+/// table, mode and keys, an export's folder, file and format) changed
+/// against `old`. A step the AI left as it was keeps its mark.
 /// A load or export without SQL reads its first upstream's rows: when the
 /// AI changes its links (which steps, in which order) it changes what the
 /// step writes, so the step becomes the AI's too.
@@ -678,7 +677,7 @@ pub fn mark_ai_sql(job: &mut Job, old: Option<&Job>) {
     let links: HashMap<String, Vec<String>> = job.nodes.iter().map(|n| (n.id.clone(), upstreams(job, &n.id))).collect();
     for n in &mut job.nodes {
         n.ai_sql = match old.and_then(|o| o.nodes.iter().find(|x| x.id == n.id).map(|b| (o, b))) {
-            Some((o, before)) if before.same_sql(n) && (!reads_links(n) || upstreams(o, &n.id) == links[&n.id]) => before.ai_sql,
+            Some((o, before)) if before.same_effect(n) && (!reads_links(n) || upstreams(o, &n.id) == links[&n.id]) => before.ai_sql,
             _ => true,
         };
     }
@@ -714,6 +713,9 @@ fn renames_of(args: &Value, old: &Job) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Apply `update_job` arguments to `old`: steps whose name is kept (or
+/// renamed via `rename`) keep their id, place and history; `taken` = other
+/// jobs' output names. Returns the new job and notes for the model.
 pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Result<(Job, Vec<String>)> {
     let rename = renames_of(args, old)?;
     let mut a = args.clone();
@@ -1229,6 +1231,47 @@ mod ai_sql_tests {
         mark_ai_sql(&mut q_new, Some(&q_old));
         assert!(!q_new.nodes[1].ai_sql);
         assert!(changes(&q_old, &q_new).iter().any(|c| c == "step w runs after no step (was u)"));
+    }
+
+    /// Where a user's step writes is part of it: the AI pointing a load at
+    /// another table (also one differing only in case), switching its mode,
+    /// keys or "create the table", or an export's folder, file or format,
+    /// makes it the AI's and says so; left as it was, it stays the user's.
+    #[test]
+    fn changing_where_a_users_step_writes_makes_it_the_ais() {
+        let mut old: Job = serde_json::from_value(json!({"name": "j", "nodes": [
+            {"id": "u", "name": "u", "kind": "query", "sql": "select 1"},
+            {"id": "l", "name": "l", "kind": "load", "sql": "", "target_connection_id": "pg", "target_table": "public.orders", "key_columns": ["id"]},
+            {"id": "e", "name": "e", "kind": "export", "sql": "", "export_folder": "/out", "export_file": "f"}
+        ], "edges": [{"from": "u", "to": "l"}, {"from": "u", "to": "e"}]}))
+        .unwrap();
+        old.id = "J".into();
+        let edit = |f: &dyn Fn(&mut Job)| {
+            let mut j = old.clone();
+            f(&mut j);
+            mark_ai_sql(&mut j, Some(&old));
+            j
+        };
+        // Left as it was (spacing aside): the user's.
+        let same = edit(&|j| j.nodes[1].target_table = Some(" public.orders ".into()));
+        assert!(!same.nodes[1].ai_sql && !same.nodes[2].ai_sql);
+        for (what, j) in [
+            ("another table", edit(&|j| j.nodes[1].target_table = Some("public.orders_copy".into()))),
+            ("a name in another case", edit(&|j| j.nodes[1].target_table = Some("public.\"Orders\"".into()))),
+            ("another mode", edit(&|j| j.nodes[1].load_mode = databrain_workspace::LoadMode::Replace)),
+            ("other keys", edit(&|j| j.nodes[1].key_columns = vec!["ID".into()])),
+            ("create the table", edit(&|j| j.nodes[1].create_table = !j.nodes[1].create_table)),
+        ] {
+            assert!(j.nodes[1].ai_sql, "{what}");
+            assert!(changes(&old, &j).iter().any(|c| c.starts_with("step l becomes the assistant's")), "{what}");
+        }
+        for (what, j) in [
+            ("another folder", edit(&|j| j.nodes[2].export_folder = Some("/elsewhere".into()))),
+            ("another file", edit(&|j| j.nodes[2].export_file = Some("g".into()))),
+            ("another format", edit(&|j| j.nodes[2].export_format = databrain_workspace::FileFormat::Parquet)),
+        ] {
+            assert!(j.nodes[2].ai_sql, "{what}");
+        }
     }
 
     /// `rename` only renames steps of the job to step names, once each; a

@@ -1165,6 +1165,46 @@ async fn steps_the_assistant_wrote_follow_todays_ai_settings() {
 /// runs under the AI rules, so it is refused where the assistant may not
 /// write; the same load of the user's own rows runs as before, and with
 /// "AI may write" on the target it runs.
+/// A query step on a DuckDB file (not Results) reads `results.*` too: one
+/// that reads the assistant's rows and writes them runs under the AI rules.
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_files_reading_the_assistants_rows_follow_the_ai_rules() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let file = duckdb(&st, "file", &dir.path().join("file.duckdb"));
+        let job_of = |name: &str, ai: bool| {
+            let mut pick = node("a", &format!("{name}_rows"), JobNodeKind::Query, Some(&src), "select 1 as id union all select 2");
+            pick.ai_sql = ai;
+            let copy =
+                node("b", &format!("{name}_copy"), JobNodeKind::Query, Some(&file), &format!("create table {name}_t as select * from results.{name}_rows"));
+            let mut j = plain_job(name, vec![pick, copy]);
+            j.edges = vec![JobEdge { from: "a".into(), to: "b".into() }];
+            st.workspace.save_job(j).unwrap()
+        };
+        // Refused: the user's step on a DuckDB file writes the assistant's rows there.
+        let ai_job = job_of("dk_ai", true);
+        let run = run_all(&st, &ai_job).await;
+        let copy = step(&run, "dk_ai_copy");
+        assert_eq!(copy.status, "error", "{run:?}");
+        let log = api::job_run_log(&st, &ai_job.id, run.id).unwrap();
+        assert!(
+            log.iter().any(|l| l.message.starts_with("Runs under the AI rules: it reads rows the assistant's SQL selected (results.dk_ai_rows)")),
+            "{log:?}"
+        );
+        assert_eq!(rows(&st, &file, "select count(*) from information_schema.tables where table_name = 'dk_ai_t'").await, vec![vec!["0"]], "nothing written");
+
+        // Allowed: the same step reading the user's own rows.
+        let mine = job_of("dk_mine", false);
+        let run = run_all(&st, &mine).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(rows(&st, &file, "select count(*) from dk_mine_t").await, vec![vec!["2"]]);
+    })
+    .await
+    .expect("test hung");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn loads_of_the_assistants_rows_follow_the_ai_rules() {
     tokio::time::timeout(Duration::from_secs(120), async {

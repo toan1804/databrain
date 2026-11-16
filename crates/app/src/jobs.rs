@@ -918,10 +918,11 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // SQL it wrote, a query of its own) stay the assistant's: a step that
     // reads them, by its SQL or by default from its upstream, runs under the
     // AI rules too, so a load or export the user wrote can't take rows the
-    // assistant chose where the assistant may not write. Outputs only exist
-    // on Results; the step's own output then is the AI's as well, so this
-    // follows the rows down the job.
-    let on_results = node.kind != JobNodeKind::Query || connection_id == ctx.engine.results_connection()?.id;
+    // assistant chose where the assistant may not write. Every DuckDB
+    // connection reads `results.*` (Results, a DuckDB file, MotherDuck), so
+    // a query step on any of them is followed; the step's own output then is
+    // the AI's as well, so this follows the rows down the job.
+    let on_results = node.kind != JobNodeKind::Query || reads_outputs(ctx, &connection_id)?;
     let ai_rows: Vec<String> = if on_results {
         ctx.engine.outputs().referenced(&sql).into_iter().filter(|o| o.origin == Origin::Ai).map(|o| o.name.unwrap_or(o.handle)).collect()
     } else {
@@ -1032,6 +1033,15 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     }
     let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
+}
+
+/// Whether SQL on `connection_id` can read the outputs (`results.*`): every
+/// DuckDB connection loads them, Results and the user's DuckDB files alike.
+fn reads_outputs(ctx: &JobCtx, connection_id: &str) -> Result<bool> {
+    if connection_id == ctx.engine.results_connection()?.id {
+        return Ok(true);
+    }
+    Ok(ctx.workspace.get_connection(connection_id).is_ok_and(|p| p.config.kind == databrain_connector_core::ConnectorKind::Duckdb))
 }
 
 /// What a load step writes, from its settings.

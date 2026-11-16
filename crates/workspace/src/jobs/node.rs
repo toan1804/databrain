@@ -251,6 +251,25 @@ impl JobNode {
             && self.load_after_sql.as_deref().map(str::trim) == other.load_after_sql.as_deref().map(str::trim)
     }
 
+    /// [`Self::same_sql`], and where and how it writes: a load's table,
+    /// mode, key columns and "create the table", an export's folder, file
+    /// name and format. Names are compared exactly (after trimming): on a
+    /// database where case matters, `orders` and `"Orders"` are two tables.
+    /// Used for the assistant's edits (any change makes the step its own);
+    /// a user's save keeps the assistant's mark by [`Self::same_sql`] alone.
+    pub fn same_effect(&self, other: &JobNode) -> bool {
+        let t = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let keys = |k: &[String]| k.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
+        self.same_sql(other)
+            && t(&self.target_table) == t(&other.target_table)
+            && self.load_mode == other.load_mode
+            && keys(&self.key_columns) == keys(&other.key_columns)
+            && self.create_table == other.create_table
+            && t(&self.export_folder) == t(&other.export_folder)
+            && t(&self.export_file) == t(&other.export_file)
+            && self.export_format == other.export_format
+    }
+
     /// A step does one thing: drop the settings of the other actions, so a
     /// query step can't also carry a load target or a file name.
     pub fn keep_own_settings(&mut self) {
