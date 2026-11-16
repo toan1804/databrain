@@ -59,6 +59,14 @@ async fn declare_cursor(client: &tokio_postgres::Client, sql: &str) -> bool {
     declared
 }
 
+/// Whether a read cut by the row limit goes through a cursor: only inside a
+/// transaction (outside it, the connection can be cancelled or replaced
+/// freely), and not on Redshift: it has no SAVEPOINT, and the failed one
+/// would abort the user's transaction.
+pub(crate) fn cursor_for_limit(redshift: bool, in_transaction: bool) -> bool {
+    in_transaction && !redshift
+}
+
 /// The cursor a read cut by the row limit inside a transaction is fetched through.
 const CURSOR: &str = "databrain_rows";
 
@@ -94,6 +102,12 @@ async fn fetch_cursor(
                     Some(s) => parse_text(*t, s),
                 }));
                 got += 1;
+                // The rows it keeps are all here: finished before they reach
+                // the engine, whose cut at the row limit cancels the stream
+                // (a cancel sent to the server now would abort the transaction).
+                if rows + got >= max {
+                    finished.store(true, Ordering::SeqCst);
+                }
                 if builder.is_full() {
                     match builder.finish() {
                         Ok(b) => {
@@ -180,7 +194,7 @@ async fn run_statement(link: &Arc<Link>, sql: String, opts: ExecOptions, tx: Str
     // read to its end: a cancel would abort the transaction, and a new
     // connection would lose it).
     if let Some(max) = opts.max_rows
-        && link.state.in_transaction()
+        && cursor_for_limit(link.redshift, link.state.in_transaction())
         && declare_cursor(&client, &sql).await
     {
         return fetch_cursor(&client, max, &types, &geo, &mut builder, &opts, &tx, &finished).await;

@@ -1343,3 +1343,25 @@ async fn rerunning_one_output_keeps_the_tabs_other_results() {
     let e = f.engine.rerun_output(other, &after[0].handle).unwrap_err();
     assert!(e.message.contains("another tab"), "{}", e.message);
 }
+
+/// A flavor the server revealed (Redshift behind an alias) is recorded on
+/// the connection once, so a read-only Redshift connection reached that way
+/// is no longer taken as enforced by the server.
+#[test]
+fn a_revealed_flavor_is_recorded_on_the_connection() {
+    let f = fixture(EnvTag::Dev);
+    let mut p = f.engine.workspace().get_connection(&f.conn_id).unwrap();
+    p.config.kind = databrain_connector_core::ConnectorKind::Postgres;
+    p.config.host = Some("warehouse.corp.example".into());
+    p.config.read_only = true;
+    f.engine.workspace().save_connection(p).unwrap();
+    let before = f.engine.workspace().get_connection(&f.conn_id).unwrap();
+    assert!(!before.config.is_redshift() && before.config.server_read_only(), "an alias: taken as Postgres");
+    f.engine.remember_flavor(&f.conn_id, "redshift");
+    let after = f.engine.workspace().get_connection(&f.conn_id).unwrap();
+    assert!(after.config.is_redshift() && !after.config.server_read_only());
+    assert_eq!(after.config.host, before.config.host, "nothing else changes");
+    // Again: nothing to save.
+    f.engine.remember_flavor(&f.conn_id, "redshift");
+    assert_eq!(f.engine.workspace().get_connection(&f.conn_id).unwrap().updated_at, after.updated_at);
+}

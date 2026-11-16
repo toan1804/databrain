@@ -153,11 +153,23 @@ impl Connector for PostgresConnector {
             r => r?,
         };
         let version: String = client.query_one("select version()", &[]).await.map(|r| r.get(0)).unwrap_or_default();
+        // Redshift the configuration didn't say: the startup-options fallback, or its version.
+        let detected = !redshift && (init.is_some() || version.contains("Redshift"));
+        let is_redshift = redshift || detected;
         Ok(Box::new(PgSession {
-            link: Arc::new(Link { pg, tls: tls.clone(), init, temporary, current: std::sync::RwLock::new((Arc::new(client), task)), state: ConnState::new() }),
+            link: Arc::new(Link {
+                pg,
+                tls: tls.clone(),
+                init,
+                temporary,
+                redshift: is_redshift,
+                current: std::sync::RwLock::new((Arc::new(client), task)),
+                state: ConnState::new(),
+            }),
             tls,
             read_only: cfg.read_only,
-            redshift: redshift || version.contains("Redshift"),
+            redshift: is_redshift,
+            detected_redshift: detected,
         }))
     }
 }

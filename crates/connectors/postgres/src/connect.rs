@@ -81,6 +81,8 @@ pub(crate) struct Link {
     /// Setup SQL run on every new connection (Redshift: DateStyle).
     pub(crate) init: Option<String>,
     pub(crate) temporary: bool,
+    /// Amazon Redshift: no SAVEPOINT, so no cursor for the row limit in a transaction.
+    pub(crate) redshift: bool,
     pub(crate) current: std::sync::RwLock<(Arc<Client>, tokio::task::AbortHandle)>,
     /// What the connection carries (transactions, SET, temp tables).
     pub(crate) state: ConnState,

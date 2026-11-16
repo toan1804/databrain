@@ -468,3 +468,13 @@ async fn live_stop_while_rows_arrive_cancels_on_the_server() {
     .expect("the session answers");
     assert!(t.elapsed() < std::time::Duration::from_secs(3), "waited {:?} for the rest of the result", t.elapsed());
 }
+
+/// The row limit's cursor is used inside a transaction, never on Redshift
+/// (no SAVEPOINT there: the failed one would abort the user's transaction).
+#[test]
+fn the_row_limit_cursor_is_off_on_redshift() {
+    use crate::exec::cursor_for_limit;
+    assert!(cursor_for_limit(false, true));
+    assert!(!cursor_for_limit(false, false), "outside a transaction: not needed");
+    assert!(!cursor_for_limit(true, true), "Redshift: refused");
+}
