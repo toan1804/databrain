@@ -48,7 +48,11 @@
     }),
     get_job: (a) => mock.db.jobs.find((j) => j.id === a.id) ?? { __error: { kind: "not_found", message: `job ${a.id} not found` } },
     save_job: (a) => {
-      const job = { ...a.job, id: a.job.id || `job-${nextId++}`, updated_at: Date.now(), created_at: a.job.created_at || Date.now() };
+      // As the app: a save made on an older version than the one saved is refused.
+      const stored = mock.db.jobs.find((j) => j.id === a.job.id);
+      if (stored && stored.updated_at !== a.job.updated_at)
+        return { __error: { kind: "conflict", message: `"${stored.name}" was changed elsewhere since it was opened` } };
+      const job = { ...a.job, id: a.job.id || `job-${nextId++}`, updated_at: Math.max(Date.now(), (stored?.updated_at ?? 0) + 1), created_at: a.job.created_at || Date.now() };
       mock.db.jobs = [...mock.db.jobs.filter((j) => j.id !== job.id), job];
       return job;
     },
@@ -57,6 +61,10 @@
       return null;
     },
   };
+
+  // A handler may wait (return a promise), e.g. to hold a save while
+  // something else happens; it can still use the built-in answers.
+  mock.builtins = builtins;
 
   function answer(cmd, args) {
     if (cmd in mock.handlers) {
@@ -97,7 +105,7 @@
       }
       if (cmd === "plugin:event|unlisten" || cmd === "plugin:event|emit") return null;
       mock.calls.push({ cmd, args: clone(args) });
-      const r = answer(cmd, args);
+      const r = await answer(cmd, args);
       if (r && typeof r === "object" && r.__error) throw r.__error;
       return r;
     },

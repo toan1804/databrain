@@ -914,11 +914,39 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     if sql.trim().is_empty() {
         return Err(EngineError::new("invalid", "This step has no SQL"));
     }
-    // SQL the assistant wrote (and every step of a run it started) passes
-    // the connection's AI rules as they are now: the job was approved under
-    // the rules of that day, and since then the connection may have become
-    // production or read-only, or lost "AI may write" or a table.
-    if t.step_origin(node) == Origin::Ai {
+    // Rows the assistant's SQL selected (an output it made: a step whose
+    // SQL it wrote, a query of its own) stay the assistant's: a step that
+    // reads them, by its SQL or by default from its upstream, runs under the
+    // AI rules too, so a load or export the user wrote can't take rows the
+    // assistant chose where the assistant may not write. Every DuckDB
+    // connection reads `results.*` (Results, a DuckDB file, MotherDuck), so
+    // a query step on any of them is followed; the step's own output then is
+    // the AI's as well, so this follows the rows down the job.
+    let on_results = node.kind != JobNodeKind::Query || reads_outputs(ctx, &connection_id)?;
+    let ai_rows: Vec<String> = if on_results {
+        ctx.engine.outputs().referenced(&sql).into_iter().filter(|o| o.origin == Origin::Ai).map(|o| o.name.unwrap_or(o.handle)).collect()
+    } else {
+        vec![]
+    };
+    let origin = if ai_rows.is_empty() { t.step_origin(node) } else { Origin::Ai };
+    if origin == Origin::Ai && t.step_origin(node) != Origin::Ai {
+        t.log(
+            "info",
+            format!(
+                "Runs under the AI rules: it reads rows the assistant's SQL selected ({})",
+                ai_rows.iter().map(|n| format!("results.{n}")).collect::<Vec<_>>().join(", ")
+            ),
+            None,
+            None,
+            None,
+        );
+    }
+    // SQL the assistant wrote (and every step of a run it started, and of
+    // rows it chose) passes the connection's AI rules as they are now: the
+    // job was approved under the rules of that day, and since then the
+    // connection may have become production or read-only, or lost "AI may
+    // write" or a table.
+    if origin == Origin::Ai {
         ai_rules_now(ctx, node, &sql, &connection_id, t).await?;
     }
     // Checked before the query runs, so a missing folder fails fast.
@@ -938,13 +966,12 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             ),
         )
     };
-    // (A query on another database naming `results.x` reads its own table.)
-    if (node.kind != JobNodeKind::Query || connection_id == ctx.engine.results_connection()?.id)
-        && let Some(o) = ctx.engine.outputs().referenced(&sql).into_iter().find(|o| o.truncated)
-    {
+    // Every DuckDB connection reads `results.*` (the same rule as above); a
+    // query on another database naming `results.x` reads its own table.
+    if on_results && let Some(o) = ctx.engine.outputs().referenced(&sql).into_iter().find(|o| o.truncated) {
         return Err(capped(&o, "run"));
     }
-    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(node), cancel, t).await?;
+    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), origin, cancel, t).await?;
     let last = outcomes.last();
     let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
     if node.kind == JobNodeKind::Query {
@@ -989,6 +1016,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
     // Before/after SQL get the run's `:name` values too.
     let mut spec = load_spec(node);
+    spec.origin = origin;
     let kind = ctx.workspace.get_connection(target)?.config.kind;
     let params = t.params()?;
     for sql in [&mut spec.before_sql, &mut spec.after_sql].into_iter().flatten() {
@@ -1004,6 +1032,15 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     }
     let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
+}
+
+/// Whether SQL on `connection_id` can read the outputs (`results.*`): every
+/// DuckDB connection loads them, Results and the user's DuckDB files alike.
+fn reads_outputs(ctx: &JobCtx, connection_id: &str) -> Result<bool> {
+    if connection_id == ctx.engine.results_connection()?.id {
+        return Ok(true);
+    }
+    Ok(ctx.workspace.get_connection(connection_id).is_ok_and(|p| p.config.kind == databrain_connector_core::ConnectorKind::Duckdb))
 }
 
 /// What a load step writes, from its settings.

@@ -41,11 +41,31 @@ pub fn get_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job> {
 /// workspace). A step keeps the AI's mark (`ai_sql`) only while its SQL is
 /// as the AI saved it and the user didn't clear it ("Trust this SQL"); a
 /// step the user wrote or changed is the user's, and a user save can't mark
-/// a step as the AI's.
+/// a step as the AI's. A new step that is a copy of one of the AI's
+/// ("Duplicate": the same SQL and connections) keeps the mark: a copy of
+/// the assistant's SQL is still the assistant's.
+///
+/// `job.updated_at` is the version the editor's changes are based on: a
+/// save made on an older version (the assistant or another window saved the
+/// job since) is refused with kind `conflict`. Saved as it is, it would put
+/// back what the other change replaced, and SQL the assistant wrote before
+/// would come back as the user's (it differs from the assistant's current
+/// SQL, so it counts as edited).
 pub fn save_job(state: &AppState, mut job: databrain_workspace::Job) -> Result<databrain_workspace::Job> {
     let old = if job.id.is_empty() { None } else { state.workspace.get_job(&job.id).ok() };
+    if let Some(o) = &old
+        && o.updated_at != job.updated_at
+    {
+        return Err(EngineError::new(
+            "conflict",
+            format!("\"{}\" was changed elsewhere since it was opened (by the assistant or another window): your changes go on top of that version", o.name),
+        ));
+    }
     for n in &mut job.nodes {
-        let kept = old.as_ref().and_then(|o| o.nodes.iter().find(|x| x.id == n.id)).is_some_and(|o| o.ai_sql && o.same_sql(n));
+        let kept = match old.as_ref().and_then(|o| o.nodes.iter().find(|x| x.id == n.id)) {
+            Some(o) => o.ai_sql && o.same_sql(n),
+            None => old.as_ref().is_some_and(|o| o.nodes.iter().any(|x| x.ai_sql && x.same_sql(n))),
+        };
         n.ai_sql = n.ai_sql && kept;
     }
     // Names the job doesn't own yet must not be taken by other outputs.
@@ -65,26 +85,10 @@ pub fn save_job(state: &AppState, mut job: databrain_workspace::Job) -> Result<d
 /// job's step, a named output of a query tab or notebook, or a notebook
 /// cell's output name. `None` when it's free.
 pub fn output_name_user(state: &AppState, name: &str, job_id: &str) -> Result<Option<String>> {
-    if let Some(o) = state.workspace.job_step_owner(name)?
-        && o.job_id != job_id
-    {
-        return Ok(Some(o.describe()));
-    }
-    // Outputs of job steps don't count: step names decide (a renamed or
-    // deleted step's old outputs don't keep its name taken).
-    if let Some(o) = state.engine.outputs().resolve(name).filter(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
-        && !matches!(SessionRole::parse(&o.tab_id), SessionRole::JobStep { .. })
-    {
-        let from = if matches!(SessionRole::parse(&o.tab_id), SessionRole::Notebook { .. }) { "a notebook cell" } else { "a query tab" };
-        return Ok(Some(format!("output {} (from {from}); rename or remove it first", o.handle)));
-    }
-    for nb in state.workspace.list_notebooks()? {
-        let Ok(nb) = state.workspace.get_notebook(&nb.id) else { continue };
-        if nb.cells.iter().any(|c| c.output_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))) {
-            return Ok(Some(format!("a cell of notebook \"{}\"", nb.name)));
-        }
-    }
-    Ok(None)
+    databrain_ai::jobs::output_name_user(&state.engine, name, job_id).map_err(|e| match e {
+        databrain_ai::AiError::Policy(m) => invalid(m),
+        other => EngineError::new("internal", other.to_string()),
+    })
 }
 
 pub fn delete_job(state: &AppState, id: &str) -> Result<()> {

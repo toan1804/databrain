@@ -72,3 +72,15 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 - **Query tips** don't see a column more than about 500 characters into a call as wrapped by it (`coalesce(` with thousands of arguments): the price of keeping long predicates fast.
 - **SQL text with no known dialect** (a query tip without a connection) is read as DuckDB reads it: `$$` opens a string.
 
+## AI job tools (review of 2026-11-17)
+
+The escapes found by the red-team review are fixed (see CHANGELOG, Security). Left:
+
+- **Duplicate across a rebase:** a copy of the assistant's step whose original the assistant changes before the copy is saved is saved as yours (the server finds no step of the assistant's with the copy's older SQL). Narrow window.
+- **Rebase drops your edits to a step the assistant deleted** without saying so.
+- **`set_job_node_results`** reads, changes and writes the job's spec without the save lock or a new version: a run ending during a save can write back the older spec under the newer version.
+- **Check-then-save isn't atomic:** `save_job` and `update_job` check the version, then save; two saves in the same moment can both pass (no step changes owner: marks are judged against the version read).
+- **Approval noise:** renaming an upstream step lists "runs after new (was old)" on every step after it, though their rows don't change.
+- **Not followed:** the assistant's rows reached through `USE results`, a view made earlier, or a table name built from a `:param`; tables the assistant's steps wrote on other databases.
+- **Name check not repeated after approval:** a tab or notebook taking the name meanwhile is refused later (the job step keeps it).
+- **Missing tests:** a load with explicit `select … from results.x` SQL of the assistant's rows; a chain of steps following them.

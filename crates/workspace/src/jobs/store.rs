@@ -184,10 +184,14 @@ impl Workspace {
                 return Err(Error::Invalid(format!("results.{} is already the output of {}; choose another step name", n.name, owner.describe())));
             }
         }
-        let now = now_ms();
+        let mut now = now_ms();
         if job.id.is_empty() {
             job.id = new_id();
             job.created_at = now;
+        } else if let Some(prev) = self.conn.lock().query_row("SELECT updated_at FROM jobs WHERE id = ?1", [&job.id], |r| r.get::<_, i64>(0)).optional()? {
+            // Each save is a new version (the editor's saves are refused
+            // when based on an older one): two in one millisecond differ too.
+            now = now.max(prev + 1);
         }
         job.updated_at = now;
         let spec = serde_json::to_string(&Spec::of(&job)).map_err(|e| Error::Invalid(e.to_string()))?;

@@ -1341,6 +1341,73 @@ async fn creates_a_job_across_connections() {
     assert!(c.call("update_job", &fix).await.content.starts_with("Nothing changes"));
 }
 
+/// The assistant's steps can't take a name the user's notebooks (or query
+/// tabs, or other jobs) already use: whatever reads `results.<name>` would
+/// then read the assistant's rows. And a change approved over a version of
+/// the job the user changed meanwhile isn't saved over theirs.
+#[tokio::test]
+async fn job_names_and_versions_stay_the_users() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    let profile = f.ws.get_connection(&f.conn).unwrap();
+    let nb: databrain_workspace::Notebook = serde_json::from_value(json!({
+        "name": "Weekly",
+        "cells": [{"id": "", "kind": "sql", "source": "select 1", "output_name": "nb_sales"}]
+    }))
+    .unwrap();
+    f.ws.save_notebook(nb).unwrap();
+    let ctx = |host: Arc<dyn ToolHost>| databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: profile.clone(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host,
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+        provider_id: None,
+    };
+    let c = ctx(Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }));
+    let job = |step: &str| json!({"name": "Sales", "steps": [{"name": step, "connection": profile.name, "sql": "select country, amount from orders"}]});
+    // Refused: the notebook's output name.
+    let o = c.call("create_job", &job("nb_sales")).await.content;
+    assert!(o.contains("already used by a cell of notebook \"Weekly\""), "{o}");
+    assert!(f.ws.list_jobs().unwrap().is_empty());
+    // Allowed: a free name.
+    let o = c.call("create_job", &job("job_sales")).await.content;
+    assert!(o.starts_with("Created job"), "{o}");
+    // Renaming the step onto it is refused too.
+    let o = c
+        .call("update_job", &json!({"job": "Sales", "rename": {"job_sales": "nb_sales"}, "steps": [{"name": "nb_sales", "connection": profile.name, "sql": "select country, amount from orders"}]}))
+        .await
+        .content;
+    assert!(o.contains("already used by a cell of notebook"), "{o}");
+
+    // The user saves the job while the approval waits: the change isn't saved over it.
+    struct EditsMeanwhile(Arc<databrain_workspace::Workspace>);
+    #[async_trait::async_trait]
+    impl ToolHost for EditsMeanwhile {
+        async fn approve(&self, _: &str, _: &str, detail: &Value) -> Option<Value> {
+            let id = self.0.list_jobs().unwrap()[0].id.clone();
+            let mut j = self.0.get_job(&id).unwrap();
+            j.nodes[0].x += 40.0;
+            self.0.save_job(j).unwrap();
+            Some(detail.clone())
+        }
+    }
+    let racing = ctx(Arc::new(EditsMeanwhile(f.ws.clone())));
+    let change = json!({"job": "Sales", "steps": [{"name": "job_sales", "connection": profile.name, "sql": "select country from orders"}]});
+    let o = racing.call("update_job", &change).await.content;
+    assert!(o.contains("was changed while the change waited for approval"), "{o}");
+    let id = f.ws.list_jobs().unwrap()[0].id.clone();
+    assert_eq!(f.ws.get_job(&id).unwrap().nodes[0].sql, "select country, amount from orders", "nothing saved");
+    // Asked again on the current version: saved.
+    let o = c.call("update_job", &change).await.content;
+    assert!(o.starts_with("Updated job"), "{o}");
+    assert_eq!(f.ws.get_job(&id).unwrap().nodes[0].sql, "select country from orders");
+}
+
 /// Jobs the assistant builds, changes or runs follow its policy like its
 /// own queries do (runs don't prompt, so it is checked before).
 #[tokio::test]

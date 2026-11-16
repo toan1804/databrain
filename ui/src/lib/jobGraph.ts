@@ -339,3 +339,95 @@ export function batchValue(text: string, max: number): number | null {
   if (!text.trim() || !Number.isFinite(n) || n <= 0) return null;
   return Math.min(n, max);
 }
+
+/** A step's fields that decide whose SQL it is (as the app's `JobNode::same_sql`). */
+const TEXT_FIELDS = ["kind", "sql", "connection_id", "target_connection_id", "load_before_sql", "load_after_sql"] as const;
+/** Fields the app keeps, not the editor. */
+const SERVER_FIELDS = new Set(["last_run", "updated_at", "created_at", "last_scheduled_at", "id"]);
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+const text = (v: unknown) => (typeof v === "string" ? v.trim() : (v ?? null));
+const sameText = (a: JobNode, b: JobNode) => TEXT_FIELDS.every((k) => same(text(a[k]), text(b[k])));
+/** Where and how a step writes (as the app's `JobNode::same_effect`, with its SQL). */
+const EFFECT_FIELDS = ["target_table", "load_mode", "key_columns", "create_table", "export_folder", "export_file", "export_format"] as const;
+const sameEffect = (a: JobNode, b: JobNode) => sameText(a, b) && EFFECT_FIELDS.every((k) => same(text(a[k]), text(b[k])));
+
+/**
+ * Steps whose SQL was edited here while the assistant changed the same step
+ * (its SQL, connections or where it writes) in the version saved since: the
+ * rebase keeps the assistant's version of those (see [`rebaseJob`]).
+ */
+export function rebaseClashes(base: Job, mine: Job, theirs: Job): string[] {
+  const baseById = new Map(base.nodes.map((n) => [n.id, n]));
+  const mineById = new Map(mine.nodes.map((n) => [n.id, n]));
+  return theirs.nodes
+    .filter((t) => {
+      const b = baseById.get(t.id);
+      const m = mineById.get(t.id);
+      return !!b && !!m && !sameText(m, b) && !sameEffect(t, b);
+    })
+    .map((t) => t.name);
+}
+
+/**
+ * Edits made on `base` (`mine`) put on top of the job as saved since
+ * (`theirs`, e.g. after the assistant changed it): what the user changed
+ * wins, what they left alone is `theirs`. A step's SQL, connections and
+ * before/after SQL go together: the user's version when they edited any of
+ * them (the step is then theirs, as any step they edit), else `theirs`
+ * whole, with its AI mark — so an older version of SQL the assistant wrote
+ * never comes back as the user's. Clearing the mark ("Trust this SQL")
+ * only counts for the SQL the user trusted. A step both changed (the user
+ * its SQL, the version since its SQL, connections or where it writes) keeps
+ * the version since: the user is told ([`rebaseClashes`]) and edits again.
+ */
+export function rebaseJob(base: Job, mine: Job, theirs: Job): Job {
+  const out: Job = { ...theirs };
+  for (const k of Object.keys(mine) as (keyof Job)[]) {
+    if (k === "nodes" || k === "edges" || SERVER_FIELDS.has(k)) continue;
+    if (!same(mine[k], base[k])) (out as Record<string, unknown>)[k] = mine[k];
+  }
+  const baseById = new Map(base.nodes.map((n) => [n.id, n]));
+  const mineById = new Map(mine.nodes.map((n) => [n.id, n]));
+  const theirIds = new Set(theirs.nodes.map((n) => n.id));
+  const nodes: JobNode[] = [];
+  for (const t of theirs.nodes) {
+    const b = baseById.get(t.id);
+    const m = mineById.get(t.id);
+    if (!b || !m) {
+      // Added since (theirs), or deleted by the user (in base, not in mine).
+      if (!b) nodes.push(t);
+      continue;
+    }
+    const n: Record<string, unknown> = { ...t };
+    for (const k of Object.keys(m) as (keyof JobNode)[]) {
+      if (SERVER_FIELDS.has(k) || (TEXT_FIELDS as readonly string[]).includes(k) || k === "ai_sql") continue;
+      if (!same(m[k], b[k])) n[k] = m[k];
+    }
+    if (!sameText(m, b) && !sameEffect(t, b)) {
+      // Both changed the step: the version saved since stays whole (SQL,
+      // connections, where it writes, its mark), so the user's SQL can't
+      // take what the assistant changed as the user's ([`rebaseClashes`]).
+      for (const k of [...TEXT_FIELDS, ...EFFECT_FIELDS]) n[k] = t[k];
+      n.ai_sql = t.ai_sql;
+    } else if (!sameText(m, b)) {
+      for (const k of TEXT_FIELDS) n[k] = m[k];
+      n.ai_sql = m.ai_sql;
+    } else if (!same(m.ai_sql, b.ai_sql) && sameText(t, b)) {
+      n.ai_sql = m.ai_sql;
+    }
+    nodes.push(n as JobNode);
+  }
+  // Steps the user added.
+  for (const m of mine.nodes) if (!baseById.has(m.id) && !theirIds.has(m.id)) nodes.push(m);
+  const ids = new Set(nodes.map((n) => n.id));
+  const key = (e: JobEdge) => `${e.from}\u0000${e.to}`;
+  const baseEdges = new Set(base.edges.map(key));
+  const mineEdges = new Set(mine.edges.map(key));
+  const edges = theirs.edges.filter((e) => !(baseEdges.has(key(e)) && !mineEdges.has(key(e))));
+  const have = new Set(edges.map(key));
+  for (const e of mine.edges) if (!baseEdges.has(key(e)) && !have.has(key(e))) edges.push(e);
+  out.nodes = nodes;
+  out.edges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+  return out;
+}

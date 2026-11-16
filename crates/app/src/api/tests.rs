@@ -1171,7 +1171,7 @@ async fn ai_job_runs_are_sandboxed() {
     trusted.nodes.iter_mut().find(|n| n.id == "s3").unwrap().ai_sql = false;
     let after = save_job(&st, trusted).unwrap();
     assert!(!after.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql);
-    st.workspace.save_job(saved.clone()).unwrap();
+    let saved = st.workspace.save_job(saved.clone()).unwrap();
     // The user changes the SQL: the step is theirs, and reads files again.
     let mut edited = saved;
     edited.nodes.iter_mut().find(|n| n.id == "s3").unwrap().sql = format!("select a from read_csv('{}')", csv.display());
@@ -1179,6 +1179,101 @@ async fn ai_job_runs_are_sandboxed() {
     assert!(!saved.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql);
     let by_hand = run("schedule").await;
     assert_eq!(step(&by_hand, "secret").rows, Some(1), "{by_hand:?}");
+}
+
+/// The editor's saves are based on the version it loaded: one made on an
+/// older version (the assistant changed the job since) is refused, so SQL
+/// the assistant wrote before can't come back as the user's; a save on the
+/// current version goes through. A copy of the assistant's step
+/// ("Duplicate") stays the assistant's; a new step of the user's is theirs.
+/// A user's save judges the assistant's mark by its SQL and connections
+/// only: pointing the assistant's load at another table, mode or keys keeps
+/// it the assistant's (so its SQL stays under the AI rules).
+#[test]
+fn a_users_new_target_keeps_the_assistants_load_the_assistants() {
+    let (st, _sink, _dir) = state();
+    let job: databrain_workspace::Job = serde_json::from_value(serde_json::json!({
+        "name": "Targets",
+        "nodes": [
+            {"id": "l", "name": "ai_load", "kind": "load", "sql": "select 1 as id", "target_connection_id": "pg", "target_table": "t", "ai_sql": true}
+        ]
+    }))
+    .unwrap();
+    let opened = st.workspace.save_job(job).unwrap();
+    let mut edit = opened.clone();
+    let n = edit.nodes.iter_mut().find(|n| n.id == "l").unwrap();
+    n.target_table = Some("other".into());
+    n.load_mode = databrain_workspace::LoadMode::Replace;
+    n.key_columns = vec!["id".into()];
+    let saved = save_job(&st, edit).unwrap();
+    assert!(saved.nodes[0].ai_sql, "still the assistant's SQL");
+    // Its SQL changed by the user: the user's.
+    let mut edit = saved.clone();
+    edit.nodes[0].sql = "select 2 as id".into();
+    assert!(!save_job(&st, edit).unwrap().nodes[0].ai_sql);
+}
+
+#[test]
+fn job_saves_follow_the_version_and_copies_keep_the_ai_mark() {
+    let (st, _sink, _dir) = state();
+    let job: databrain_workspace::Job = serde_json::from_value(serde_json::json!({
+        "name": "Versions",
+        "nodes": [
+            {"id": "u", "name": "users_step", "kind": "query", "sql": "select 1 as x"},
+            {"id": "a", "name": "ai_step", "kind": "query", "sql": "select 2 as y", "ai_sql": true}
+        ]
+    }))
+    .unwrap();
+    // As the assistant's tools save it (through the workspace).
+    let opened = st.workspace.save_job(job).unwrap();
+    assert!(opened.nodes.iter().find(|n| n.id == "a").unwrap().ai_sql);
+
+    // The assistant changes its step while the editor has the job open.
+    let mut by_ai = opened.clone();
+    by_ai.nodes.iter_mut().find(|n| n.id == "a").unwrap().sql = "select 3 as y".into();
+    let current = st.workspace.save_job(by_ai).unwrap();
+    assert!(current.updated_at > opened.updated_at);
+
+    // Refused: the editor's version (the step's older SQL, still marked as
+    // the AI's) would come back as the user's.
+    let mut stale = opened.clone();
+    stale.nodes.iter_mut().find(|n| n.id == "u").unwrap().x = 300.0;
+    let e = save_job(&st, stale).unwrap_err();
+    assert_eq!(e.kind, "conflict", "{e:?}");
+    let kept = st.workspace.get_job(&opened.id).unwrap();
+    assert_eq!(kept.nodes.iter().find(|n| n.id == "a").unwrap().sql, "select 3 as y");
+    assert!(kept.nodes.iter().find(|n| n.id == "a").unwrap().ai_sql);
+
+    // Allowed: the same edit on the current version.
+    let mut fresh = current.clone();
+    fresh.nodes.iter_mut().find(|n| n.id == "u").unwrap().x = 300.0;
+    let saved = save_job(&st, fresh).unwrap();
+    assert_eq!(saved.nodes.iter().find(|n| n.id == "u").unwrap().x, 300.0);
+    assert!(saved.nodes.iter().find(|n| n.id == "a").unwrap().ai_sql, "still the AI's");
+    assert!(saved.updated_at > current.updated_at);
+
+    // Duplicate: a copy of the AI's step (new id, same SQL) stays the AI's;
+    // a new step of the user's can't take the mark.
+    let mut dup = saved.clone();
+    let mut copy = dup.nodes.iter().find(|n| n.id == "a").unwrap().clone();
+    copy.id = "a_copy".into();
+    copy.name = "ai_step_2".into();
+    let mut mine = dup.nodes.iter().find(|n| n.id == "u").unwrap().clone();
+    mine.id = "u_new".into();
+    mine.name = "users_step_2".into();
+    mine.sql = "select 4 as z".into();
+    mine.ai_sql = true;
+    dup.nodes.push(copy);
+    dup.nodes.push(mine);
+    let saved = save_job(&st, dup).unwrap();
+    assert!(saved.nodes.iter().find(|n| n.id == "a_copy").unwrap().ai_sql, "a copy of the AI's SQL is the AI's");
+    assert!(!saved.nodes.iter().find(|n| n.id == "u_new").unwrap().ai_sql, "a user save can't mark the user's SQL as the AI's");
+
+    // A copy whose SQL the user then changed is theirs.
+    let mut edited = saved.clone();
+    edited.nodes.iter_mut().find(|n| n.id == "a_copy").unwrap().sql = "select 5 as y".into();
+    let saved = save_job(&st, edited).unwrap();
+    assert!(!saved.nodes.iter().find(|n| n.id == "a_copy").unwrap().ai_sql);
 }
 
 /// The saved Instant Client folder is checked at launch like the thin
