@@ -268,6 +268,7 @@ impl Workspace {
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, spec_json = excluded.spec_json, updated_at = excluded.updated_at",
             params![job.id, job.name.trim(), spec, job.created_at, job.updated_at],
         )?;
+        Self::drop_stale_watermarks(&tx, &job)?;
         tx.commit()?;
         drop(c);
         self.get_job(&job.id)
@@ -291,7 +292,7 @@ impl Workspace {
         Ok(n)
     }
 
-    /// Delete a job, its runs and queued starts; the jobs that ran
+    /// Delete a job, its runs, marks and queued starts; the jobs that ran
     /// after it no longer do (their edit time is kept). One write
     /// transaction: a crash leaves all of it or none, and a save of one of
     /// those jobs at the same moment (another process) isn't overwritten
@@ -299,7 +300,7 @@ impl Workspace {
     pub fn delete_job(&self, id: &str) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for table in ["job_runs", "job_after_pending"] {
+        for table in ["job_runs", "job_watermarks", "job_watermarks_pending", "job_after_pending"] {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
         tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
@@ -338,6 +339,95 @@ impl Workspace {
         }
         out.sort_by_key(|a| a.1.to_lowercase());
         Ok(out)
+    }
+
+    /// An incremental step's mark: the largest value of `column` after its
+    /// last successful run. A mark taken from another column (the step's
+    /// column changed since) doesn't count.
+    pub fn job_watermark(&self, job_id: &str, node_id: &str, column: &str) -> Result<Option<Watermark>> {
+        let w = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT column_name, value, value_type, run_id, updated_at FROM job_watermarks WHERE job_id = ?1 AND node_id = ?2",
+                params![job_id, node_id],
+                |r| Ok(Watermark { column: r.get(0)?, value: r.get(1)?, value_type: r.get(2)?, run_id: r.get(3)?, updated_at: r.get(4)? }),
+            )
+            .optional()?;
+        Ok(w.filter(|w| w.column.eq_ignore_ascii_case(column.trim())))
+    }
+
+    /// Keep `value` (of type `value_type`) as the step's mark, taken from
+    /// `column` by run `run_id`; a pending mark of the step is done with.
+    pub fn set_job_watermark(&self, job_id: &str, node_id: &str, column: &str, value: &str, value_type: Option<&str>, run_id: Option<i64>) -> Result<()> {
+        let c = self.conn.lock();
+        c.execute(
+            "INSERT INTO job_watermarks (job_id, node_id, column_name, value, value_type, run_id, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (job_id, node_id) DO UPDATE SET column_name = excluded.column_name, value = excluded.value, value_type = excluded.value_type,
+               run_id = excluded.run_id, updated_at = excluded.updated_at",
+            params![job_id, node_id, column.trim(), value, value_type, run_id, now_ms()],
+        )?;
+        c.execute("DELETE FROM job_watermarks_pending WHERE job_id = ?1 AND node_id = ?2", params![job_id, node_id])?;
+        Ok(())
+    }
+
+    /// A mark the step took while a step after it didn't succeed: it
+    /// becomes the mark when they have (a resume), replaced by the step's
+    /// next run. `None` drops it.
+    pub fn set_job_watermark_pending(&self, job_id: &str, node_id: &str, pending: Option<&PendingMark>) -> Result<()> {
+        let c = self.conn.lock();
+        match pending {
+            Some(p) => c.execute(
+                "INSERT INTO job_watermarks_pending (job_id, node_id, column_name, value, value_type, run_id, taken_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (job_id, node_id) DO UPDATE SET column_name = excluded.column_name, value = excluded.value,
+                   value_type = excluded.value_type, run_id = excluded.run_id, taken_at = excluded.taken_at",
+                params![job_id, node_id, p.column.trim(), p.value, p.value_type, p.run_id, p.taken_at],
+            )?,
+            None => c.execute("DELETE FROM job_watermarks_pending WHERE job_id = ?1 AND node_id = ?2", params![job_id, node_id])?,
+        };
+        Ok(())
+    }
+
+    /// The step's pending mark, when taken from `column`.
+    pub fn job_watermark_pending(&self, job_id: &str, node_id: &str, column: &str) -> Result<Option<PendingMark>> {
+        let p = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT column_name, value, value_type, run_id, taken_at FROM job_watermarks_pending WHERE job_id = ?1 AND node_id = ?2",
+                params![job_id, node_id],
+                |r| Ok(PendingMark { column: r.get(0)?, value: r.get(1)?, value_type: r.get(2)?, run_id: r.get(3)?, taken_at: r.get(4)? }),
+            )
+            .optional()?;
+        Ok(p.filter(|p| p.column.eq_ignore_ascii_case(column.trim())))
+    }
+
+    /// Marks of `job` that its steps no longer have: of a deleted step, or
+    /// taken from a column the step doesn't use any more (another column,
+    /// or not incremental), so changing the column back starts from the
+    /// start value instead of an old mark.
+    fn drop_stale_watermarks(c: &rusqlite::Connection, job: &Job) -> Result<()> {
+        for table in ["job_watermarks", "job_watermarks_pending"] {
+            let rows: Vec<(String, String)> = {
+                let mut st = c.prepare(&format!("SELECT node_id, column_name FROM {table} WHERE job_id = ?1"))?;
+                st.query_map([&job.id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            };
+            for (node_id, column) in rows {
+                let current = job.nodes.iter().find(|n| n.id == node_id).and_then(|n| n.incremental_column.as_deref()).map(str::trim).filter(|c| !c.is_empty());
+                if current.is_none_or(|cur| !cur.eq_ignore_ascii_case(column.trim())) {
+                    c.execute(&format!("DELETE FROM {table} WHERE job_id = ?1 AND node_id = ?2"), params![job.id, node_id])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Forget the step's mark (and a pending one): its next run reads from the start value.
+    pub fn reset_job_watermark(&self, job_id: &str, node_id: &str) -> Result<()> {
+        let c = self.conn.lock();
+        c.execute("DELETE FROM job_watermarks WHERE job_id = ?1 AND node_id = ?2", params![job_id, node_id])?;
+        c.execute("DELETE FROM job_watermarks_pending WHERE job_id = ?1 AND node_id = ?2", params![job_id, node_id])?;
+        Ok(())
     }
 
     /// Queue a "run after" start of `job_id` that couldn't happen now (the
@@ -632,6 +722,8 @@ mod tests {
             export_format: FileFormat::Csv,
             ai_sql: false,
             limits: Default::default(),
+            incremental_column: None,
+            incremental_start: None,
             last_run: None,
         }
     }
@@ -920,8 +1012,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Deleting a job takes it out of every list in one go, its queued
-    /// starts with it; the other jobs' own settings are kept.
+    /// Deleting a job takes it out of every list in one go, its marks and
+    /// queued starts with it; the other jobs' own settings are kept.
     #[test]
     fn deleting_a_job_cleans_up_everything_of_it() {
         let ws = Workspace::open_in_memory().unwrap();
@@ -933,6 +1025,7 @@ mod tests {
         b.schedule.after_jobs = vec![a.id.clone()];
         b.schedule.time_zone = "Europe/Paris".into();
         let b = ws.save_job(b).unwrap();
+        ws.set_job_watermark(&a.id, "n", "id", "5", Some("integer"), Some(1)).unwrap();
         ws.queue_job_after(&a.id, "after:X", false).unwrap();
         ws.queue_job_after(&b.id, "after:Gone", false).unwrap();
         ws.delete_job(&a.id).unwrap();
@@ -940,7 +1033,42 @@ mod tests {
         let b = ws.get_job(&b.id).unwrap();
         assert!(b.schedule.after_jobs.is_empty());
         assert_eq!(b.schedule.time_zone, "Europe/Paris");
+        assert_eq!(ws.job_watermark(&a.id, "n", "id").unwrap(), None);
         // Its own queued start goes; one it triggered for another job stays (it runs once).
         assert_eq!(ws.queued_job_after().unwrap(), vec![(b.id.clone(), "after:Gone".to_string())]);
+    }
+
+    /// Marks belong to a step and its column: saving the job drops those of
+    /// a deleted step and of a column the step doesn't use any more, so
+    /// switching the column back starts again from the start value.
+    #[test]
+    fn saving_a_job_drops_marks_its_steps_no_longer_have() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let mut a = node("inc");
+        a.incremental_column = Some("id".into());
+        let mut j = ws.save_job(job(vec![a, node("other")], vec![])).unwrap();
+        let pending = |v: &str| PendingMark { column: "id".into(), value: v.into(), value_type: Some("integer".into()), run_id: Some(1), taken_at: 1 };
+        ws.set_job_watermark(&j.id, "n0", "id", "5", Some("integer"), Some(1)).unwrap();
+        ws.set_job_watermark_pending(&j.id, "n0", Some(&pending("7"))).unwrap();
+        ws.set_job_watermark(&j.id, "n1", "id", "9", Some("integer"), Some(1)).unwrap();
+        // Saved unchanged: kept (the step and its column are the same; case doesn't matter).
+        j.nodes[0].incremental_column = Some("ID".into());
+        let mut j = ws.save_job(j).unwrap();
+        assert_eq!(ws.job_watermark(&j.id, "n0", "id").unwrap().map(|w| w.value).as_deref(), Some("5"));
+        assert!(ws.job_watermark_pending(&j.id, "n0", "id").unwrap().is_some());
+        // Not incremental (n1): its mark goes.
+        assert_eq!(ws.job_watermark(&j.id, "n1", "id").unwrap(), None);
+        // Another column: gone, and back to the first one it isn't revived.
+        j.nodes[0].incremental_column = Some("updated_at".into());
+        let mut j = ws.save_job(j).unwrap();
+        j.nodes[0].incremental_column = Some("id".into());
+        let mut j = ws.save_job(j).unwrap();
+        assert_eq!(ws.job_watermark(&j.id, "n0", "id").unwrap(), None);
+        assert_eq!(ws.job_watermark_pending(&j.id, "n0", "id").unwrap(), None);
+        // A deleted step's marks go with it.
+        ws.set_job_watermark(&j.id, "n0", "id", "5", Some("integer"), Some(1)).unwrap();
+        j.nodes.remove(0);
+        let j = ws.save_job(j).unwrap();
+        assert_eq!(ws.job_watermark(&j.id, "n0", "id").unwrap(), None);
     }
 }

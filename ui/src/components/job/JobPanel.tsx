@@ -10,6 +10,7 @@ import { RunLog } from "./RunLog";
 import { JobLimits } from "./LimitFields";
 import { ScheduleSection } from "./ScheduleSection";
 import { triggerText } from "../../lib/jobGraph";
+import { WATERMARK, isIncremental } from "./IncrementalFields";
 import { ProgressBar, StatusIcon, field, label, statusText, type Patch } from "./shared";
 
 /** "2 succeeded · 1 failed" for a run's steps. */
@@ -35,14 +36,17 @@ function useJobParamNames(job: Job): string[] {
   useEffect(() => {
     let alive = true;
     const kindOf = (id: string | null | undefined): ConnectorKind => (connections.find((c) => c.id === id)?.config.kind ?? "duckdb") as ConnectorKind;
-    const texts: [ConnectorKind, string][] = [];
+    // [kind, sql, incremental]: an incremental step's `:watermark` is its mark, not a job parameter.
+    const texts: [ConnectorKind, string, boolean][] = [];
     for (const n of job.nodes) {
-      texts.push([n.kind === "query" ? kindOf(n.connection_id) : "duckdb", n.sql]);
-      for (const extra of [n.load_before_sql, n.load_after_sql]) if (extra) texts.push([kindOf(n.target_connection_id), extra]);
+      const incremental = isIncremental(n);
+      texts.push([n.kind === "query" ? kindOf(n.connection_id) : "duckdb", n.sql, incremental]);
+      for (const extra of [n.load_before_sql, n.load_after_sql]) if (extra) texts.push([kindOf(n.target_connection_id), extra, incremental]);
     }
     const t = setTimeout(() => {
-      Promise.all(texts.filter(([, sql]) => sql.includes(":") || sql.includes("&")).map(([k, sql]) => api.sqlParameters(k, sql).catch(() => [])))
-        .then((all) => alive && setNames([...new Set(all.flat().map((p) => p.name))]))
+      const withParams = texts.filter(([, sql]) => sql.includes(":") || sql.includes("&"));
+      Promise.all(withParams.map(([k, sql]) => api.sqlParameters(k, sql).catch(() => [])))
+        .then((all) => alive && setNames([...new Set(all.flatMap((ps, i) => ps.map((p) => p.name).filter((n) => !(withParams[i][2] && n.toLowerCase() === WATERMARK))))]))
         .catch(() => {});
     }, 300);
     return () => {

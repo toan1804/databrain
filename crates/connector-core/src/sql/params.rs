@@ -151,7 +151,7 @@ pub fn render_param(v: &ParamValue, kind: ConnectorKind) -> Option<String> {
     Some(quote_string(t, kind))
 }
 
-fn is_number(t: &str) -> bool {
+pub(super) fn is_number(t: &str) -> bool {
     let s = t.strip_prefix(['-', '+']).unwrap_or(t);
     let (mant, exp) = match s.find(['e', 'E']) {
         Some(p) => (&s[..p], Some(&s[p + 1..])),

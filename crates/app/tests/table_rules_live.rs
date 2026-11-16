@@ -121,6 +121,8 @@ fn ai_job(connection_id: &str, sql: &str) -> Job {
         export_format: FileFormat::Csv,
         ai_sql: true,
         limits: Default::default(),
+        incremental_column: None,
+        incremental_start: None,
         last_run: None,
     };
     Job {

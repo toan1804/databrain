@@ -326,6 +326,8 @@ pub fn run() {
             commands::jobs::dry_run_job_step,
             commands::system::load_batch_limits,
             commands::jobs::job_run_log,
+            commands::jobs::job_watermark,
+            commands::jobs::reset_job_watermark,
             commands::jobs::check_job_cron,
             commands::jobs::check_job_time_zone,
             commands::jobs::job_time_zones,

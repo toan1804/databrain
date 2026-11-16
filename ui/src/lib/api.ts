@@ -10,6 +10,7 @@ import type {
   JobRunEvent,
   JobLogEvent,
   RunLogEntry,
+  Watermark,
   JobSummary,
   LoadDryRun,
   LoadTarget,
@@ -373,6 +374,8 @@ export const api = {
   revealLogs: () => call<void>("reveal_logs"),
   /** Log of one run of a job, oldest first. */
   jobRunLog: (id: string, runId: number) => call<RunLogEntry[]>("job_run_log", { id, runId }),
+  jobWatermark: (id: string, nodeId: string, column: string) => call<Watermark | null>("job_watermark", { id, nodeId, column }),
+  resetJobWatermark: (id: string, nodeId: string) => call<void>("reset_job_watermark", { id, nodeId }),
   /** Why a cron expression can't be a job's schedule (what a save says), or null. */
   checkJobCron: (cron: string) => call<string | null>("check_job_cron", { cron }),
   /** Why a time zone can't be a job's, or null. */

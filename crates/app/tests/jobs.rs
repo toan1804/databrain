@@ -79,6 +79,8 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
         export_format: FileFormat::Csv,
         ai_sql: false,
         limits: Default::default(),
+        incremental_column: None,
+        incremental_start: None,
         last_run: None,
     }
 }
@@ -2265,6 +2267,180 @@ async fn job_outputs_have_their_own_memory() {
     .expect("in time");
 }
 
+/// An incremental step: its SQL gets `:watermark`, the start value on the
+/// first run and then the largest value of its column; the mark moves only
+/// when the step and the load after it succeed; Reset starts over.
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_steps_read_only_new_rows() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+        rows(&st, &src, "create table events (id integer, v text); insert into events values (1, 'a'), (2, 'b'), (3, 'c'); select 1").await;
+        let mut read = node("a", "new_events", JobNodeKind::Query, Some(&src), "select id, v from events where id > :watermark order by id");
+        read.incremental_column = Some("ID".into());
+        read.incremental_start = Some("0".into());
+        let mut load = node("b", "copied", JobNodeKind::Load, None, "");
+        load.target_connection_id = Some(dst.clone());
+        load.target_table = Some("copied".into());
+        let mut job = plain_job("incremental", vec![read, load]);
+        job.edges = vec![JobEdge { from: "a".into(), to: "b".into() }];
+        let mut job = st.workspace.save_job(job).unwrap();
+        let mark = |st: &AppState, job: &Job| api::job_watermark(st, &job.id, "a", "id").unwrap().map(|w| w.value);
+        let log_text = |st: &AppState, job: &Job, run: &JobRun| {
+            api::job_run_log(st, &job.id, run.id).unwrap().into_iter().map(|l| l.message).collect::<Vec<_>>().join("\n")
+        };
+
+        // First run: from the start value.
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(step(&run, "new_events").rows, Some(3));
+        assert_eq!(mark(&st, &job).as_deref(), Some("3"));
+        let log = log_text(&st, &job, &run);
+        assert!(log.contains(":watermark = 0 (the start value") && log.contains("Incremental mark moved: largest id is now 3"), "{log}");
+        // A mark of another column doesn't count.
+        assert_eq!(api::job_watermark(&st, &job.id, "a", "v").unwrap(), None);
+
+        // Second run: only the new rows.
+        rows(&st, &src, "insert into events values (4, 'd'), (5, 'e'); select 1").await;
+        let run = run_all(&st, &job).await;
+        assert_eq!(step(&run, "new_events").rows, Some(2));
+        assert!(log_text(&st, &job, &run).contains(":watermark = 3 (the step's mark from run #"));
+        assert_eq!(mark(&st, &job).as_deref(), Some("5"));
+        assert_eq!(rows(&st, &dst, "select count(*), max(id) from copied").await, vec![vec!["5", "5"]]);
+
+        // The load fails (rolled back): the mark stays, the next run reads the row again.
+        rows(&st, &src, "insert into events values (6, 'f'); select 1").await;
+        job.nodes[1].load_after_sql = Some("insert into no_such_table values (1)".into());
+        let mut job = st.workspace.save_job(job).unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "error");
+        assert_eq!(step(&run, "new_events").rows, Some(1));
+        assert_eq!(mark(&st, &job).as_deref(), Some("5"));
+        assert!(log_text(&st, &job, &run).contains("Incremental mark not moved: step copied after it didn't succeed"));
+        job.nodes[1].load_after_sql = None;
+        let mut job = st.workspace.save_job(job).unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(step(&run, "new_events").rows, Some(1));
+        assert_eq!(mark(&st, &job).as_deref(), Some("6"));
+        assert_eq!(rows(&st, &dst, "select count(*) from copied").await, vec![vec!["6"]]);
+
+        // Only the step, without its load: the load didn't run, so the mark stays.
+        rows(&st, &src, "insert into events values (7, 'g'); select 1").await;
+        api::run_job(&st, &job.id, Some(vec!["a".into()])).unwrap();
+        let run = finished(&st, &job.id).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(mark(&st, &job).as_deref(), Some("6"));
+
+        // Then the whole job moves it; with no new rows it is kept.
+        let run = run_all(&st, &job).await;
+        assert_eq!(mark(&st, &job).as_deref(), Some("7"));
+        let run2 = run_all(&st, &job).await;
+        assert_eq!((step(&run, "new_events").rows, step(&run2, "new_events").rows), (Some(1), Some(0)));
+        assert_eq!(mark(&st, &job).as_deref(), Some("7"));
+        assert!(log_text(&st, &job, &run2).contains("Incremental mark kept: no rows"));
+
+        // Reset: from the start value again.
+        api::reset_job_watermark(&st, &job.id, "a").unwrap();
+        assert_eq!(mark(&st, &job), None);
+        let run = run_all(&st, &job).await;
+        assert_eq!(step(&run, "new_events").rows, Some(7));
+        assert_eq!(mark(&st, &job).as_deref(), Some("7"));
+
+        // Without a start value (and no mark), or with a column the rows
+        // don't have: the step fails and says why.
+        api::reset_job_watermark(&st, &job.id, "a").unwrap();
+        job.nodes[0].incremental_start = None;
+        let mut job = st.workspace.save_job(job).unwrap();
+        let err = step(&run_all(&st, &job).await, "new_events").error.unwrap_or_default();
+        assert!(err.contains("Enter the start value of the incremental column ID"), "{err}");
+        job.nodes[0].incremental_start = Some("0".into());
+        job.nodes[0].incremental_column = Some("nope".into());
+        let job = st.workspace.save_job(job).unwrap();
+        let err = step(&run_all(&st, &job).await, "new_events").error.unwrap_or_default();
+        assert!(err.contains("have no column nope") && err.contains("id, v"), "{err}");
+    })
+    .await
+    .expect("in time");
+}
+
+/// Resume after an incremental step's load failed: the load succeeds
+/// without the step running again, so the step's pending mark becomes its
+/// mark and the next run doesn't load the same rows twice. A failed rerun
+/// of the step drops the pending mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_moves_an_incremental_steps_pending_mark() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+        rows(&st, &src, "create table events (id integer, v text); insert into events values (1, 'a'), (2, 'b'), (3, 'c'); select 1").await;
+        rows(&st, &dst, "create table copied (id integer, v text); select 1").await;
+        let mut read = node("a", "events_in", JobNodeKind::Query, Some(&src), "select id, v from events where id > :watermark order by id");
+        read.incremental_column = Some("id".into());
+        read.incremental_start = Some("0".into());
+        let mut load = node("b", "events_out", JobNodeKind::Load, None, "");
+        load.target_connection_id = Some(dst.clone());
+        load.target_table = Some("copied".into());
+        load.load_after_sql = Some("insert into no_such_table values (1)".into());
+        let mut job = plain_job("pending marks", vec![read, load]);
+        job.edges = vec![JobEdge { from: "a".into(), to: "b".into() }];
+        let job = st.workspace.save_job(job).unwrap();
+        let mark = |st: &AppState| api::job_watermark(st, &job_id(st), "a", "id").unwrap().map(|w| w.value);
+        fn job_id(st: &AppState) -> String {
+            st.workspace.list_jobs().unwrap().into_iter().find(|j| j.name == "pending marks").unwrap().id
+        }
+
+        // The load fails: no mark yet, a pending one.
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "error", "{run:?}");
+        assert_eq!(mark(&st), None);
+        assert_eq!(st.workspace.job_watermark_pending(&job.id, "a", "id").unwrap().map(|p| p.value).as_deref(), Some("3"));
+
+        // Fixed (as saved now: with its steps' last results), then resumed:
+        // only the load runs, the mark moves to 3.
+        let mut job = st.workspace.get_job(&job.id).unwrap();
+        job.nodes[1].load_after_sql = None;
+        let job = st.workspace.save_job(job).unwrap();
+        api::resume_job(&st, &job.id).unwrap();
+        let run = finished(&st, &job.id).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(run.nodes.iter().all(|n| n.node_id != "a"), "the step didn't run again: {run:?}");
+        assert_eq!(mark(&st).as_deref(), Some("3"));
+        assert_eq!(st.workspace.job_watermark_pending(&job.id, "a", "id").unwrap(), None);
+        let log = api::job_run_log(&st, &job.id, run.id).unwrap().into_iter().map(|l| l.message).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("Incremental mark moved: the steps after it succeeded"), "{log}");
+
+        // The next run reads only the new row: no row is loaded twice.
+        rows(&st, &src, "insert into events values (4, 'd'); select 1").await;
+        let run = run_all(&st, &job).await;
+        assert_eq!(step(&run, "events_in").rows, Some(1));
+        assert_eq!(rows(&st, &dst, "select count(*), count(distinct id) from copied").await, vec![vec!["4", "4"]]);
+
+        // A pending mark is dropped when the step runs again and fails.
+        let pending = databrain_workspace::PendingMark {
+            column: "id".into(),
+            value: "99".into(),
+            value_type: Some("integer".into()),
+            run_id: Some(run.id),
+            taken_at: databrain_workspace::now_ms(),
+        };
+        st.workspace.set_job_watermark_pending(&job.id, "a", Some(&pending)).unwrap();
+        let mut broken = st.workspace.get_job(&job.id).unwrap();
+        broken.nodes[0].sql = "select id from no_such_table where id > :watermark".into();
+        let broken = st.workspace.save_job(broken).unwrap();
+        api::run_job(&st, &broken.id, Some(vec!["a".into()])).unwrap();
+        assert_eq!(finished(&st, &broken.id).await.status, "error");
+        assert_eq!(st.workspace.job_watermark_pending(&job.id, "a", "id").unwrap(), None);
+        assert_eq!(mark(&st).as_deref(), Some("4"));
+    })
+    .await
+    .expect("in time");
+}
+
 /// "Run after" a job that is busy: the start is queued, not lost, and the
 /// next scheduler pass starts it once the job is free.
 #[tokio::test(flavor = "multi_thread")]
@@ -2405,6 +2581,46 @@ async fn a_waiting_step_can_be_stopped() {
     })
     .await
     .expect("in time");
+}
+
+/// An incremental step that reads is tried again after a connection error
+/// (its `:watermark` is a value, so its SQL is still a read); one that
+/// writes isn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_reads_are_tried_again() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let st = state();
+        st.jobs.set_retry_delay(Duration::from_secs(3));
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("later");
+        let later = sqlite(&st, "Later", &folder.join("later.db"), false);
+        let mut read = node("n1", "inc_read_later", JobNodeKind::Query, Some(&later), "select 42 as id where 42 > :watermark");
+        read.incremental_column = Some("id".into());
+        read.incremental_start = Some("0".into());
+        read.limits.retries = Some(2);
+        let job = st.workspace.save_job(plain_job("Incremental retry", vec![read])).unwrap();
+        api::run_job(&st, &job.id, None).unwrap();
+        until("the first try failed", 30, || logged(&st, &job.id, "Try 1 of 3 failed")).await;
+        std::fs::create_dir(&folder).unwrap();
+        let run = finished(&st, &job.id).await;
+        let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+        assert_eq!(run.status, "success", "{log:#?}");
+        assert_eq!(step(&run, "inc_read_later").attempt, Some(2));
+
+        // Writing SQL with :watermark: not tried again.
+        std::fs::remove_dir_all(&folder).unwrap();
+        let mut write = node("n1", "inc_write_later", JobNodeKind::Query, Some(&later), "delete from t where id < :watermark; select 1 as id");
+        write.incremental_column = Some("id".into());
+        write.incremental_start = Some("0".into());
+        write.limits.retries = Some(2);
+        let job2 = st.workspace.save_job(plain_job("Incremental no retry", vec![write])).unwrap();
+        let run = run_all(&st, &job2).await;
+        assert_eq!((run.status.as_str(), step(&run, "inc_write_later").attempt), ("error", Some(1)), "{run:?}");
+        let log = api::job_run_log(&st, &job2.id, run.id).unwrap();
+        assert!(log.iter().any(|l| l.message.starts_with("Not tried again: its SQL may write")), "{log:?}");
+    })
+    .await
+    .expect("test hung");
 }
 
 /// `databrain-jobs tick` end to end: every run it started is reported (a
@@ -2585,6 +2801,218 @@ async fn dead_runners_and_unrecorded_starts() {
         assert_eq!(finished(&st, &job.id).await.status, "success");
         assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty(), "not due again");
         assert_eq!(st.workspace.job_runs(&job.id, 10).unwrap().len(), 2);
+    })
+    .await;
+}
+
+/// An incremental step whose rows two loads read: its new mark waits until
+/// both have loaded those rows. "Run this step" on the step, then on one
+/// load, doesn't move it (the other load's last success had older rows:
+/// moving it would skip the new row there for good); the other load
+/// running too does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_mark_waits_for_every_step_after_it() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+        rows(&st, &src, "create table events (id integer); insert into events values (1), (2), (3); select 1").await;
+        rows(&st, &dst, "create table one (id integer); create table two (id integer); select 1").await;
+        let mut read = node("a", "fanned", JobNodeKind::Query, Some(&src), "select id from events where id > :watermark order by id");
+        read.incremental_column = Some("id".into());
+        read.incremental_start = Some("0".into());
+        let load = |id: &str, name: &str, table: &str| {
+            let mut l = node(id, name, JobNodeKind::Load, None, "");
+            l.target_connection_id = Some(dst.clone());
+            l.target_table = Some(table.into());
+            l
+        };
+        let mut job = plain_job("fan out", vec![read, load("b", "to_one", "one"), load("c", "to_two", "two")]);
+        job.edges = vec![JobEdge { from: "a".into(), to: "b".into() }, JobEdge { from: "a".into(), to: "c".into() }];
+        let job = st.workspace.save_job(job).unwrap();
+        let mark = |st: &AppState| api::job_watermark(st, &job.id, "a", "id").unwrap().map(|w| w.value);
+        let only = |ids: &[&str]| Some(ids.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(run_all(&st, &job).await.status, "success");
+        assert_eq!(mark(&st).as_deref(), Some("3"));
+
+        rows(&st, &src, "insert into events values (4); select 1").await;
+        api::run_job(&st, &job.id, only(&["a"])).unwrap();
+        assert_eq!(finished(&st, &job.id).await.status, "success");
+        assert_eq!(mark(&st).as_deref(), Some("3"), "the loads haven't run: pending");
+        api::run_job(&st, &job.id, only(&["b"])).unwrap();
+        assert_eq!(finished(&st, &job.id).await.status, "success");
+        assert_eq!(mark(&st).as_deref(), Some("3"), "to_two's last success had only the older rows");
+        assert_eq!(rows(&st, &dst, "select count(*) from one union all select count(*) from two").await, vec![vec!["4"], vec!["3"]]);
+        api::run_job(&st, &job.id, only(&["c"])).unwrap();
+        assert_eq!(finished(&st, &job.id).await.status, "success");
+        assert_eq!(mark(&st).as_deref(), Some("4"), "both loads have the new row");
+
+        // The next run reads nothing new: no row lost or loaded twice.
+        let run = run_all(&st, &job).await;
+        assert_eq!(step(&run, "fanned").rows, Some(0));
+        let counts = "select count(*), count(distinct id) from one union all select count(*), count(distinct id) from two";
+        assert_eq!(rows(&st, &dst, counts).await, vec![vec!["4", "4"], vec!["4", "4"]]);
+    })
+    .await;
+}
+
+/// Resume when the failed step is two steps below the incremental one: the
+/// step between them still holds this run's rows (it isn't run again), so
+/// the mark moves once the load succeeds, and the next run loads nothing twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_moves_a_mark_two_steps_up() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+        rows(&st, &src, "create table events (id integer); insert into events values (1), (2), (3); select 1").await;
+        rows(&st, &dst, "create table copied (id integer); select 1").await;
+        let mut read = node("a", "chain_in", JobNodeKind::Query, Some(&src), "select id from events where id > :watermark order by id");
+        read.incremental_column = Some("id".into());
+        read.incremental_start = Some("0".into());
+        let middle = node("t", "chain_mid", JobNodeKind::Query, None, "select * from results.chain_in");
+        let mut load = node("l", "chain_out", JobNodeKind::Load, None, "");
+        load.target_connection_id = Some(dst.clone());
+        load.target_table = Some("copied".into());
+        load.load_after_sql = Some("insert into no_such_table values (1)".into());
+        let mut job = plain_job("chain", vec![read, middle, load]);
+        job.edges = vec![JobEdge { from: "a".into(), to: "t".into() }, JobEdge { from: "t".into(), to: "l".into() }];
+        let mut job = st.workspace.save_job(job).unwrap();
+        let mark = |st: &AppState, id: &str| api::job_watermark(st, id, "a", "id").unwrap().map(|w| w.value);
+
+        assert_eq!(run_all(&st, &job).await.status, "error");
+        assert_eq!(mark(&st, &job.id), None);
+        // Fixed as the user does it: the saved job, with its steps' last runs.
+        job = st.workspace.get_job(&job.id).unwrap();
+        job.nodes[2].load_after_sql = None;
+        let job = st.workspace.save_job(job).unwrap();
+        api::resume_job(&st, &job.id).unwrap();
+        let run = finished(&st, &job.id).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(run.nodes.iter().all(|n| n.node_id == "l"), "only the load ran again: {run:?}");
+        assert_eq!(mark(&st, &job.id).as_deref(), Some("3"));
+
+        rows(&st, &src, "insert into events values (4); select 1").await;
+        let run = run_all(&st, &job).await;
+        assert_eq!(step(&run, "chain_in").rows, Some(1));
+        assert_eq!(rows(&st, &dst, "select count(*), count(distinct id) from copied").await, vec![vec!["4", "4"]]);
+    })
+    .await;
+}
+
+/// Reset while the job runs is refused (the run's end would set the mark
+/// it read again); once it has ended, Reset works.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mark_is_not_reset_while_its_job_runs() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let mut read = node("a", "quick_mark", JobNodeKind::Query, Some(&src), "select 5 as id where 5 > :watermark");
+        read.incremental_column = Some("id".into());
+        read.incremental_start = Some("0".into());
+        let slow = node("b", "slow_beside", JobNodeKind::Query, Some(&src), SLOW);
+        let job = st.workspace.save_job(plain_job("reset while running", vec![read, slow])).unwrap();
+        api::run_job(&st, &job.id, None).unwrap();
+        until("the slow step running", 20, || step_status(&st, &job.id, "b").as_deref() == Some("running")).await;
+        let e = api::reset_job_watermark(&st, &job.id, "a").unwrap_err();
+        assert!(e.message.contains("running"), "{e:?}");
+        assert!(api::cancel_job(&st, &job.id));
+        finished(&st, &job.id).await;
+        api::reset_job_watermark(&st, &job.id, "a").unwrap();
+        assert_eq!(api::job_watermark(&st, &job.id, "a", "id").unwrap(), None);
+    })
+    .await;
+}
+
+/// A mark goes back into the SQL as its column's type: a text column's
+/// number-like value as a string, a timestamp with its fraction and offset,
+/// binary as a hex literal. Each next run reads nothing again.
+#[tokio::test(flavor = "multi_thread")]
+async fn marks_keep_their_columns_type() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let db = duckdb(&st, "typed", &dir.path().join("typed.duckdb"));
+        rows(
+            &st,
+            &db,
+            "create table src (code varchar, ts timestamptz, bin blob); \
+             insert into src values ('9', timestamptz '2026-01-02 03:04:05.123456+00', '\\x01\\x02'::blob), \
+             ('20260102', timestamptz '2026-01-02 03:04:05.123457+00', '\\x01\\xff'::blob); select 1",
+        )
+        .await;
+        for (name, col, want) in
+            [("by_code", "code", "> '9'"), ("by_ts", "ts", "> TIMESTAMPTZ '2026-01-02 03:04:05.123457"), ("by_bin", "bin", "> unhex('01ff')")]
+        {
+            // The first run starts below every value (NULL: all rows).
+            let mut n = node("a", name, JobNodeKind::Query, Some(&db), &format!("select {col} from src where :watermark is null or {col} > :watermark"));
+            n.incremental_column = Some(col.into());
+            n.incremental_start = Some("null".into());
+            let job = st.workspace.save_job(plain_job(&format!("typed {name}"), vec![n])).unwrap();
+            let first = run_all(&st, &job).await;
+            assert_eq!(first.status, "success", "{name}: {first:?}");
+            assert_eq!(step(&first, name).rows, Some(2), "{name}");
+            let second = run_all(&st, &job).await;
+            assert_eq!(second.status, "success", "{name}: {second:?}");
+            let log = api::job_run_log(&st, &job.id, second.id).unwrap();
+            let sql: Vec<String> = log.iter().filter_map(|l| l.sql.clone()).collect();
+            assert!(sql.iter().any(|s| s.contains(want)), "{name}: {sql:#?}");
+            assert_eq!(step(&second, name).rows, Some(0), "{name}: the largest row isn't read again");
+        }
+    })
+    .await;
+}
+
+/// Live (Postgres, MySQL): marks of a text column holding numbers, of a
+/// timestamp with fractional seconds (and a zone on Postgres) and of binary
+/// go back as literals of their type: each next run reads nothing again
+/// (and fails nowhere, as `text > 9` would on Postgres).
+#[ignore = "live: needs DATABRAIN_PG_HOST and DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn live_marks_keep_their_columns_type() {
+    guarded(async {
+        let st = state();
+        let suffix = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let servers = [
+            (
+                "DATABRAIN_PG",
+                ConnectorKind::Postgres,
+                "postgres",
+                "5432",
+                "postgres",
+                "code text, ts timestamptz(6), bin bytea",
+                "'\\x01ff'::bytea",
+                "'\\x0102'::bytea",
+            ),
+            ("DATABRAIN_MYSQL", ConnectorKind::Mysql, "root", "3306", "mysql", "code varchar(20), ts datetime(6), bin varbinary(8)", "x'01ff'", "x'0102'"),
+        ];
+        for (env, kind, user, port, database, cols, hi, lo) in servers {
+            let conn = live_conn(&st, env, kind, user, port, database);
+            let table = format!("db_marks_{suffix}");
+            let ts_hi = if kind == ConnectorKind::Postgres { "'2026-01-02 03:04:05.123457+02'" } else { "'2026-01-02 03:04:05.123457'" };
+            let ts_lo = if kind == ConnectorKind::Postgres { "'2026-01-02 03:04:05.123456+02'" } else { "'2026-01-02 03:04:05.123456'" };
+            rows(&st, &conn, &format!("create table {table} ({cols}); select 1")).await;
+            rows(&st, &conn, &format!("insert into {table} values ('9', {ts_lo}, {lo}), ('20260102', {ts_hi}, {hi}); select 1")).await;
+            for col in ["code", "ts", "bin"] {
+                let name = format!("mark_{col}_{}", if kind == ConnectorKind::Postgres { "pg" } else { "my" });
+                let mut n =
+                    node("a", &name, JobNodeKind::Query, Some(&conn), &format!("select {col} from {table} where :watermark is null or {col} > :watermark"));
+                n.incremental_column = Some(col.into());
+                n.incremental_start = Some("null".into());
+                let job = st.workspace.save_job(plain_job(&format!("{env} {col}"), vec![n])).unwrap();
+                let first = run_all(&st, &job).await;
+                assert_eq!(first.status, "success", "{env} {col}: {first:?}");
+                assert_eq!(step(&first, &name).rows, Some(2), "{env} {col}");
+                let second = run_all(&st, &job).await;
+                assert_eq!(second.status, "success", "{env} {col}: {second:?}");
+                assert_eq!(step(&second, &name).rows, Some(0), "{env} {col}: {:#?}", api::job_run_log(&st, &job.id, second.id).unwrap());
+            }
+            rows(&st, &conn, &format!("drop table {table}; select 1")).await;
+        }
     })
     .await;
 }

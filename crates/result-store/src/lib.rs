@@ -670,6 +670,50 @@ impl ResultSet {
         Ok(FindResult { matches, truncated: false })
     }
 
+    /// The largest non-NULL value of `column` over every row (those on disk
+    /// too), as the grid shows it; None when it has no non-NULL value. Exact
+    /// decimals compare by value. A job's incremental mark.
+    pub fn column_max(&mut self, column: usize) -> Result<Option<String>> {
+        if column >= self.schema.fields().len() {
+            return Err(Error::InvalidColumn(column));
+        }
+        let decimal_text = display::is_decimal_text(self.schema.field(column));
+        // NaN sorts above every number: as a mark nothing would be greater.
+        let no_nan = |col: &ArrayRef| -> ArrayRef {
+            use databrain_connector_core::arrow::array::{Float32Array, Float64Array};
+            if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+                return Arc::new(a.iter().map(|v| v.filter(|x| !x.is_nan())).collect::<Float64Array>());
+            }
+            if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
+                return Arc::new(a.iter().map(|v| v.filter(|x| !x.is_nan())).collect::<Float32Array>());
+            }
+            col.clone()
+        };
+        let largest = |col: &ArrayRef| -> Result<Option<usize>> {
+            if col.null_count() == col.len() {
+                return Ok(None);
+            }
+            let sortable = if decimal_text { Arc::new(decimal::keys(col.as_ref())?) as ArrayRef } else { col.clone() };
+            let order = compute::sort_to_indices(sortable.as_ref(), Some(compute::SortOptions { descending: true, nulls_first: false }), Some(1))?;
+            Ok(order.values().first().map(|i| *i as usize).filter(|i| !col.is_null(*i)))
+        };
+        // Each batch's largest, then the largest of those.
+        let mut best: Vec<ArrayRef> = Vec::new();
+        self.for_each_batch(&ViewSpec::default(), 65_536, &mut |b| {
+            let col = no_nan(b.column(column));
+            if let Some(i) = largest(&col)? {
+                best.push(col.slice(i, 1));
+            }
+            Ok(())
+        })?;
+        if best.is_empty() {
+            return Ok(None);
+        }
+        let all = compute::concat(&best.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
+        let Some(i) = largest(&all)? else { return Ok(None) };
+        Ok(Some(display::to_display(all.as_ref())?.value(i).to_string()))
+    }
+
     /// Statistics of one column over the current view.
     pub fn column_stats(&mut self, spec: &ViewSpec, column: usize) -> Result<ColumnStats> {
         if column >= self.schema.fields().len() {
@@ -1063,6 +1107,33 @@ mod tests {
     use databrain_connector_core::arrow::array::{Float64Array, Int64Array, StringArray};
     use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
     use databrain_connector_core::value::META_DB_TYPE;
+
+    /// The largest value over every batch: numbers, text, decimals by value
+    /// (100 > 10.5), NULLs skipped; None for an out-of-range column's error.
+    #[test]
+    fn column_max_over_all_batches() {
+        let mut rs = sample();
+        assert_eq!(rs.column_max(0).unwrap().as_deref(), Some("5"));
+        assert_eq!(rs.column_max(1).unwrap().as_deref(), Some("bob"));
+        assert_eq!(rs.column_max(2).unwrap().as_deref(), Some("9.5"));
+        assert_eq!(rs.column_max(3).unwrap().as_deref(), Some("100"));
+        assert!(rs.column_max(9).is_err());
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let mut empty = ResultSet::new("r2", schema.clone());
+        empty.push(RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![None, None]))]).unwrap());
+        empty.finish(false);
+        assert_eq!(empty.column_max(0).unwrap(), None);
+        // NaN isn't a largest value; only NaN is none.
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let mut nan = ResultSet::new("r3", schema.clone());
+        nan.push(RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(vec![Some(1.5), Some(f64::NAN), Some(2.5)]))]).unwrap());
+        nan.finish(false);
+        assert_eq!(nan.column_max(0).unwrap().as_deref(), Some("2.5"));
+        let mut only = ResultSet::new("r4", schema.clone());
+        only.push(RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![Some(f64::NAN)]))]).unwrap());
+        only.finish(false);
+        assert_eq!(only.column_max(0).unwrap(), None);
+    }
 
     fn sample() -> ResultSet {
         let mut md = HashMap::new();

@@ -32,7 +32,8 @@
 use futures::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use databrain_connector_core::sql::ParamValue;
+use databrain_connector_core::ConnectorKind;
+use databrain_connector_core::sql::{MarkType, ParamValue};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,7 +41,8 @@ use databrain_query_engine::{EngineError, EventHub, LoadDryRun, LoadEvent, LoadO
 use databrain_workspace::jobs::Due;
 use databrain_workspace::jobs::LOG_KEPT;
 use databrain_workspace::{
-    FileFormat, Job, JobNode, JobNodeKind, JobRun, NodeRunRecord, NodeRunSummary, Origin, RunLogEntry, StepProgress, Workspace, duration_text, now_ms,
+    FileFormat, Job, JobNode, JobNodeKind, JobRun, NodeRunRecord, NodeRunSummary, Origin, PendingMark, RunLogEntry, StepProgress, Workspace, duration_text,
+    now_ms,
 };
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -237,6 +239,11 @@ pub struct JobCtx {
 }
 
 /// Session/run key of a step.
+/// The kind of connection `id` (the Results DuckDB when it isn't a saved one).
+fn connection_kind(ctx: &JobCtx, id: &str) -> ConnectorKind {
+    ctx.workspace.get_connection(id).map(|p| p.config.kind).unwrap_or(ConnectorKind::Duckdb)
+}
+
 fn node_tab(job: &str, node: &str) -> String {
     databrain_workspace::SessionRole::JobStep { job: job.into(), node: node.into() }.key()
 }
@@ -308,6 +315,10 @@ pub struct Tracer {
     node: Option<(String, String)>,
     /// `:name` values of the run (or why there are none: its steps fail with it).
     params: Arc<std::result::Result<HashMap<String, ParamValue>, String>>,
+    /// An incremental step's `:watermark`: its value, and the type of its
+    /// column (a stored mark) or none (the start value, typed by the user):
+    /// written as a literal of that type for each connection it runs on.
+    watermark: Arc<Option<(String, Option<MarkType>)>>,
     /// How far the step's load got, for [`retry_refused`].
     load: Arc<Mutex<LoadState>>,
 }
@@ -319,6 +330,7 @@ impl Tracer {
             live: Arc::new(Mutex::new(Live { run, log: Vec::new(), dropped: 0, last_emit: Instant::now() })),
             node: None,
             params: Arc::new(Ok(HashMap::new())),
+            watermark: Arc::new(None),
             load: Arc::default(),
         }
     }
@@ -326,6 +338,25 @@ impl Tracer {
     /// The run's `:name` values for a step's SQL.
     fn params(&self) -> Result<HashMap<String, ParamValue>> {
         self.params.as_ref().clone().map_err(|e| EngineError::new("invalid", e))
+    }
+
+    /// The run's `:name` values for SQL that runs on a `kind` connection,
+    /// with the step's `:watermark` as a literal of its column's type there.
+    fn params_for(&self, kind: ConnectorKind) -> Result<HashMap<String, ParamValue>> {
+        let mut p = self.params()?;
+        if let Some((value, ty)) = self.watermark.as_ref() {
+            let v = match ty {
+                Some(ty) => ParamValue { value: ty.literal(value, kind), raw: true },
+                None => ParamValue { value: value.clone(), raw: false },
+            };
+            p.insert(WATERMARK.to_string(), v);
+        }
+        Ok(p)
+    }
+
+    /// This tracer with the step's `:watermark`.
+    fn with_watermark(&self, mark: (String, Option<MarkType>)) -> Self {
+        Tracer { watermark: Arc::new(Some(mark)), ..self.clone() }
     }
 
     fn for_node(&self, node: &JobNode) -> Self {
@@ -858,6 +889,8 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     // Status per selected step: pending → running → success/error/skipped/cancelled.
     let mut status: HashMap<String, &'static str> = selected.iter().map(|id| (id.clone(), "pending")).collect();
     let mut set = tokio::task::JoinSet::new();
+    // Incremental steps' new marks, kept once the steps after them succeed.
+    let mut marks: HashMap<String, PendingMark> = HashMap::new();
     let started_run = Instant::now();
     // Steps at once: in the run, and per connection (`slot_key`).
     let (max_parallel, max_per_connection) = (job.limits.max_parallel(), job.limits.max_per_connection());
@@ -1049,6 +1082,11 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                     Some(out.rows),
                     Some(took),
                 );
+                if let Some((column, value, ty)) = out.mark {
+                    // Taken now: a step after it that succeeds from now on has its rows.
+                    marks
+                        .insert(node.id.clone(), PendingMark { column, value, value_type: Some(ty.as_str().into()), run_id: Some(run.id), taken_at: now_ms() });
+                }
                 let mut r = record(&node, "success", Some(started), Some(out.rows), None);
                 r.summary.file = out.file;
                 r.summary.notices = out.notices;
@@ -1103,6 +1141,7 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     if released > 0 {
         ctx.engine.outputs_changed();
     }
+    advance_marks(ctx, &job, &status, &marks, &tracer);
     let any = |s: &str| status.values().any(|v| *v == s);
     for (id, st) in &status {
         if *st == "error" {
@@ -1286,7 +1325,12 @@ fn retryable(e: &EngineError) -> bool {
 /// read, no function that isn't a known built-in), and a load only when it
 /// wrote nothing or ran in one transaction that was rolled back.
 fn retry_refused(ctx: &JobCtx, node: &JobNode, t: &Tracer) -> Option<String> {
-    let Ok(params) = t.params() else { return Some("the run's parameter values are missing".into()) };
+    let Ok(mut params) = t.params() else { return Some("the run's parameter values are missing".into()) };
+    // An incremental step's SQL reads `:watermark` too (a value, never SQL):
+    // any value classifies it the same (an empty one counts as missing).
+    if incremental_column(node).is_some() {
+        params.entry(WATERMARK.to_string()).or_insert(ParamValue { value: "0".into(), raw: false });
+    }
     let reads = |sql: &str, connection: Option<&str>| {
         let kind = match connection.filter(|c| !c.is_empty()) {
             Some(c) => ctx.workspace.get_connection(c).ok().map(|p| p.config.kind),
@@ -1454,7 +1498,7 @@ async fn run_sql(
 ) -> Result<Vec<databrain_query_engine::StatementOutcomeView>> {
     let conn = ctx.workspace.get_connection(&connection_id).map(|p| p.name).unwrap_or_else(|_| connection_id.clone());
     // The run's `:name` values (job parameters); a missing one fails the step.
-    let params = t.params()?;
+    let params = t.params_for(connection_kind(ctx, &connection_id))?;
     t.log("info", format!("Running SQL on {conn}"), None, None, None);
     let outcomes = ctx
         .engine
@@ -1520,6 +1564,9 @@ struct NodeOut {
     /// File written (Export).
     file: Option<String>,
     notices: Vec<String>,
+    /// Incremental: the largest value of its column now (column, value,
+    /// its type), kept as its mark when the steps after it succeed too.
+    mark: Option<(String, String, MarkType)>,
 }
 
 /// Run one step.
@@ -1547,6 +1594,17 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     if sql.trim().is_empty() {
         return Err(EngineError::new("invalid", "This step has no SQL"));
     }
+    // Incremental: the step's SQL (and a load's before/after SQL) gets its
+    // mark as `:watermark`.
+    let incremental = incremental_column(node);
+    let with_mark;
+    let t = match &incremental {
+        Some(col) => {
+            with_mark = t.with_watermark(watermark_now(ctx, job_id, node, col, t)?);
+            &with_mark
+        }
+        None => t,
+    };
     // Rows the assistant's SQL selected (an output it made: a step whose
     // SQL it wrote, a query of its own) stay the assistant's: a step that
     // reads them, by its SQL or by default from its upstream, runs under the
@@ -1624,7 +1682,18 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
                 None,
             );
         }
-        return Ok(NodeOut { rows, file: None, notices: vec![] });
+        let mark = match &incremental {
+            Some(col) => {
+                let output =
+                    ctx.engine.outputs().for_tab(&tab).into_iter().rev().find(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&node.name)));
+                let output = output.ok_or_else(|| {
+                    EngineError::new("invalid", format!("The SQL returned no rows to take the incremental column {col} from (it must end with a SELECT)"))
+                })?;
+                incremental_max(ctx, &output, col).await?
+            }
+            None => None,
+        };
+        return Ok(NodeOut { rows, file: None, notices: vec![], mark });
     }
     // This step's result (a statement that returns rows ends with one).
     let output = ctx
@@ -1638,6 +1707,11 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     if output.truncated {
         return Err(capped(&output, if node.kind == JobNodeKind::Export { "exported" } else { "loaded" }));
     }
+    // Taken before anything is written, so a missing column fails first.
+    let mark = match &incremental {
+        Some(col) => incremental_max(ctx, &output, col).await?,
+        None => None,
+    };
     if let Some(folder) = folder {
         let name = databrain_workspace::jobs::export_file_name(node.export_file.as_deref(), &node.name, job_name, node.export_format, now_ms());
         let written = files_written_by(&ctx.workspace, job_id);
@@ -1663,7 +1737,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             t.log("warning", n.clone(), None, None, None);
             notices.push(n);
         }
-        return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices });
+        return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices, mark });
     }
     let target =
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
@@ -1671,7 +1745,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // From here a failure may have written: a retry needs the load to say it kept nothing.
     *t.load.lock() = LoadState::Started;
     let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
-    Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
+    Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices, mark })
 }
 
 /// [`load_spec`] with the run's `:name` values in the before/after SQL.
@@ -1682,7 +1756,7 @@ fn load_spec_now(ctx: &JobCtx, node: &JobNode, target: &str, origin: Origin, t: 
     // a DuckDB target), as the step's own SQL.
     spec.origin = origin;
     let kind = ctx.workspace.get_connection(target)?.config.kind;
-    let params = t.params()?;
+    let params = t.params_for(kind)?;
     for sql in [&mut spec.before_sql, &mut spec.after_sql].into_iter().flatten() {
         *sql = databrain_connector_core::sql::substitute_parameters(sql, kind, &params).map_err(|missing| {
             EngineError::new(
@@ -1695,6 +1769,175 @@ fn load_spec_now(ctx: &JobCtx, node: &JobNode, target: &str, origin: Origin, t: 
         })?;
     }
     Ok(spec)
+}
+
+/// The parameter an incremental step's SQL reads its mark from.
+pub const WATERMARK: &str = "watermark";
+
+/// An incremental step's column, if it has one.
+fn incremental_column(node: &JobNode) -> Option<String> {
+    node.incremental_column.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(String::from)
+}
+
+/// `:watermark` for this run of an incremental step: its mark (written
+/// back as its column's type), else its start value (none yet, or reset).
+fn watermark_now(ctx: &JobCtx, job_id: &str, node: &JobNode, col: &str, t: &Tracer) -> Result<(String, Option<MarkType>)> {
+    if let Some(w) = ctx.workspace.job_watermark(job_id, &node.id, col)? {
+        let from = w.run_id.map(|r| format!(" from run #{r}")).unwrap_or_default();
+        t.log("info", format!("Incremental on {col}: :{WATERMARK} = {} (the step's mark{from})", w.value), None, None, None);
+        return Ok((w.value, w.value_type.as_deref().and_then(MarkType::parse)));
+    }
+    match node.incremental_start.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(start) => {
+            t.log("info", format!("Incremental on {col}: :{WATERMARK} = {start} (the start value: the step has no mark yet)"), None, None, None);
+            Ok((start.to_string(), None))
+        }
+        None => Err(EngineError::new(
+            "invalid",
+            format!("Enter the start value of the incremental column {col}: the step's SQL gets it as :{WATERMARK} until the step has a mark"),
+        )),
+    }
+}
+
+/// The largest value of column `col` in `output` (all its rows, those on
+/// disk too; NULL and NaN left out), with the column's name and type; None
+/// when it has no such value. (The result stays locked while its files on
+/// disk are read: the grid and the outputs list wait meanwhile.)
+async fn incremental_max(ctx: &JobCtx, output: &databrain_query_engine::OutputInfo, col: &str) -> Result<Option<(String, String, MarkType)>> {
+    // Part of the rows: their largest value would skip the rest next time.
+    if output.truncated {
+        return Err(EngineError::new(
+            "invalid",
+            format!(
+                "{} holds only its first {} rows (capped by a row limit or by the memory a result may keep): the incremental mark can't be taken from part of them. Select fewer rows per run (e.g. a smaller range after :{WATERMARK}).",
+                output.name.as_deref().unwrap_or(&output.handle),
+                output.rows
+            ),
+        ));
+    }
+    let rs = ctx.engine.results().get(&output.result_id).map_err(|e| EngineError::new("internal", e.to_string()))?;
+    let col = col.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut g = rs.lock();
+        let schema = g.schema();
+        let Some(i) = schema.fields().iter().position(|f| f.name().eq_ignore_ascii_case(&col)) else {
+            let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            return Err(EngineError::new("invalid", format!("The step's rows have no column {col} (its incremental column); they have {}", names.join(", "))));
+        };
+        let max = g.column_max(i).map_err(|e| EngineError::new("internal", format!("reading the largest {col}: {e}")))?;
+        let field = schema.field(i);
+        let ty = MarkType::of(field, databrain_result_store::display::is_decimal_text(field));
+        Ok(max.map(|v| (field.name().clone(), v, ty)))
+    })
+    .await
+    .map_err(|_| EngineError::new("internal", "reading the incremental mark stopped unexpectedly"))?
+}
+
+/// Incremental marks after a run. A step that succeeded keeps its new mark
+/// when every step after it (all downstream, transitively) succeeded in
+/// this run too; otherwise the mark waits ("pending") and the next run reads
+/// the same rows again, unless a later run that doesn't rerun the step
+/// (a resume, "Run this step" or "Run from here" below it) leaves every
+/// step after it succeeded since the mark was taken (in that run, or in
+/// one that ended after the mark was taken): then the pending mark becomes
+/// the mark, as its rows are loaded everywhere. A step's success from
+/// before the mark was taken doesn't count: it loaded older rows. A rerun
+/// of the step replaces its pending mark; one that fails drops it.
+fn advance_marks(ctx: &JobCtx, job: &Job, status: &HashMap<String, &'static str>, marks: &HashMap<String, PendingMark>, tracer: &Tracer) {
+    // Every step after `id` (transitively), in no particular order.
+    let below = |id: &str| -> Vec<&JobNode> {
+        let mut out: Vec<&JobNode> = Vec::new();
+        let mut todo = vec![id.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(id) = todo.pop() {
+            for e in job.edges.iter().filter(|e| e.from == id) {
+                if seen.insert(e.to.clone())
+                    && let Some(n) = job.nodes.iter().find(|x| x.id == e.to)
+                {
+                    out.push(n);
+                    todo.push(e.to.clone());
+                }
+            }
+        }
+        out
+    };
+    // The first step after `id` that hasn't succeeded since `taken_at`:
+    // in this run, or (not in it) in its last run, ended after it.
+    let blocked_after = |id: &str, taken_at: i64| -> Option<String> {
+        below(id)
+            .into_iter()
+            .find(|n| match status.get(&n.id) {
+                Some(s) => *s != "success",
+                None => !n.last_run.as_ref().is_some_and(|r| r.status == "success" && r.finished_at >= taken_at),
+            })
+            .map(|n| n.name.clone())
+    };
+    for n in &job.nodes {
+        let Some(col) = incremental_column(n) else { continue };
+        let t = tracer.for_node(n);
+        match status.get(&n.id) {
+            Some(&"success") => {
+                let mark = marks.get(&n.id);
+                if let Some(step) = blocked_after(&n.id, mark.map_or(0, |m| m.taken_at)).filter(|_| mark.is_some()).or_else(|| {
+                    // Without a new mark only the steps of this run matter.
+                    below(&n.id).into_iter().find(|x| status.get(&x.id).is_some_and(|s| *s != "success")).map(|x| x.name.clone())
+                }) {
+                    let _ = ctx.workspace.set_job_watermark_pending(&job.id, &n.id, mark);
+                    t.log(
+                        "warning",
+                        format!(
+                            "Incremental mark not moved: step {step} after it didn't succeed in this run, so the next run reads these rows again{}",
+                            if mark.is_some() { " (a resume that makes it succeed moves it)" } else { "" }
+                        ),
+                        None,
+                        None,
+                        None,
+                    );
+                    continue;
+                }
+                match mark {
+                    Some(m) => match ctx.workspace.set_job_watermark(&job.id, &n.id, &m.column, &m.value, m.value_type.as_deref(), m.run_id) {
+                        Ok(()) => t.log("success", format!("Incremental mark moved: largest {} is now {}", m.column, m.value), None, None, None),
+                        Err(e) => {
+                            t.log("error", format!("The incremental mark could not be saved ({e}): the next run reads these rows again"), None, None, None)
+                        }
+                    },
+                    None => {
+                        let _ = ctx.workspace.set_job_watermark_pending(&job.id, &n.id, None);
+                        t.log("info", format!("Incremental mark kept: no rows with a {col} this run"), None, None, None)
+                    }
+                }
+            }
+            // It ran and didn't succeed: its pending rows aren't the ones its output holds now.
+            Some(_) => {
+                let _ = ctx.workspace.set_job_watermark_pending(&job.id, &n.id, None);
+            }
+            // Not in this run: a pending mark moves once every step after it
+            // has succeeded since the mark was taken, one of them in this run.
+            None => {
+                let Ok(Some(p)) = ctx.workspace.job_watermark_pending(&job.id, &n.id, &col) else { continue };
+                let after = below(&n.id);
+                if !after.iter().any(|x| status.contains_key(&x.id)) || blocked_after(&n.id, p.taken_at).is_some() {
+                    continue;
+                }
+                match ctx.workspace.set_job_watermark(&job.id, &n.id, &p.column, &p.value, p.value_type.as_deref(), p.run_id) {
+                    Ok(()) => t.log(
+                        "success",
+                        format!(
+                            "Incremental mark moved: the steps after it succeeded, so the rows it read{} are loaded; largest {} is now {}",
+                            p.run_id.map(|r| format!(" in run #{r}")).unwrap_or_default(),
+                            p.column,
+                            p.value
+                        ),
+                        None,
+                        None,
+                        None,
+                    ),
+                    Err(e) => t.log("error", format!("The incremental mark could not be saved ({e}): the next run reads these rows again"), None, None, None),
+                }
+            }
+        }
+    }
 }
 
 /// Whether SQL on `connection_id` can read the outputs (`results.*`): every
@@ -1744,10 +1987,10 @@ async fn ai_rules_now(ctx: &JobCtx, job_id: &str, node: &JobNode, sql: &str, con
             databrain_ai::access::learn_defaults(&ctx.engine, &p).await;
         }
     }
-    let params = t.params().unwrap_or_default();
     let filled = |sql: &str, connection: Option<&str>| -> String {
         let kind = connection.and_then(|c| ctx.workspace.get_connection(c).ok()).map(|p| p.config.kind);
-        kind.and_then(|k| databrain_connector_core::sql::substitute_parameters(sql, k, &params).ok()).unwrap_or_else(|| sql.to_string())
+        kind.and_then(|k| databrain_connector_core::sql::substitute_parameters(sql, k, &t.params_for(k).unwrap_or_default()).ok())
+            .unwrap_or_else(|| sql.to_string())
     };
     let mut checked = node.clone();
     checked.sql = filled(sql, Some(connection_id));
@@ -1796,9 +2039,22 @@ fn sql_origin(node: &JobNode) -> Origin {
 /// Rows a dry run selects to try the load with.
 pub const DRY_RUN_ROWS: usize = 1000;
 
-/// `:name` values a dry run selects its rows with: the job's.
-fn dry_run_params(ctx: &JobCtx, job: &Job) -> HashMap<String, ParamValue> {
-    effective_params(&ctx.workspace, job, None).map(|(p, _)| p.into_iter().collect()).unwrap_or_default()
+/// `:name` values a dry run selects its rows with: the job's, and an
+/// incremental step's `:watermark` as its next run would get it.
+fn dry_run_params(ctx: &JobCtx, job: &Job, node: &JobNode) -> HashMap<String, ParamValue> {
+    let mut params: HashMap<String, ParamValue> = effective_params(&ctx.workspace, job, None).map(|(p, _)| p.into_iter().collect()).unwrap_or_default();
+    if let Some(col) = incremental_column(node) {
+        // The rows are selected on DuckDB: the mark as a DuckDB literal of its type.
+        let mark = ctx.workspace.job_watermark(&job.id, &node.id, &col).ok().flatten().map(|w| match w.value_type.as_deref().and_then(MarkType::parse) {
+            Some(ty) => ParamValue { value: ty.literal(&w.value, ConnectorKind::Duckdb), raw: true },
+            None => ParamValue { value: w.value, raw: false },
+        });
+        let start = || node.incremental_start.clone().filter(|s| !s.trim().is_empty()).map(|v| ParamValue { value: v, raw: false });
+        if let Some(v) = mark.or_else(start) {
+            params.insert(WATERMARK.to_string(), v);
+        }
+    }
+    params
 }
 
 /// Check a load step of `job` (as edited, not necessarily saved) without
@@ -1833,7 +2089,7 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
                 origin: sql_origin(node),
                 session_key: None,
                 output_name: None,
-                params: dry_run_params(ctx, job),
+                params: dry_run_params(ctx, job, node),
                 output_masks: None,
             };
             match ctx.engine.run_and_wait(&ctx.hub, req, Some(cancel.clone())).await {
@@ -2139,6 +2395,12 @@ mod tests {
         let p = HashMap::from([("id".to_string(), ParamValue { value: "7".into(), raw: false })]);
         assert!(reads_only("select * from t where id = :id", Postgres, &p));
         assert!(!reads_only("select * from t where id = :other", Postgres, &p));
+        // An incremental step's `:watermark` (bound for the check as a stand-in value).
+        let w = HashMap::from([(WATERMARK.to_string(), ParamValue { value: "0".into(), raw: false })]);
+        for kind in [databrain_connector_core::ConnectorKind::Sqlite, Postgres, Duckdb] {
+            assert!(reads_only("select 42 as id where 42 > :watermark", kind, &w), "{kind:?}");
+            assert!(!reads_only("delete from t where id < :watermark; select 1 as id", kind, &w), "{kind:?}");
+        }
         let raw = HashMap::from([("q".to_string(), ParamValue { value: "1; drop table t".into(), raw: true })]);
         assert!(!reads_only("select :q", Postgres, &raw));
     }

@@ -148,6 +148,25 @@ pub fn job_run_log(state: &AppState, id: &str, run_id: i64) -> Result<Vec<databr
     Ok(state.workspace.job_run_log(id, run_id)?)
 }
 
+/// An incremental step's mark taken from `column` (`None`: none yet, or
+/// it was taken from another column).
+pub fn job_watermark(state: &AppState, id: &str, node_id: &str, column: &str) -> Result<Option<databrain_workspace::Watermark>> {
+    if column.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(state.workspace.job_watermark(id, node_id, column)?)
+}
+
+/// Forget an incremental step's mark: its next run reads from the start value.
+pub fn reset_job_watermark(state: &AppState, id: &str, node_id: &str) -> Result<()> {
+    // A run going now would set the mark it read again when it ends.
+    let elsewhere = state.workspace.job_lease(id).ok().flatten().is_some_and(|(_, until)| until > databrain_workspace::now_ms());
+    if state.jobs.is_running(id) || elsewhere {
+        return Err(EngineError::new("busy", "The job is running: reset the incremental mark once the run has ended (or stop it first)"));
+    }
+    Ok(state.workspace.reset_job_watermark(id, node_id)?)
+}
+
 pub fn job_runs(state: &AppState, id: &str, limit: Option<i64>) -> Result<Vec<databrain_workspace::JobRun>> {
     Ok(state.workspace.job_runs(id, limit.unwrap_or(30).clamp(1, databrain_workspace::jobs::RUNS_KEPT))?)
 }

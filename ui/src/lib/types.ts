@@ -8,6 +8,7 @@ import type { LoadMode } from "./bindings/LoadMode";
 import type { NodeRunSummary } from "./bindings/NodeRunSummary";
 import type { StepProgress } from "./bindings/StepProgress";
 import type { RunLogEntry } from "./bindings/RunLogEntry";
+import type { Watermark } from "./bindings/Watermark";
 import type { JobNode } from "./bindings/JobNode";
 import type { JobEdge } from "./bindings/JobEdge";
 import type { JobSchedule } from "./bindings/JobSchedule";
@@ -196,6 +197,7 @@ export type {
   NodeRunSummary,
   StepProgress,
   RunLogEntry,
+  Watermark,
   JobNode,
   JobEdge,
   JobSchedule,

@@ -464,14 +464,41 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE job_runs ADD COLUMN ai INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v23: incremental job steps: the largest value of a step's column after
+    // its last successful run (passed to its SQL as `:watermark`); a mark
+    // waiting for the steps after it to succeed (a later run, e.g. a
+    // resume). `IF NOT EXISTS`: a development build had these in v22.
+    r#"
+    CREATE TABLE IF NOT EXISTS job_watermarks (
+        job_id      TEXT NOT NULL,
+        node_id     TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        value_type  TEXT,
+        run_id      INTEGER,
+        updated_at  INTEGER NOT NULL,
+        PRIMARY KEY (job_id, node_id)
+    );
+    CREATE TABLE IF NOT EXISTS job_watermarks_pending (
+        job_id      TEXT NOT NULL,
+        node_id     TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        value_type  TEXT,
+        run_id      INTEGER,
+        taken_at    INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (job_id, node_id)
+    );
+    "#,
 ];
 
 impl Workspace {
-    /// v22 changed while it was unreleased: a workspace a development build
-    /// upgraded to an earlier draft of it lacks columns or keys the code
-    /// now uses (a `job_after_pending` keyed by job only would make every
-    /// queued "run after" start fail). Brings such a workspace to the final
-    /// v22; a workspace that has it is left alone. Rows are kept.
+    /// v22 changed while it was unreleased (and held v23's tables): a
+    /// workspace a development build upgraded to an earlier draft of it
+    /// lacks columns or keys the code now uses (a `job_after_pending` keyed
+    /// by job only would make every queued "run after" start fail). Brings
+    /// such a workspace to the final v22 and v23; a workspace that has them
+    /// is left alone. Rows are kept.
     pub(crate) fn repair_v22(&self) -> Result<()> {
         // (column, primary-key position) of each column of `table`.
         fn cols(c: &rusqlite::Connection, table: &str) -> rusqlite::Result<Vec<(String, i64)>> {
@@ -482,9 +509,28 @@ impl Workspace {
         fn has(cols: &[(String, i64)], name: &str) -> bool {
             cols.iter().any(|(n, _)| n == name)
         }
-        // What needs doing; empty when the workspace has the final v22.
+        // What needs doing; empty when the workspace has the final v22 and v23.
         fn todo(c: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
             let mut out = Vec::new();
+            let w = cols(c, "job_watermarks")?;
+            if !w.is_empty() && !has(&w, "value_type") {
+                out.push("ALTER TABLE job_watermarks ADD COLUMN value_type TEXT;".into());
+            }
+            let p = cols(c, "job_watermarks_pending")?;
+            if p.is_empty() {
+                out.push(
+                    "CREATE TABLE job_watermarks_pending (job_id TEXT NOT NULL, node_id TEXT NOT NULL, column_name TEXT NOT NULL, value TEXT NOT NULL, \
+                     value_type TEXT, run_id INTEGER, taken_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (job_id, node_id));"
+                        .into(),
+                );
+            } else {
+                if !has(&p, "value_type") {
+                    out.push("ALTER TABLE job_watermarks_pending ADD COLUMN value_type TEXT;".into());
+                }
+                if !has(&p, "taken_at") {
+                    out.push("ALTER TABLE job_watermarks_pending ADD COLUMN taken_at INTEGER NOT NULL DEFAULT 0;".into());
+                }
+            }
             let q = cols(c, "job_after_pending")?;
             let keyed = q.iter().any(|(n, k)| n == "job_id" && *k > 0) && q.iter().any(|(n, k)| n == "ai" && *k > 0);
             if !keyed {
