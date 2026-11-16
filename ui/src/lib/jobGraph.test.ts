@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, removeNode, scheduleText, uniqueName } from "./jobGraph";
+import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, rebaseJob, removeNode, scheduleText, uniqueName } from "./jobGraph";
 import type { Job, JobNode, OutputInfo } from "./types";
 
 const n = (id: string, name: string, sql = "", x = 0, y = 0): JobNode => ({ id, name, kind: "query", sql, x, y, load_mode: "append" });
@@ -185,5 +185,67 @@ describe("job steps read outputs as the shared scanner does", () => {
   it("doesn't take results.x in a string or comment for a link, and sees one behind a comment", () => {
     const k = job([n("a", "orders"), n("b", "x", "select 'results.orders' as label -- results.orders"), n("c", "y", "select * from results/**/.orders")]);
     expect(missingLinks(k)).toEqual([{ node: "c", reads: "a" }]);
+  });
+});
+
+describe("rebaseJob: edits made here put on top of the version saved since", () => {
+  const node = (id: string, extra: Partial<JobNode> = {}): JobNode => ({ id, name: id, kind: "query", sql: `select '${id}'`, x: 0, y: 0, load_mode: "append", ...extra });
+  const job = (nodes: JobNode[], extra: Partial<Job> = {}): Job => ({
+    id: "J",
+    name: "J",
+    nodes,
+    edges: [],
+    schedule: { enabled: false, mode: "interval", minutes: 60, at: "08:00", weekdays: [] },
+    created_at: 1,
+    updated_at: 1,
+    ...extra,
+  });
+
+  it("keeps the assistant's newer SQL (and its mark) under a step the user only moved or renamed", () => {
+    const base = job([node("a", { sql: "select 1", ai_sql: true })]);
+    const mine = job([node("a", { sql: "select 1", ai_sql: true, x: 200, name: "renamed" })]);
+    const theirs = job([node("a", { sql: "select 2", ai_sql: true })], { updated_at: 2 });
+    const out = rebaseJob(base, mine, theirs);
+    expect(out.nodes[0]).toMatchObject({ sql: "select 2", ai_sql: true, x: 200, name: "renamed" });
+    expect(out.updated_at).toBe(2);
+  });
+
+  it("keeps the user's own SQL edit whole (the step is then the user's to save)", () => {
+    const base = job([node("a", { sql: "select 1", load_before_sql: "delete from t", ai_sql: true })]);
+    const mine = job([node("a", { sql: "select 10", load_before_sql: "delete from t", ai_sql: true })]);
+    const theirs = job([node("a", { sql: "select 2", load_before_sql: "drop table t", ai_sql: true })], { updated_at: 2 });
+    const out = rebaseJob(base, mine, theirs);
+    // The user's version of every text field: never the user's SQL with the assistant's newer before-SQL.
+    expect(out.nodes[0]).toMatchObject({ sql: "select 10", load_before_sql: "delete from t" });
+  });
+
+  it("'Trust this SQL' counts only for the SQL the user trusted", () => {
+    const base = job([node("a", { sql: "select 1", ai_sql: true })]);
+    const mine = job([node("a", { sql: "select 1", ai_sql: false })]);
+    const changed = rebaseJob(base, mine, job([node("a", { sql: "select 2", ai_sql: true })], { updated_at: 2 }));
+    expect(changed.nodes[0]).toMatchObject({ sql: "select 2", ai_sql: true });
+    const same = rebaseJob(base, mine, job([node("a", { sql: "select 1", ai_sql: true, x: 5 })], { updated_at: 2 }));
+    expect(same.nodes[0]).toMatchObject({ sql: "select 1", ai_sql: false, x: 5 });
+  });
+
+  it("adds and removes steps and links from both sides", () => {
+    const base = job([node("a"), node("b")], { edges: [{ from: "a", to: "b" }] });
+    const mine = job([node("a"), node("c")], { edges: [{ from: "a", to: "c" }] });
+    const theirs = job([node("a"), node("b"), node("d")], { edges: [{ from: "a", to: "b" }, { from: "a", to: "d" }], updated_at: 2 });
+    const out = rebaseJob(base, mine, theirs);
+    expect(out.nodes.map((n) => n.id).sort()).toEqual(["a", "c", "d"]);
+    expect(out.edges).toEqual([
+      { from: "a", to: "d" },
+      { from: "a", to: "c" },
+    ]);
+  });
+
+  it("job settings: the user's change wins, the rest is the saved version's", () => {
+    const base = job([node("a")]);
+    const mine = job([node("a")], { name: "Mine" });
+    const theirs = job([node("a")], { schedule: { enabled: true, mode: "interval", minutes: 5, at: "08:00", weekdays: [] }, updated_at: 2 });
+    const out = rebaseJob(base, mine, theirs);
+    expect(out.name).toBe("Mine");
+    expect(out.schedule.minutes).toBe(5);
   });
 });

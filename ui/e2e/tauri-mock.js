@@ -48,7 +48,11 @@
     }),
     get_job: (a) => mock.db.jobs.find((j) => j.id === a.id) ?? { __error: { kind: "not_found", message: `job ${a.id} not found` } },
     save_job: (a) => {
-      const job = { ...a.job, id: a.job.id || `job-${nextId++}`, updated_at: Date.now(), created_at: a.job.created_at || Date.now() };
+      // As the app: a save made on an older version than the one saved is refused.
+      const stored = mock.db.jobs.find((j) => j.id === a.job.id);
+      if (stored && stored.updated_at !== a.job.updated_at)
+        return { __error: { kind: "conflict", message: `"${stored.name}" was changed elsewhere since it was opened` } };
+      const job = { ...a.job, id: a.job.id || `job-${nextId++}`, updated_at: Math.max(Date.now(), (stored?.updated_at ?? 0) + 1), created_at: a.job.created_at || Date.now() };
       mock.db.jobs = [...mock.db.jobs.filter((j) => j.id !== job.id), job];
       return job;
     },

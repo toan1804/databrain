@@ -1,7 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { answer, backend, calls, emit, openApp } from "./app";
 
-type SavedJob = { id: string; nodes: { id: string; name: string; sql: string }[]; edges: { from: string; to: string }[] };
+type SavedJob = { id: string; updated_at: number; nodes: { id: string; name: string; sql: string; ai_sql?: boolean }[]; edges: { from: string; to: string }[] };
 
 /** The job as the app last saved it. */
 async function lastSaved(page: Page): Promise<SavedJob | undefined> {
@@ -113,7 +113,7 @@ test.describe("the assistant changes a job with unsaved edits here", () => {
       window.dispatchEvent(new CustomEvent("db:job-changed", { detail: { id: j.id } }));
     }, job);
     const dialog = page.getByRole("dialog");
-    await expect(dialog).toContainText("The assistant changed this job");
+    await expect(dialog).toContainText("This job was changed elsewhere");
     return { card, dialog };
   }
 
@@ -137,12 +137,60 @@ test.describe("the assistant changes a job with unsaved edits here", () => {
     expect(await calls(page, "save_job")).toHaveLength(1);
   });
 
-  test("Keep my changes saves them over the assistant's", async ({ page }) => {
+  test("Keep my changes saves them on top of the assistant's version", async ({ page }) => {
     const { card, dialog } = await conflict(page);
     await dialog.getByRole("button", { name: "Keep my changes" }).click();
     await expect.poll(async () => (await lastSaved(page))?.nodes[0].name).toBe("mine");
     await expect(card).toContainText("mine");
     await page.waitForTimeout(1500);
     expect(await calls(page, "save_job")).toHaveLength(2);
+    // Based on the assistant's version: the app takes it.
+    expect((await lastSaved(page))?.updated_at).toBe(2);
+  });
+
+  test("Keep my changes never brings back the assistant's older SQL as the user's", async ({ page }) => {
+    const aiStep = { ...step, sql: "select * from orders where day = current_date", ai_sql: true };
+    await openApp(page, backend({ __jobs: [{ ...job, nodes: [aiStep] }] }));
+    await page.getByRole("button", { name: "Jobs", exact: true }).click();
+    await page.getByText("Orders", { exact: true }).click();
+    const card = page.getByLabel("Job steps").locator("[data-node]").first();
+    await expect(card).toContainText("orders_today");
+    // A save that fails, then the user renames the step (not its SQL).
+    await answer(page, "save_job", { __error: { kind: "internal", message: "disk full" } });
+    await card.click();
+    await page.getByLabel("Step details").getByRole("textbox").first().fill("mine");
+    await expect.poll(async () => (await calls(page, "save_job")).length).toBe(1);
+    // The assistant changes the step's SQL meanwhile.
+    await page.evaluate((j) => {
+      const w = window as unknown as { __DB_MOCK__: { handlers: Record<string, unknown>; db: { jobs: unknown[] } } };
+      delete w.__DB_MOCK__.handlers.save_job;
+      w.__DB_MOCK__.db.jobs = [{ ...j, updated_at: 2 }];
+      window.dispatchEvent(new CustomEvent("db:job-changed", { detail: { id: j.id } }));
+    }, { ...job, nodes: [{ ...aiStep, sql: "select * from orders where day >= current_date - 7" }] });
+    await page.getByRole("dialog").getByRole("button", { name: "Keep my changes" }).click();
+    await expect.poll(async () => (await lastSaved(page))?.nodes[0].name).toBe("mine");
+    const saved = await lastSaved(page);
+    expect(saved?.nodes[0].sql).toBe("select * from orders where day >= current_date - 7");
+    expect(saved?.nodes[0].ai_sql).toBe(true);
+  });
+
+  test("a save refused as made on an older version asks too", async ({ page }) => {
+    await openApp(page, backend({ __jobs: [job] }));
+    await page.getByRole("button", { name: "Jobs", exact: true }).click();
+    await page.getByText("Orders", { exact: true }).click();
+    const card = page.getByLabel("Job steps").locator("[data-node]").first();
+    await expect(card).toContainText("orders_today");
+    // Saved elsewhere without the event reaching this tab.
+    await page.evaluate((j) => {
+      const w = window as unknown as { __DB_MOCK__: { db: { jobs: unknown[] } } };
+      w.__DB_MOCK__.db.jobs = [{ ...j, nodes: [{ ...j.nodes[0], sql: "select 2" }], updated_at: 5 }];
+    }, job);
+    await card.click();
+    await page.getByLabel("Step details").getByRole("textbox").first().fill("mine");
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("This job was changed elsewhere");
+    await dialog.getByRole("button", { name: "Keep my changes" }).click();
+    await expect.poll(async () => (await lastSaved(page))?.nodes[0].name).toBe("mine");
+    expect((await lastSaved(page))?.nodes[0].sql).toBe("select 2");
   });
 });

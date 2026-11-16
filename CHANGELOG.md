@@ -4,6 +4,17 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Security
+
+- **Jobs and the AI assistant:** SQL or rows the assistant chose no longer end up running as yours, outside its rules (found by an internal review; in 0.4.2 and earlier):
+  - "Duplicate" on a step the assistant wrote made the copy yours (unsandboxed, without the AI rules) while it still showed "AI's SQL"; the copy is now the assistant's.
+  - "Keep my changes", or a save already under way when the assistant changed the job, saved the assistant's earlier SQL as yours. Saves made on an older version of the job are refused, and your edits are put on top of the new version.
+  - A load or export that takes rows a step of the assistant's selected now runs under the AI rules, so it can't write them where the assistant may not.
+  - Changing which steps a load or export runs after now makes it the assistant's, and the approval lists link changes (a reorder wasn't shown).
+  - The assistant can't name a step after an output your query tabs, notebooks or other jobs use. Renames must rename a step of the job to a valid name, once (a swap was applied one rename after another).
+  - A change the assistant asked about isn't saved over edits you saved while the approval waited.
+  - The approval shows an export's file name.
+
 ### Fixed
 
 - Postgres: inside a transaction, a query cut at the row limit reads only the rows it keeps (it read the whole result), and the transaction stays usable. Stop while rows are arriving stops the query on the server, so the next statement no longer waits for the rest.

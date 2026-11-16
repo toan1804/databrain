@@ -7,7 +7,7 @@ import { AlertTriangle, FileDown, ArrowDownToLine, CalendarClock, Copy, Database
 import { api, toError } from "../lib/api";
 import { kbd, modalOpen } from "../lib/platform";
 import type { RunParams, Job, JobEdge, JobNode } from "../lib/types";
-import { NODE_H, NODE_W, actionSettings, addDownstream, addEdge, ancestors, cappedReads, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
+import { NODE_H, NODE_W, actionSettings, addDownstream, addEdge, ancestors, cappedReads, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, rebaseJob, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
 import { isQueryTab, useStore } from "../store";
 import { useJobs } from "../jobsStore";
 import { openOutput, resultsConnection } from "../outputs";
@@ -48,6 +48,12 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   /** Edits not saved yet (saved when the tab closes). */
   const dirty = useRef(false);
+  /** The job as last loaded or saved: the version the edits here are based on. */
+  const basis = useRef<Job | null>(null);
+  /** The save under way: the next one waits for it (it is based on what it saves). */
+  const saving = useRef<Promise<unknown>>(Promise.resolve());
+  /** Ask whether to keep the edits here over a change made elsewhere. */
+  const conflict = useRef<() => void>(() => {});
 
   useEffect(() => {
     void useJobs.getState().init();
@@ -57,6 +63,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
       .getJob(jobId)
       .then((j) => {
         latest.current = j;
+        basis.current = j;
         setJob(j);
       })
       .catch((e) => setLoadError(toError(e).message));
@@ -68,29 +75,53 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
         .getJob(jobId)
         .then((j) => {
           latest.current = j;
+          basis.current = j;
           setJob(j);
           setSave({ state: "saved" });
         })
         .catch(() => {});
     };
+    // Keep the edits made here: put on top of the version saved since
+    // (never the older version of the job, which would undo the change made
+    // elsewhere and turn SQL the assistant wrote before into the user's).
+    const keepMine = async () => {
+      try {
+        const theirs = await api.getJob(jobId);
+        const base = basis.current;
+        const mine = latest.current;
+        if (!base || !mine) return showSaved();
+        const merged = rebaseJob(base, mine, theirs);
+        basis.current = theirs;
+        latest.current = merged;
+        dirty.current = true;
+        setJob(merged);
+        await persistRef.current();
+      } catch (e) {
+        setSave({ state: "error", message: toError(e).message });
+      }
+    };
+    const ask = () => {
+      // Saving over the change made elsewhere needs the click: closing the
+      // dialog (Escape, or another dialog taking its place) shows its version.
+      useStore.getState().askConfirm({
+        title: "This job was changed elsewhere",
+        reasons: [
+          "The assistant (or another window) changed it, and you have changes to it that are not saved yet.",
+          "Keep my changes: yours are saved on top of the new version. Cancel: the new version is shown, and your unsaved changes are lost.",
+        ],
+        confirmLabel: "Keep my changes",
+        onConfirm: () => void keepMine(),
+        onCancel: showSaved,
+      });
+    };
+    conflict.current = ask;
     const onChanged = (ev: Event) => {
       if ((ev as CustomEvent<{ id: string }>).detail?.id !== jobId) return;
       if (!dirty.current) return showSaved();
       // Edits here not saved yet (the last moment's, or a save that failed):
       // the user chooses, rather than losing them without a word.
       clearTimeout(timer.current);
-      // Saving over the assistant's change needs the click: closing the
-      // dialog (Escape, or another dialog taking its place) shows its version.
-      useStore.getState().askConfirm({
-        title: "The assistant changed this job",
-        reasons: [
-          "You have changes to it that are not saved yet.",
-          "Keep my changes: yours are saved, over the assistant's change. Cancel: the assistant's version is shown, and your unsaved changes are lost.",
-        ],
-        confirmLabel: "Keep my changes",
-        onConfirm: () => void persistRef.current(),
-        onCancel: showSaved,
-      });
+      ask();
     };
     window.addEventListener("db:job-changed", onChanged);
     return () => window.removeEventListener("db:job-changed", onChanged);
@@ -98,19 +129,37 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
 
   const persist = useCallback(async () => {
     clearTimeout(timer.current);
+    // One save at a time: each is based on the version the one before saved.
+    await saving.current;
     const j = latest.current;
     if (!j) return true;
     dirty.current = false;
     setSave({ state: "saving" });
+    const call = api.saveJob(j);
+    saving.current = call.catch(() => {});
     try {
-      await api.saveJob(j);
-      setSave({ state: "saved" });
+      // The job as saved: the app's version (which steps are the
+      // assistant's, when it was saved), the base of the next save.
+      const saved = await call;
+      basis.current = saved;
+      const next = latest.current === j ? saved : rebaseJob(j, latest.current ?? j, saved);
+      latest.current = next;
+      setJob(next);
+      setSave({ state: dirty.current ? "pending" : "saved" });
       void useJobs.getState().refresh().catch(() => {});
       return true;
     } catch (e) {
       // Still not saved: a change from elsewhere must not drop it, and closing the tab tries again.
       if (latest.current === j) dirty.current = true;
-      setSave({ state: "error", message: toError(e).message });
+      const err = toError(e);
+      // Saved elsewhere since this version was loaded: the user chooses.
+      if (err.kind === "conflict") {
+        dirty.current = true;
+        setSave({ state: "error", message: err.message });
+        conflict.current();
+        return false;
+      }
+      setSave({ state: "error", message: err.message });
       return false;
     }
   }, []);

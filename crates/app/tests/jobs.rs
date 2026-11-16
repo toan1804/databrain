@@ -1159,3 +1159,59 @@ async fn steps_the_assistant_wrote_follow_todays_ai_settings() {
     let why = step(&run, "ai_write").error.unwrap_or_default();
     assert!(run.status == "error" && why.contains("not allowed for the AI"), "{why}");
 }
+
+/// Rows the assistant's SQL selected stay the assistant's down the job: a
+/// load the user wrote that takes them (here by default, from its upstream)
+/// runs under the AI rules, so it is refused where the assistant may not
+/// write; the same load of the user's own rows runs as before, and with
+/// "AI may write" on the target it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn loads_of_the_assistants_rows_follow_the_ai_rules() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+        let job_of = |name: &str, ai: bool| {
+            let mut pick = node("a", &format!("{name}_rows"), JobNodeKind::Query, Some(&src), "select 1 as id union all select 2");
+            pick.ai_sql = ai;
+            let mut load = node("b", &format!("{name}_load"), JobNodeKind::Load, None, "");
+            load.target_connection_id = Some(dst.clone());
+            load.target_table = Some(format!("{name}_t"));
+            let mut j = plain_job(name, vec![pick, load]);
+            j.edges = vec![JobEdge { from: "a".into(), to: "b".into() }];
+            st.workspace.save_job(j).unwrap()
+        };
+        // Refused: the user's load takes the assistant's rows into a
+        // connection the assistant may not write to.
+        let ai_job = job_of("from_ai", true);
+        assert!(!ai_job.nodes[1].ai_sql, "the load is the user's");
+        let run = run_all(&st, &ai_job).await;
+        assert_eq!(step(&run, "from_ai_rows").status, "success", "{run:?}");
+        let load = step(&run, "from_ai_load");
+        assert_eq!(load.status, "error", "{run:?}");
+        assert!(load.error.as_deref().unwrap_or_default().contains("AI settings no longer allow"), "{load:?}");
+        let log = api::job_run_log(&st, &ai_job.id, run.id).unwrap();
+        assert!(
+            log.iter().any(|l| l.message.starts_with("Runs under the AI rules: it reads rows the assistant's SQL selected (results.from_ai_rows)")),
+            "{log:?}"
+        );
+        assert_eq!(rows(&st, &dst, "select count(*) from sqlite_master where name = 'from_ai_t'").await, vec![vec!["0"]], "nothing written");
+
+        // Allowed: the same load of the user's own rows.
+        let mine = job_of("mine", false);
+        let run = run_all(&st, &mine).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(rows(&st, &dst, "select count(*) from mine_t").await, vec![vec!["2"]]);
+
+        // Allowed: the assistant may write there.
+        let mut p = st.workspace.get_connection(&dst).unwrap();
+        p.ai_policy.allow_write = true;
+        st.workspace.save_connection(p).unwrap();
+        let run = run_all(&st, &ai_job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(rows(&st, &dst, "select count(*) from from_ai_t").await, vec![vec!["2"]]);
+    })
+    .await
+    .expect("test hung");
+}
