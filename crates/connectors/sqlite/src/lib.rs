@@ -228,14 +228,15 @@ fn fits(t: ColType, v: &Value) -> bool {
     }
 }
 
-/// Runs on a blocking thread; streams rows through `tx`.
-fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
+/// Runs on a blocking thread; streams rows through `tx`. Returns the
+/// summary to send as `Done` once the connection is let go (`None`: the
+/// reader went away).
+fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<Option<ExecSummary>> {
     let mut stmt = conn.prepare(sql).map_err(map_err)?;
     let ncols = stmt.column_count();
     if ncols == 0 {
         let n = stmt.raw_execute().map_err(map_err)?;
-        tx.blocking_send(Ok(StreamEvent::Done(ExecSummary { rows_affected: Some(n as u64) })));
-        return Ok(());
+        return Ok(Some(ExecSummary { rows_affected: Some(n as u64) }));
     }
 
     let meta: Vec<(String, String)> = stmt.columns().map(|c| (c.name().to_string(), c.decl_type().unwrap_or("").to_string())).collect();
@@ -291,7 +292,7 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
 
     let mut builder = BatchBuilder::new(&columns, batch_size);
     if !tx.blocking_send(Ok(StreamEvent::Schema(builder.schema()))) {
-        return Ok(());
+        return Ok(None);
     }
     for r in first {
         builder.push_row(r);
@@ -304,7 +305,7 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
                 break;
             }
             if builder.is_full() && !tx.blocking_send(Ok(StreamEvent::Batch(builder.finish()?))) {
-                return Ok(());
+                return Ok(None);
             }
             if opts.cancel.is_cancelled() {
                 return Err(ConnectorError::cancelled());
@@ -323,13 +324,12 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
         }
     }
     if !builder.is_empty() && !tx.blocking_send(Ok(StreamEvent::Batch(builder.finish()?))) {
-        return Ok(());
+        return Ok(None);
     }
     for n in builder.notices(None) {
         tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
-    tx.blocking_send(Ok(StreamEvent::Done(ExecSummary::default())));
-    Ok(())
+    Ok(Some(ExecSummary::default()))
 }
 
 #[async_trait]
@@ -389,16 +389,24 @@ impl Session for SqliteSession {
                 }
             };
             // Ends (before the connection is let go) when the statement does.
-            let _running = running.start(id);
+            let running = running.start(id);
             // Stopped while it waited for the connection: it doesn't run.
-            if opts.cancel.is_cancelled() {
-                tx.blocking_send(Err(ConnectorError::cancelled()));
-                return;
-            }
-            if let Err(e) = run_query(&guard, &sql, &opts, &tx) {
-                let e = if opts.cancel.is_cancelled() && e.kind != ErrorKind::Cancelled { ConnectorError::cancelled() } else { e };
-                tx.blocking_send(Err(e));
-            }
+            let end = if opts.cancel.is_cancelled() {
+                Err(ConnectorError::cancelled())
+            } else {
+                run_query(&guard, &sql, &opts, &tx)
+                    .map_err(|e| if opts.cancel.is_cancelled() && e.kind != ErrorKind::Cancelled { ConnectorError::cancelled() } else { e })
+            };
+            // The end is sent once the connection is let go: a reader that
+            // asks for the transaction state when the statement ends got
+            // `Unknown` (the lock still held) and saw no transaction.
+            drop(running);
+            drop(guard);
+            match end {
+                Ok(Some(summary)) => tx.blocking_send(Ok(StreamEvent::Done(summary))),
+                Ok(None) => true,
+                Err(e) => tx.blocking_send(Err(e)),
+            };
         });
         Ok(stream)
     }
@@ -609,6 +617,26 @@ mod tests {
 
     async fn exec(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
         s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await.unwrap()
+    }
+
+    /// A statement that has ended has let the connection go: the
+    /// transaction state read right after it is known (it was `Unknown`
+    /// now and then, and the engine saw no transaction after BEGIN).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transaction_state_is_known_once_a_statement_ends() {
+        use databrain_connector_core::TxState;
+        let s = session().await;
+        exec(s.as_ref(), "create table t(a int)").await;
+        for _ in 0..300 {
+            exec(s.as_ref(), "begin").await;
+            assert_eq!(s.transaction_state(), TxState::Open);
+            exec(s.as_ref(), "insert into t values (1)").await;
+            assert_eq!(s.transaction_state(), TxState::Open);
+            exec(s.as_ref(), "select a from t").await;
+            assert_eq!(s.transaction_state(), TxState::Open);
+            exec(s.as_ref(), "rollback").await;
+            assert_eq!(s.transaction_state(), TxState::None);
+        }
     }
 
     #[tokio::test]

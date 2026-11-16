@@ -29,6 +29,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- SQLite: with manual commit, a write now and then left the tab showing no open transaction (no Commit or Rollback) although one was open.
 - Postgres: inside a transaction, a query cut at the row limit reads only the rows it keeps (it read the whole result), and the transaction stays usable. Stop while rows are arriving stops the query on the server, so the next statement no longer waits for the rest.
 - MySQL: with SSL set to Prefer, the connection goes on without encryption only when the server has none; a wrong password is no longer retried in plaintext. Stop and replacement connections read the saved password again rather than keeping it.
 - Postgres and MySQL: a "CA certificate" setting verifies the server's certificate against your CA (with Verify, its host name too).
