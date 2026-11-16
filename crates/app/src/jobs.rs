@@ -534,7 +534,15 @@ pub fn resume_steps(ctx: &JobCtx, job: &Job) -> Vec<String> {
     let ok = |n: &JobNode| n.last_run.as_ref().is_some_and(|r| r.status == "success");
     let has_output = |n: &JobNode| {
         let tab = node_tab(&job.id, &n.id);
-        ctx.engine.outputs().resolve(&n.name).is_some_and(|o| o.tab_id == tab && o.state != databrain_query_engine::OutputState::Evicted)
+        let here = ctx.engine.outputs().resolve(&n.name).is_some_and(|o| o.tab_id == tab && o.state != databrain_query_engine::OutputState::Evicted);
+        // An incremental step whose pending mark came with rows this output
+        // doesn't hold (another process read them, or an older run): it
+        // runs again, or the steps after it would load other rows and its
+        // mark would skip the pending ones.
+        here && incremental_column(n).is_none_or(|col| match ctx.workspace.job_watermark_pending(&job.id, &n.id, &col) {
+            Ok(Some(p)) => holds_pending_rows(ctx, job, n, &p),
+            _ => true,
+        })
     };
     let mut todo: HashSet<String> = job.nodes.iter().filter(|n| !ok(n)).map(|n| n.id.clone()).collect();
     if todo.is_empty() {
@@ -1742,6 +1750,32 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     let target =
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
     let spec = load_spec_now(ctx, node, target, origin, t)?;
+    // Rows of an incremental step are only the new ones: a mode that
+    // removes the table's other rows would keep only them.
+    if let Some(inc) = ctx.workspace.get_job(job_id).ok().and_then(|j| incremental_upstream(&j, &node.id).map(|n| n.name.clone())) {
+        use databrain_workspace::LoadMode;
+        match node.load_mode {
+            LoadMode::Sync => {
+                return Err(EngineError::new(
+                    "invalid",
+                    format!(
+                        "Sync deletes the rows of the table that aren't among the step's, and the rows come from incremental step {inc} (only those after its last run's): it would delete everything loaded before. Use Merge, or turn Incremental off."
+                    ),
+                ));
+            }
+            LoadMode::Truncate | LoadMode::Replace => t.log(
+                "warning",
+                format!(
+                    "The table keeps only this run's rows: they come from incremental step {inc} (only those after its last run's), and {} removes the others",
+                    mode_name(node.load_mode)
+                ),
+                None,
+                None,
+                None,
+            ),
+            _ => {}
+        }
+    }
     // From here a failure may have written: a retry needs the load to say it kept nothing.
     *t.load.lock() = LoadState::Started;
     let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
@@ -1775,6 +1809,36 @@ fn load_spec_now(ctx: &JobCtx, node: &JobNode, target: &str, origin: Origin, t: 
 pub const WATERMARK: &str = "watermark";
 
 /// An incremental step's column, if it has one.
+/// The incremental step whose rows step `id` gets (itself, or a step
+/// above it), if any.
+fn incremental_upstream<'j>(job: &'j Job, id: &str) -> Option<&'j JobNode> {
+    let mut todo = vec![id.to_string()];
+    let mut seen = HashSet::new();
+    while let Some(id) = todo.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(n) = job.nodes.iter().find(|n| n.id == id).filter(|n| incremental_column(n).is_some()) {
+            return Some(n);
+        }
+        todo.extend(job.edges.iter().filter(|e| e.to == id).map(|e| e.from.clone()));
+    }
+    None
+}
+
+/// A load mode as the editor names it.
+fn mode_name(m: databrain_workspace::LoadMode) -> &'static str {
+    use databrain_workspace::LoadMode;
+    match m {
+        LoadMode::Append => "Append",
+        LoadMode::Truncate => "Truncate",
+        LoadMode::Replace => "Replace",
+        LoadMode::Update => "Update",
+        LoadMode::Merge => "Merge",
+        LoadMode::Sync => "Sync",
+    }
+}
+
 fn incremental_column(node: &JobNode) -> Option<String> {
     node.incremental_column.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(String::from)
 }
@@ -1908,16 +1972,39 @@ fn advance_marks(ctx: &JobCtx, job: &Job, status: &HashMap<String, &'static str>
                     }
                 }
             }
-            // It ran and didn't succeed: its pending rows aren't the ones its output holds now.
-            Some(_) => {
+            // It ran and failed: its pending rows aren't the ones its output holds now.
+            Some(&"error") => {
                 let _ = ctx.workspace.set_job_watermark_pending(&job.id, &n.id, None);
             }
+            // Skipped, or stopped (it may not have started): a pending mark
+            // stays; it moves only with the output it was taken with
+            // ([`holds_pending_rows`]).
+            Some(_) => {}
             // Not in this run: a pending mark moves once every step after it
             // has succeeded since the mark was taken, one of them in this run.
             None => {
                 let Ok(Some(p)) = ctx.workspace.job_watermark_pending(&job.id, &n.id, &col) else { continue };
                 let after = below(&n.id);
                 if !after.iter().any(|x| status.contains_key(&x.id)) || blocked_after(&n.id, p.taken_at).is_some() {
+                    continue;
+                }
+                // The steps after it read its output in this process: only
+                // when that is the output the mark was taken with were the
+                // pending rows loaded. Otherwise they weren't: dropped, the
+                // next run reads them again.
+                if !holds_pending_rows(ctx, job, n, &p) {
+                    let _ = ctx.workspace.set_job_watermark_pending(&job.id, &n.id, None);
+                    t.log(
+                        "warning",
+                        format!(
+                            "Incremental mark not moved: the steps after it read an output of {} other than the one run{} read its rows into (it ran in another process, or earlier), so the next run reads those rows again",
+                            n.name,
+                            p.run_id.map(|r| format!(" #{r}")).unwrap_or_default()
+                        ),
+                        None,
+                        None,
+                        None,
+                    );
                     continue;
                 }
                 match ctx.workspace.set_job_watermark(&job.id, &n.id, &p.column, &p.value, p.value_type.as_deref(), p.run_id) {
@@ -1938,6 +2025,18 @@ fn advance_marks(ctx: &JobCtx, job: &Job, status: &HashMap<String, &'static str>
             }
         }
     }
+}
+
+/// Whether step `n`'s output in this process holds the rows its pending
+/// mark `p` was taken from: created by the run that took it (from its
+/// start to the mark). An output of another process (the background
+/// runner, `databrain-jobs run`) isn't here; an older one predates the run.
+fn holds_pending_rows(ctx: &JobCtx, job: &Job, n: &JobNode, p: &PendingMark) -> bool {
+    let Some(run) = p.run_id.and_then(|r| ctx.workspace.job_run(&job.id, r).ok().flatten()) else { return false };
+    let tab = node_tab(&job.id, &n.id);
+    ctx.engine.outputs().resolve(&n.name).is_some_and(|o| {
+        o.tab_id == tab && o.state != databrain_query_engine::OutputState::Evicted && o.created_at >= run.started_at && o.created_at <= p.taken_at
+    })
 }
 
 /// Whether SQL on `connection_id` can read the outputs (`results.*`): every

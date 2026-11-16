@@ -402,19 +402,19 @@ impl Workspace {
         Ok(p.filter(|p| p.column.eq_ignore_ascii_case(column.trim())))
     }
 
-    /// Marks of `job` that its steps no longer have: of a deleted step, or
-    /// taken from a column the step doesn't use any more (another column,
-    /// or not incremental), so changing the column back starts from the
-    /// start value instead of an old mark.
+    /// Marks of `job`'s deleted steps. A step's mark stays while the step
+    /// does, whatever its column now: it counts only for the column it was
+    /// taken from ([`Self::job_watermark`]), so turning Incremental off and
+    /// on again, or a column saved half typed, doesn't lose it (only Reset
+    /// does, after asking); a run with another column replaces it.
     fn drop_stale_watermarks(c: &rusqlite::Connection, job: &Job) -> Result<()> {
         for table in ["job_watermarks", "job_watermarks_pending"] {
-            let rows: Vec<(String, String)> = {
-                let mut st = c.prepare(&format!("SELECT node_id, column_name FROM {table} WHERE job_id = ?1"))?;
-                st.query_map([&job.id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            let nodes: Vec<String> = {
+                let mut st = c.prepare(&format!("SELECT node_id FROM {table} WHERE job_id = ?1"))?;
+                st.query_map([&job.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
             };
-            for (node_id, column) in rows {
-                let current = job.nodes.iter().find(|n| n.id == node_id).and_then(|n| n.incremental_column.as_deref()).map(str::trim).filter(|c| !c.is_empty());
-                if current.is_none_or(|cur| !cur.eq_ignore_ascii_case(column.trim())) {
+            for node_id in nodes {
+                if !job.nodes.iter().any(|n| n.id == node_id) {
                     c.execute(&format!("DELETE FROM {table} WHERE job_id = ?1 AND node_id = ?2"), params![job.id, node_id])?;
                 }
             }
@@ -1038,11 +1038,11 @@ mod tests {
         assert_eq!(ws.queued_job_after().unwrap(), vec![(b.id.clone(), "after:Gone".to_string())]);
     }
 
-    /// Marks belong to a step and its column: saving the job drops those of
-    /// a deleted step and of a column the step doesn't use any more, so
-    /// switching the column back starts again from the start value.
+    /// Marks belong to a step and count for the column they were taken
+    /// from: saving the job drops those of a deleted step only, so turning
+    /// Incremental off or changing the column (and back) doesn't lose one.
     #[test]
-    fn saving_a_job_drops_marks_its_steps_no_longer_have() {
+    fn saving_a_job_drops_marks_of_deleted_steps_only() {
         let ws = Workspace::open_in_memory().unwrap();
         let mut a = node("inc");
         a.incremental_column = Some("id".into());
@@ -1056,15 +1056,17 @@ mod tests {
         let mut j = ws.save_job(j).unwrap();
         assert_eq!(ws.job_watermark(&j.id, "n0", "id").unwrap().map(|w| w.value).as_deref(), Some("5"));
         assert!(ws.job_watermark_pending(&j.id, "n0", "id").unwrap().is_some());
-        // Not incremental (n1): its mark goes.
-        assert_eq!(ws.job_watermark(&j.id, "n1", "id").unwrap(), None);
-        // Another column: gone, and back to the first one it isn't revived.
+        // Not incremental (n1): kept, for when it is again.
+        assert_eq!(ws.job_watermark(&j.id, "n1", "id").unwrap().map(|w| w.value).as_deref(), Some("9"));
+        // Another column: not counted for it; back to the first one, it is again.
         j.nodes[0].incremental_column = Some("updated_at".into());
         let mut j = ws.save_job(j).unwrap();
+        assert_eq!(ws.job_watermark(&j.id, "n0", "updated_at").unwrap(), None);
+        assert_eq!(ws.job_watermark_pending(&j.id, "n0", "updated_at").unwrap(), None);
         j.nodes[0].incremental_column = Some("id".into());
         let mut j = ws.save_job(j).unwrap();
-        assert_eq!(ws.job_watermark(&j.id, "n0", "id").unwrap(), None);
-        assert_eq!(ws.job_watermark_pending(&j.id, "n0", "id").unwrap(), None);
+        assert_eq!(ws.job_watermark(&j.id, "n0", "id").unwrap().map(|w| w.value).as_deref(), Some("5"));
+        assert!(ws.job_watermark_pending(&j.id, "n0", "id").unwrap().is_some());
         // A deleted step's marks go with it.
         ws.set_job_watermark(&j.id, "n0", "id", "5", Some("integer"), Some(1)).unwrap();
         j.nodes.remove(0);

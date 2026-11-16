@@ -2349,6 +2349,14 @@ async fn incremental_steps_read_only_new_rows() {
         assert_eq!(step(&run, "new_events").rows, Some(7));
         assert_eq!(mark(&st, &job).as_deref(), Some("7"));
 
+        // Turning Incremental off and on again (or a column saved half
+        // typed, then finished) keeps the mark: only Reset forgets it.
+        for col in [None, Some("I"), Some("ID")] {
+            job.nodes[0].incremental_column = col.map(str::to_string);
+            job = st.workspace.save_job(job).unwrap();
+        }
+        assert_eq!(mark(&st, &job).as_deref(), Some("7"), "kept through the edits");
+
         // Without a start value (and no mark), or with a column the rows
         // don't have: the step fails and says why.
         api::reset_job_watermark(&st, &job.id, "a").unwrap();
@@ -2361,6 +2369,119 @@ async fn incremental_steps_read_only_new_rows() {
         let job = st.workspace.save_job(job).unwrap();
         let err = step(&run_all(&st, &job).await, "new_events").error.unwrap_or_default();
         assert!(err.contains("have no column nope") && err.contains("id, v"), "{err}");
+    })
+    .await
+    .expect("in time");
+}
+
+/// A pending mark taken by a run whose output this process doesn't hold
+/// (the background runner read the rows; the app still has an older
+/// output of the step): a load that reads the older output doesn't move
+/// the mark (those rows weren't loaded), it's dropped so the next run
+/// reads them; and Resume runs the step again rather than load the older output.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_mark_from_another_process_does_not_move() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+        rows(&st, &src, "create table events (id integer, v text); insert into events values (1, 'a'), (2, 'b'); select 1").await;
+        rows(&st, &dst, "create table copied (id integer, v text); select 1").await;
+        let mut read = node("a", "other_in", JobNodeKind::Query, Some(&src), "select id, v from events where id > :watermark order by id");
+        read.incremental_column = Some("id".into());
+        read.incremental_start = Some("0".into());
+        let mut load = node("b", "other_out", JobNodeKind::Load, None, "");
+        load.target_connection_id = Some(dst.clone());
+        load.target_table = Some("copied".into());
+        let mut job = plain_job("other process", vec![read, load]);
+        job.edges = vec![JobEdge { from: "a".into(), to: "b".into() }];
+        let job = st.workspace.save_job(job).unwrap();
+        // This process ran it: mark 2, its output holds rows 1 and 2.
+        assert_eq!(run_all(&st, &job).await.status, "success");
+        assert_eq!(api::job_watermark(&st, &job.id, "a", "id").unwrap().map(|w| w.value).as_deref(), Some("2"));
+
+        // Another process ran it later: read up to 5 (pending), its load failed.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut other = st.workspace.start_job_run(&job.id, "background").unwrap();
+        other.status = "error".into();
+        other.finished_at = Some(databrain_workspace::now_ms());
+        st.workspace.update_job_run(&other).unwrap();
+        let pending = databrain_workspace::PendingMark {
+            column: "id".into(),
+            value: "5".into(),
+            value_type: Some("integer".into()),
+            run_id: Some(other.id),
+            taken_at: databrain_workspace::now_ms(),
+        };
+        st.workspace.set_job_watermark_pending(&job.id, "a", Some(&pending)).unwrap();
+        let mut failed = st.workspace.get_job(&job.id).unwrap().nodes[1].last_run.clone().unwrap();
+        failed.status = "error".into();
+        st.workspace
+            .set_job_node_results(&job.id, &[databrain_workspace::NodeRunRecord { node_id: "b".into(), name: "other_out".into(), summary: failed }])
+            .unwrap();
+
+        // Resume would load this process's older output: it runs the step again.
+        let j = st.workspace.get_job(&job.id).unwrap();
+        assert_eq!(databrain_app::jobs::resume_steps(&st.job_ctx(), &j), vec!["a".to_string(), "b".to_string()]);
+
+        // "Run this step" on the load reads the older output: the mark stays, the pending one goes.
+        api::run_job(&st, &job.id, Some(vec!["b".into()])).unwrap();
+        let run = finished(&st, &job.id).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(api::job_watermark(&st, &job.id, "a", "id").unwrap().map(|w| w.value).as_deref(), Some("2"));
+        assert_eq!(st.workspace.job_watermark_pending(&job.id, "a", "id").unwrap(), None);
+        let log = api::job_run_log(&st, &job.id, run.id).unwrap().into_iter().map(|l| l.message).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("other than the one run"), "{log}");
+    })
+    .await
+    .expect("in time");
+}
+
+/// Rows of an incremental step are only the new ones: a Sync load of them
+/// (which deletes the table's other rows) is refused before it writes; a
+/// Truncate or Replace one runs and says the table keeps only these rows;
+/// a Merge one runs quietly.
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_rows_are_not_synced_over_a_table() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+        rows(&st, &src, "create table events (id integer, v text); insert into events values (1, 'a'), (2, 'b'); select 1").await;
+        rows(&st, &dst, "create table kept (id integer primary key, v text); insert into kept values (100, 'old'); select 1").await;
+        let job_with = |name: &str, mode: LoadMode| {
+            let mut read = node("a", &format!("{name}_in"), JobNodeKind::Query, Some(&src), "select id, v from events where id > :watermark");
+            read.incremental_column = Some("id".into());
+            read.incremental_start = Some("0".into());
+            let mut load = node("b", &format!("{name}_out"), JobNodeKind::Load, None, "");
+            load.target_connection_id = Some(dst.clone());
+            load.target_table = Some("kept".into());
+            load.load_mode = mode;
+            load.key_columns = vec!["id".into()];
+            let mut job = plain_job(name, vec![read, load]);
+            job.edges = vec![JobEdge { from: "a".into(), to: "b".into() }];
+            st.workspace.save_job(job).unwrap()
+        };
+        let job = job_with("inc_sync", LoadMode::Sync);
+        let run = run_all(&st, &job).await;
+        let s = step(&run, "inc_sync_out");
+        assert_eq!(s.status, "error", "{run:?}");
+        assert!(s.error.as_deref().unwrap_or_default().contains("Sync deletes the rows"), "{s:?}");
+        assert_eq!(rows(&st, &dst, "select count(*) from kept where id = 100").await, vec![vec!["1"]], "nothing deleted");
+        assert_eq!(api::job_watermark(&st, &job.id, "a", "id").unwrap(), None, "the mark didn't move");
+
+        let job = job_with("inc_merge", LoadMode::Merge);
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(!log_text(&st, &job, &run).iter().any(|l| l.contains("keeps only this run's rows")));
+        assert_eq!(rows(&st, &dst, "select count(*) from kept").await, vec![vec!["3"]]);
+
+        let job = job_with("inc_truncate", LoadMode::Truncate);
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(log_text(&st, &job, &run).iter().any(|l| l.contains("The table keeps only this run's rows")), "{:?}", log_text(&st, &job, &run));
     })
     .await
     .expect("in time");
