@@ -129,6 +129,8 @@ impl Inner {
         let mut held: Option<Vec<u8>> = None;
         let max = opts.max_rows.unwrap_or(usize::MAX);
         let mut rows = 0usize;
+        // Stopped at the row limit: the rest isn't read.
+        let mut limited = false;
         'read: loop {
             let chunk = tokio::select! {
                 c = resp.chunk() => c.map_err(|e| ended_early(e, &query_id, rows))?,
@@ -181,6 +183,9 @@ impl Inner {
                             .collect();
                         let b = BatchBuilder::new(&cols, opts.batch_size.max(1));
                         if !tx.send(StreamEvent::Schema(b.schema())).await {
+                            // Nobody reads it any more: stopped on the server too.
+                            drop(resp);
+                            self.kill(&query_id).await;
                             return Ok(());
                         }
                         sink = Some((b, cols.iter().map(|c| c.col_type).collect()));
@@ -203,17 +208,29 @@ impl Inner {
                     b.push_row(types.iter().enumerate().map(|(i, t)| cell(*t, cells.get(i).cloned().flatten())));
                     rows += 1;
                     if b.is_full() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
+                        drop(resp);
+                        self.kill(&query_id).await;
                         return Ok(());
                     }
                     if rows >= max {
-                        // Dropping the response stops a read-only query on the server.
                         held = None;
+                        limited = true;
                         break 'read;
                     }
                 }
             }
             if done {
                 break;
+            }
+        }
+        // At the row limit the query goes on on the server until it notices
+        // the closed response (or never, while it is busy before writing
+        // more): stopped there, unless the result had ended anyway.
+        if limited {
+            let ended = matches!(tokio::time::timeout(Duration::from_millis(50), resp.chunk()).await, Ok(Ok(None)));
+            drop(resp);
+            if !ended {
+                self.kill(&query_id).await;
             }
         }
         if let Some(h) = held {

@@ -227,6 +227,65 @@ fn split_top(s: &str) -> Vec<String> {
 }
 
 /// A record as a row: keys in RETURN order, nodes/relationships expanded.
+/// A tag no other query carries (time and a counter).
+fn query_tag() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("databrain-{t:x}-{:x}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The query as sent: the user's text and, on a line of its own, a comment
+/// with its tag. Neo4j lists a running transaction with its query text
+/// (`SHOW TRANSACTIONS`), so Stop finds it by the tag; the comment changes
+/// nothing else (the text was classified before).
+fn tagged(text: &str, tag: &str) -> String {
+    format!("{text}\n/* {tag} */")
+}
+
+/// End the transactions running the query tagged `tag` (`SHOW TRANSACTIONS`
+/// and `TERMINATE TRANSACTION`, Neo4j 4.4+; `dbms.listTransactions` and
+/// `dbms.killTransaction` before). A user may always end their own. Best
+/// effort, a few seconds at most; a query that finished isn't found.
+async fn terminate(graph: &Graph, tag: &str) {
+    let ids = |q: &'static str| async move {
+        let mut out = Vec::new();
+        let mut s = graph.execute(query(q).param("tag", tag)).await.ok()?;
+        while let Ok(Some(r)) = s.next().await {
+            if let Ok(id) = r.get::<String>("transactionId") {
+                out.push(id);
+            }
+        }
+        Some(out)
+    };
+    let work = async {
+        if let Some(found) = ids("SHOW TRANSACTIONS YIELD transactionId, currentQuery WHERE currentQuery CONTAINS $tag RETURN transactionId").await {
+            for id in found {
+                // Executed and read: `Graph::run` doesn't make the server
+                // carry it out (the transaction stayed Running).
+                if let Ok(mut st) = graph.execute(query("TERMINATE TRANSACTION $id").param("id", id)).await {
+                    while let Ok(Some(_)) = st.next().await {}
+                }
+            }
+        } else if let Some(found) =
+            ids("CALL dbms.listTransactions() YIELD transactionId, currentQuery WHERE currentQuery CONTAINS $tag RETURN transactionId").await
+        {
+            for id in found {
+                if let Ok(mut st) = graph.execute(query("CALL dbms.killTransaction($id)").param("id", id)).await {
+                    while let Ok(Some(_)) = st.next().await {}
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), work).await;
+}
+
+/// Resolves when nobody reads the stream any more.
+async fn receiver_gone(tx: &databrain_connector_core::StreamSender) {
+    while !tx.is_closed() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 fn row_of(record: BoltMap, order: &[String]) -> Row {
     let mut entries: Vec<(String, BoltType)> = record.value.into_iter().map(|(k, v)| (k.value, v)).collect();
     entries.sort_by(|a, b| {
@@ -456,13 +515,25 @@ impl Session for Neo4jSession {
         let graph = self.graph.clone();
         let text = sql.to_string();
         tokio::spawn(async move {
+            // Its tag on the server: Stop (or nobody reading any more) ends
+            // the transaction there, not only the stream here.
+            let tag = query_tag();
             let work = async {
                 let order = return_columns(&text);
-                let mut s = graph.execute(query(&text)).await.map_err(err)?;
+                let mut s = graph.execute(query(&tagged(&text, &tag))).await.map_err(err)?;
                 let mut rows = RowBatcher::new(opts.batch_size);
                 let max = opts.max_rows.unwrap_or(usize::MAX);
                 while let Some(r) = s.next().await.map_err(err)? {
                     if rows.rows() as usize >= max {
+                        // A read stops on the server; a write runs to its end
+                        // (its rows past the limit are dropped), never cut off.
+                        if databrain_connector_core::sql::classify(&text, ConnectorKind::Neo4j).kind == databrain_connector_core::sql::StatementKind::Read {
+                            drop(s);
+                            terminate(&graph, &tag).await;
+                        } else {
+                            while s.next().await.map_err(err)?.is_some() {}
+                            tx.send(StreamEvent::Notice(format!("The statement ran to its end; only its first {max} rows are kept."))).await;
+                        }
                         break;
                     }
                     let m = r.to_strict::<BoltMap>().map_err(|e| ConnectorError::query(e.to_string()))?;
@@ -480,7 +551,14 @@ impl Session for Neo4jSession {
             };
             let r = tokio::select! {
                 r = work => r,
-                _ = opts.cancel.cancelled() => Err(ConnectorError::cancelled()),
+                _ = opts.cancel.cancelled() => {
+                    terminate(&graph, &tag).await;
+                    Err(ConnectorError::cancelled())
+                }
+                _ = receiver_gone(&tx) => {
+                    terminate(&graph, &tag).await;
+                    return;
+                }
             };
             if let Err(e) = r {
                 tx.send_err(e).await;
@@ -667,6 +745,159 @@ mod tests {
         let j = json(&BoltType::Map(m));
         assert_eq!(j["since"], "2020-01-02");
         assert!(j["zoned"].as_str().unwrap().ends_with("[Europe/Paris]"), "{j}");
+    }
+
+    /// The query sent carries its tag in a comment on a line of its own (a
+    /// `//` comment ending the text can't swallow it); tags differ.
+    #[test]
+    fn queries_carry_their_tag() {
+        let (a, b) = (query_tag(), query_tag());
+        assert_ne!(a, b);
+        assert_eq!(tagged("MATCH (n) RETURN n // all", &a), format!("MATCH (n) RETURN n // all\n/* {a} */"));
+    }
+
+    /// Live: Stop and the row limit end a read on the server (it ran on
+    /// before); a write at the row limit runs to its end; a finished query
+    /// is left alone.
+    #[ignore = "live: needs DATABRAIN_NEO4J_URI (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_stop_ends_the_transaction_on_the_server() {
+        let Ok(uri) = std::env::var("DATABRAIN_NEO4J_URI") else {
+            panic!("live test: DATABRAIN_NEO4J_URI not set (run with --ignored)");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let user = std::env::var("DATABRAIN_NEO4J_USER").unwrap_or_else(|_| "neo4j".into());
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Neo4j, AuthMethod::Password { user: user.clone() });
+        cfg.options.insert("uri".into(), uri);
+        let creds = InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_NEO4J_PASSWORD").ok().map(secrecy::SecretString::from));
+        let s = Neo4jConnector.connect(&cfg, Arc::new(creds)).await.unwrap();
+        let s = &s;
+        // Transactions running a query with this text in it (not this one: its text holds only `$t`).
+        let running = |text: &'static str| async move {
+            let r = s
+                .execute(
+                    databrain_connector_core::Statement::internal(&format!(
+                        "SHOW TRANSACTIONS YIELD currentQuery WHERE currentQuery CONTAINS '{text}' AND NOT currentQuery CONTAINS 'SHOW TRANSACTIONS' RETURN count(*) AS n"
+                    )),
+                    ExecOptions::default(),
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            databrain_connector_core::arrow::util::display::ArrayFormatter::try_new(r.batches[0].column(0).as_ref(), &Default::default())
+                .unwrap()
+                .value(0)
+                .to_string()
+        };
+        let gone = |text: &'static str| async move {
+            for _ in 0..20 {
+                if running(text).await == "0" {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            false
+        };
+        // A long read, stopped: ended on the server.
+        let long = "UNWIND range(1, 4000000000) AS slowread RETURN count(slowread) AS n";
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let stream =
+            s.execute(databrain_connector_core::Statement::internal(long), ExecOptions { cancel: cancel.clone(), ..Default::default() }).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert_eq!(running("slowread").await, "1", "the read runs");
+        cancel.cancel();
+        let e = tokio::time::timeout(std::time::Duration::from_secs(10), stream.collect()).await.expect("stopped").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Cancelled);
+        assert!(gone("slowread").await, "the read still runs on the server");
+        // The termination itself, on a query whose connection stays open
+        // (the server never sees it dropped): only its tag ends it.
+        let graph = Arc::new(
+            Graph::connect(
+                ConfigBuilder::new()
+                    .uri(std::env::var("DATABRAIN_NEO4J_URI").unwrap())
+                    .user(std::env::var("DATABRAIN_NEO4J_USER").unwrap_or_else(|_| "neo4j".into()))
+                    .password(std::env::var("DATABRAIN_NEO4J_PASSWORD").unwrap_or_default())
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let tag = query_tag();
+        let held = {
+            let (graph, text) = (graph.clone(), tagged("UNWIND range(1, 4000000000) AS keptopen RETURN count(keptopen) AS n", &tag));
+            tokio::spawn(async move {
+                let mut st = graph.execute(query(&text)).await?;
+                st.next().await.map(|_| ())
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert_eq!(running("keptopen").await, "1");
+        terminate(&graph, &tag).await;
+        // Terminated on the server: gone, or marked so (a tight loop like
+        // this one notices it at its next check).
+        let status = || async {
+            let mut st = graph
+                .execute(query(
+                    "SHOW TRANSACTIONS YIELD currentQuery, status WHERE currentQuery CONTAINS 'keptopen' AND NOT currentQuery CONTAINS 'SHOW' RETURN status",
+                ))
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            while let Ok(Some(r)) = st.next().await {
+                out.push(r.get::<String>("status").unwrap_or_default());
+            }
+            out
+        };
+        let mut ok = false;
+        for _ in 0..20 {
+            let st = status().await;
+            if st.iter().all(|s| s.starts_with("Terminated")) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert!(ok, "still running on the server: {:?}", status().await);
+        held.abort();
+        // The row limit on a read: its first rows, and it ends on the server.
+        let many = "UNWIND range(1, 4000000000) AS limitedread RETURN limitedread";
+        let opts = ExecOptions { max_rows: Some(3), ..Default::default() };
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            s.execute(databrain_connector_core::Statement::internal(many), opts).await.unwrap().collect().await
+        })
+        .await
+        .expect("not read to its end")
+        .unwrap();
+        assert_eq!(r.num_rows(), 3);
+        assert!(gone("limitedread").await, "the limited read still runs on the server");
+        // The row limit on a write: it runs to its end.
+        s.execute(databrain_connector_core::Statement::internal("MATCH (n:DbStop) DELETE n"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let opts = ExecOptions { max_rows: Some(2), ..Default::default() };
+        let w = s
+            .execute(databrain_connector_core::Statement::internal("UNWIND range(1, 50) AS i CREATE (n:DbStop {i: i}) RETURN n.i AS i"), opts)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(w.num_rows(), 2);
+        assert!(w.notices.iter().any(|n| n.contains("ran to its end")), "{:?}", w.notices);
+        let n = s
+            .execute(databrain_connector_core::Statement::internal("MATCH (n:DbStop) RETURN count(n) AS c"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let c = databrain_connector_core::arrow::util::display::ArrayFormatter::try_new(n.batches[0].column(0).as_ref(), &Default::default())
+            .unwrap()
+            .value(0)
+            .to_string();
+        assert_eq!(c, "50", "every node was created");
+        s.execute(databrain_connector_core::Statement::internal("MATCH (n:DbStop) DELETE n"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
     }
 
     /// Live: DATABRAIN_NEO4J_URI=neo4j://localhost:7687 DATABRAIN_NEO4J_PASSWORD=… cargo test -p databrain-connector-neo4j -- --nocapture
