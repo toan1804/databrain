@@ -32,26 +32,23 @@ The review's privacy gaps and bugs were fixed on 2026-11-15 (a connection's rule
 
 Fixed on 2026-11-15: catalog queries built with a literal a backslash could end (MySQL, Snowflake, Databricks, Redshift, Postgres, BigQuery paths), the crashes on text outside ASCII (MongoDB, Neo4j), Databricks running a write twice, `results.<name>` hidden behind a comment, and the DuckDB sandbox writing into attached folders. Left, most serious first:
 
-**Stop and the row limit** (Oracle, MySQL, the procedure row limit and the cloud polls fixed on 2026-11-15)
-- **Postgres:** inside a transaction the row limit reads the whole result to its end before finishing; a cancel that races a ready row is not sent to the server.
-- **SQLite, DuckDB:** cancelling a statement that waits for the session interrupts the one that is running, and the cancelled one then runs. SQLite: a statement cut at its memory cap (its stream cancelled) can interrupt the next statement of the script, which then fails as cancelled (seen with several large results in a row).
-- **MongoDB, Neo4j:** cancel and the row limit only drop the local future; the server keeps working. **ClickHouse** relies on the server noticing the closed response.
+**Stop and the row limit** (fixed on 2026-11-15 and 2026-11-16 except as follows)
 - **Snowflake, BigQuery, Databricks:** the cancel on a failed poll is tested against a mock server only, not a live account; a Databricks or BigQuery submit that fails before the server answers can't be cancelled (no statement or job id yet).
-- **Oracle (Instant Client), SQL Server:** Stop, the wait-for-session check (Oracle) and the row limit on `EXEC` (SQL Server) are not tested live.
+- **Not tested live:** Oracle (Instant Client): Stop and the wait-for-session check; SQL Server: Stop, the row limit on `EXEC`, reconnect sign-in (SQL Server 2022 crashes under emulation on the arm64 podman VM, and Azure SQL Edge never finished a login); ClickHouse: `KILL QUERY` at the row limit (fake server only). The Oracle helper's exit when DataBrain goes is tested in Go, not against a server.
+- **MongoDB:** a command with the user's own `comment`, or on a server before 4.4, isn't tagged, so Stop only drops it here (an open cursor is still killed). **Neo4j:** a tight loop notices `TERMINATE TRANSACTION` only at its next check.
 
 **Wrong results or state** (fixed on 2026-11-15 except as follows; the rest was checked by unit tests only, live where noted)
-- **Oracle:** the Instant Client (thick) path, its per-statement read-only transaction and `DBMS_OUTPUT`, is not tested live (the thin one is, on Oracle Free 23). A `DBMS_OUTPUT` line longer than 8000 bytes is cut. Read-only is not enforced by the server (confirmed live on 23): a `COMMIT` inside a block, or DDL, ends the READ ONLY transaction, and what is committed after it stays; the classifier refuses blocks and DDL on a read-only connection, and what isn't committed is rolled back as the statement ends.
-- **SQL Server:** `money` comes from the driver as a float, so values beyond about ±900 billion may be off in the last digit; `datetimeoffset` is text with its offset, so it sorts as text, not by instant. Not run against a live server (the container never finished a login).
-- **SQLite:** a value that doesn't fit its column's type after the first batch (the type is chosen from the first batch) shows as NULL, with a notice.
+- **Oracle:** the Instant Client (thick) path, its per-statement read-only transaction and `DBMS_OUTPUT` (32,767-byte binds), is not tested live (the thin one is, on Oracle Free 23). Read-only is not enforced by the server (confirmed live on 23): a `COMMIT` inside a block, or DDL, ends the READ ONLY transaction, and what is committed after it stays; the classifier refuses blocks and DDL on a read-only connection, and what isn't committed is rolled back as the statement ends.
+- **SQL Server:** `money` past about ±900 billion is read by the driver (tiberius) as a float, so its last digits are lost (a notice says so); `datetimeoffset` is text with its offset, so it sorts as text, not by instant (sorting by instant needs the result store and outputs to know the type).
+- **SQLite:** a value that doesn't fit its column's type after the first batch shows as NULL, with a notice: the column types are fixed by the schema sent before the rows stream; fixing it needs the result store to widen a column mid-stream.
 - **Neo4j:** whether the server decodes `\uXXXX` outside strings is not confirmed; the classifier reads both ways. Durations are read from the driver's debug output (neo4rs 0.8.0): recheck when upgrading.
 - **Databricks:** the 100,000-row metadata check relies on `manifest.truncated` (as documented; not seen on a live workspace).
 - **ClickHouse:** the mid-stream exception fix is tested against a fake server only.
 
 **Connections and secrets**
-- **TLS:** Postgres and MySQL `Prefer` falls back to plaintext, `Require` accepts any certificate (as libpq does); MySQL's fallback also triggers on a wrong password. Only `VerifyFull` verifies; there is no CA-file option.
-- **SQL Server and MySQL keep the credential** for reconnects (an Entra token expires after about an hour).
-- **Oracle:** the Instant Client install uses a predictable folder in a shared `/tmp` on Linux; `DATABRAIN_ORACLE_AGENT` runs an unverified helper; the helper keeps running a statement after DataBrain dies.
-- **Redshift read-only** rests on `SET SESSION CHARACTERISTICS … READ ONLY`, which may be a no-op there (not confirmed).
+- **TLS:** Postgres and MySQL `Prefer` and `Require` without a CA file encrypt without checking the certificate (libpq's meaning); give a CA file (`ssl_root_cert`) to verify. The Postgres CA file is not tested against a TLS server.
+- **MySQL:** the live connection inside mysql_async keeps its own copy of the connection options (the password with them); side connections (Stop, replacement) read it again.
+- **Redshift read-only** isn't enforced by the server as far as DataBrain knows (`SET SESSION CHARACTERISTICS` is deprecated there): DataBrain's classifier refuses writes, and function calls ask.
 
 ## Review of v0.4.1..main (2026-11-15)
 
