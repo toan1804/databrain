@@ -171,3 +171,39 @@ pub fn topo_order(job: &Job) -> std::result::Result<Vec<String>, Vec<String>> {
     }
     if out.len() == ids.len() { Ok(out) } else { Err(ids.iter().filter(|i| !out.iter().any(|o| o == *i)).map(|s| s.to_string()).collect()) }
 }
+
+/// An incremental step's mark ([`JobNode::incremental_column`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct Watermark {
+    /// The column it was taken from.
+    pub column: String,
+    /// Its largest value then, as the grid shows it.
+    pub value: String,
+    /// The column's type, which the value is written back into SQL as
+    /// (`text`, `integer`, `timestamptz`…: see
+    /// `databrain_connector_core::sql::MarkType`); `None` for marks without
+    /// one (written as a parameter is).
+    #[serde(default)]
+    #[ts(optional)]
+    pub value_type: Option<String>,
+    /// The run that set it.
+    #[ts(as = "Option<f64>")]
+    pub run_id: Option<i64>,
+    #[ts(as = "f64")]
+    pub updated_at: i64,
+}
+
+/// A mark an incremental step took while a step after it didn't succeed
+/// ([`crate::Workspace::job_watermark_pending`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingMark {
+    pub column: String,
+    pub value: String,
+    pub value_type: Option<String>,
+    /// The run that took it.
+    pub run_id: Option<i64>,
+    /// When the step took it (its rows were read then): a step after it
+    /// that succeeded since has those rows.
+    pub taken_at: i64,
+}

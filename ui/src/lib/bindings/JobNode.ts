@@ -66,4 +66,16 @@ ai_sql?: boolean,
 /**
  * Its own time limit and retries (over the job's).
  */
-limits?: StepLimits, last_run?: NodeRunSummary | null, };
+limits?: StepLimits, 
+/**
+ * Incremental: a column of the step's rows whose largest value the
+ * job remembers (the step's mark, [`crate::Workspace::job_watermark`])
+ * once the step and the loads after it succeed; the step's SQL gets it
+ * as `:watermark` on the next run (e.g. `where updated_at > :watermark`).
+ */
+incremental_column?: string, 
+/**
+ * Incremental: `:watermark` while the step has no mark (its first run,
+ * after a reset).
+ */
+incremental_start?: string, last_run?: NodeRunSummary | null, };

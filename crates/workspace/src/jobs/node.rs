@@ -252,6 +252,18 @@ pub struct JobNode {
     #[serde(default, skip_serializing_if = "super::StepLimits::is_default")]
     #[ts(as = "Option<super::StepLimits>", optional)]
     pub limits: super::StepLimits,
+    /// Incremental: a column of the step's rows whose largest value the
+    /// job remembers (the step's mark, [`crate::Workspace::job_watermark`])
+    /// once the step and the loads after it succeed; the step's SQL gets it
+    /// as `:watermark` on the next run (e.g. `where updated_at > :watermark`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub incremental_column: Option<String>,
+    /// Incremental: `:watermark` while the step has no mark (its first run,
+    /// after a reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub incremental_start: Option<String>,
     #[serde(default)]
     pub last_run: Option<NodeRunSummary>,
 }

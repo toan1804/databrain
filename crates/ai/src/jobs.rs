@@ -742,6 +742,12 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
                         n.name
                     ));
                 }
+                if a.incremental_column != b.incremental_column || a.incremental_start != b.incremental_start {
+                    out.push(match b.incremental_column.as_deref().filter(|c| !c.trim().is_empty()) {
+                        Some(c) => format!("step {}: incremental on {c} (start {})", n.name, b.incremental_start.as_deref().unwrap_or("none")),
+                        None => format!("step {}: no longer incremental (it reads all rows each run)", n.name),
+                    });
+                }
                 if a.load_insert_only != b.load_insert_only {
                     out.push(format!(
                         "step {}: {}",
@@ -920,6 +926,8 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
                     n.load_insert_only = o.load_insert_only;
                 }
                 n.limits = o.limits.clone();
+                n.incremental_column = o.incremental_column.clone();
+                n.incremental_start = o.incremental_start.clone();
                 // A step with no connection runs on Results: sent back under
                 // that name it is the same step, not SQL the assistant moved.
                 if o.connection_id.as_deref().is_none_or(str::is_empty) && n.connection_id.as_deref() == results_id {
@@ -1287,13 +1295,13 @@ mod tests {
         assert!(changes(&old, &fewer).iter().any(|x| x == "removes step daily"));
     }
 
-    /// A kept step keeps the settings the tool can't write (INSERTs only,
-    /// limits); a change to them is listed.
+    /// A kept step keeps the settings the tool can't write (incremental
+    /// column and start, INSERTs only, limits); a change to them is listed.
     #[test]
-    fn edits_keep_a_steps_bulk_settings() {
+    fn edits_keep_a_steps_incremental_and_bulk_settings() {
         let c = conns();
         let args = json!({"name": "j", "steps": [
-            {"name": "orders", "connection": "Sales PG", "sql": "select * from orders"},
+            {"name": "orders", "connection": "Sales PG", "sql": "select * from orders where updated_at > :watermark"},
             {"name": "copy", "action": "load", "after": ["orders"], "target_connection": "Sales PG", "target_table": "public.copy"}
         ]});
         let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
@@ -1302,6 +1310,8 @@ mod tests {
             n.id = format!("n{i}");
         }
         old.edges = vec![databrain_workspace::JobEdge { from: "n0".into(), to: "n1".into() }];
+        old.nodes[0].incremental_column = Some("updated_at".into());
+        old.nodes[0].incremental_start = Some("2026-01-01".into());
         old.nodes[1].load_insert_only = true;
         old.nodes[1].batch_rows = Some(200);
         let mut spec = spec_of(&old, &c);
@@ -1309,8 +1319,10 @@ mod tests {
         // Sent back as it is, or with other SQL: the settings stay.
         let (same, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
         assert!(changes(&old, &same).is_empty(), "{:?}", changes(&old, &same));
-        spec["steps"][0]["sql"] = json!("select id, updated_at from orders");
+        spec["steps"][0]["sql"] = json!("select id, updated_at from orders where updated_at > :watermark");
         let (new, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert_eq!(new.nodes[0].incremental_column.as_deref(), Some("updated_at"));
+        assert_eq!(new.nodes[0].incremental_start.as_deref(), Some("2026-01-01"));
         assert!(new.nodes[1].load_insert_only && new.nodes[1].batch_rows == Some(200));
         assert_eq!(changes(&old, &new), vec!["changes step orders".to_string()]);
         // A step that stops loading drops the load's settings.
@@ -1319,9 +1331,10 @@ mod tests {
         assert!(!q.nodes[1].load_insert_only && q.nodes[1].batch_rows.is_none());
         // A change to them (made elsewhere) is listed.
         let mut other = old.clone();
+        other.nodes[0].incremental_column = None;
         other.nodes[1].load_insert_only = false;
         let ch = changes(&old, &other);
-        assert!(ch.iter().any(|x| x.contains("bulk load")), "{ch:?}");
+        assert!(ch.iter().any(|x| x.contains("no longer incremental")) && ch.iter().any(|x| x.contains("bulk load")), "{ch:?}");
     }
 
     /// `{"off": true}` turns only the time schedule off: the user's times,

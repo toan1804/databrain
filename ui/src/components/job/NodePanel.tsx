@@ -12,6 +12,7 @@ import { useJobs } from "../../jobsStore";
 import { openOutput } from "../../outputs";
 import { CellEditor } from "../Notebook";
 import { ExportFields } from "./ExportFields";
+import { IncrementalFields } from "./IncrementalFields";
 import { LoadFields } from "./LoadFields";
 import { StepLimitFields } from "./LimitFields";
 import { RunLog } from "./RunLog";
@@ -303,6 +304,7 @@ export function NodePanel({
       {node.kind === "load" && <LoadFields job={job} node={node} onChange={onChange} />}
 
       <StepLimitFields job={job} node={node} onChange={onChange} />
+      <IncrementalFields key={node.id} jobId={job.id} node={node} onChange={onChange} />
 
       {(ups.length > 0 || downs.length > 0) && (
         <div className="grid grid-cols-2 gap-2 text-[11.5px]">

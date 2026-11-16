@@ -74,7 +74,7 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 
 ## Jobs (improvements of 2026-11-16)
 
-- **The assistant's job tools** set only an interval or one daily time: not several times, monthly, cron, a time zone, the missed-run policy, "run after", limits or retries.
+- **The assistant's job tools** set only an interval or one daily time: not several times, monthly, cron, a time zone, the missed-run policy, "run after", limits, retries or an incremental column.
 - **Bulk loads** exist for PostgreSQL only (`COPY`). Not done: MySQL `LOAD DATA LOCAL` (it turns conversion errors into warnings and truncates where an INSERT fails, and `local_infile` is off by default), ClickHouse native/RowBinary, SQL Server bulk insert (TDS bulk API), Snowflake/Databricks staged files, BigQuery load jobs.
 - **`INSERT … SELECT` on the server** (a load whose rows come from a query on the same connection, without passing through DataBrain) was tried and dropped: it runs the query again after the load's own DELETE/DROP and before SQL (a Replace of a table from itself empties it), loads rows other than the step's (volatile functions, `LIMIT` without `ORDER BY`, a capped result), and Postgres refuses text into typed columns the INSERT path takes. Only as an explicit opt-in, plain inserts, no before SQL, and a query that provably doesn't read the target.
 - **No retry test with a load** that fails with a connection error midway; the decision is unit-tested (`reads_only`, `retryable`, `load_retry_refused`, `kept_nothing`), and what a failed load reports is tested on SQLite (rolled back, before SQL that may commit, failed before writing). A failed commit and a database without transactions are tested only through `kept_nothing`.

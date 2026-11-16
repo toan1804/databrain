@@ -80,6 +80,16 @@ pub(crate) async fn job_run_log(state: State<'_, AppState>, id: String, run_id: 
     api::job_run_log(&state, &id, run_id)
 }
 
+#[tauri::command]
+pub(crate) async fn job_watermark(state: State<'_, AppState>, id: String, node_id: String, column: String) -> R<Option<databrain_workspace::Watermark>> {
+    api::job_watermark(&state, &id, &node_id, &column)
+}
+
+#[tauri::command]
+pub(crate) async fn reset_job_watermark(state: State<'_, AppState>, id: String, node_id: String) -> R<()> {
+    api::reset_job_watermark(&state, &id, &node_id)
+}
+
 /// Why a cron expression can't be a job's schedule (what a save would say), or none.
 #[tauri::command]
 pub(crate) fn check_job_cron(cron: String) -> Option<String> {

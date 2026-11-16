@@ -157,9 +157,9 @@ fn schema_version_guard_and_backup() {
     // definitions): backed up as it was, then updated.
     {
         let c = Connection::open(&path).unwrap();
-        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 3) as i64).unwrap();
-        // Undo v22 and v21.
-        c.execute_batch("DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
+        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 4) as i64).unwrap();
+        // Undo v23, v22 and v21.
+        c.execute_batch("DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
         // Undo v20, as an older version left it: schema `s`
         // indexed in full (index scope `*`), `hr.teams` indexed on its own,
         // and `hr.salaries` only seen in the explorer.
@@ -197,7 +197,7 @@ fn schema_version_guard_and_backup() {
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(bv as usize, MIGRATIONS.len() - 3, "the backup is the workspace before the update");
+    assert_eq!(bv as usize, MIGRATIONS.len() - 4, "the backup is the workspace before the update");
     drop((ws, b));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -526,9 +526,10 @@ fn a_server_move_forgets_the_index_scope_and_asks() {
 }
 
 /// A workspace a development build upgraded to an earlier draft of v22
-/// (the run-after queue keyed by job only, no `ai` columns) is brought to
-/// the final v22 when opened: its queued starts are kept and queueing works
-/// again. One already at the final v22 is left alone.
+/// (the run-after queue keyed by job only, no `ai` columns, marks without
+/// their value type) is brought to the final v22 and v23 when opened: its
+/// queued starts are kept and queueing works again. One already at the
+/// final version is left alone.
 #[test]
 fn an_earlier_draft_of_v22_is_repaired() {
     let dir = std::env::temp_dir().join(format!("dbtest-ws-{}", uuid::Uuid::new_v4()));
@@ -537,10 +538,14 @@ fn an_earlier_draft_of_v22_is_repaired() {
     drop(Workspace::open(&path).unwrap());
     {
         let c = Connection::open(&path).unwrap();
+        // At v22, which then held v23's tables too: v23 runs over them.
+        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
         c.execute_batch(
             "DROP TABLE job_after_pending; \
              CREATE TABLE job_after_pending (job_id TEXT PRIMARY KEY, after TEXT NOT NULL, added_at INTEGER NOT NULL); \
              INSERT INTO job_after_pending VALUES ('j1', 'Extract', 5); \
+             DROP TABLE job_watermarks_pending; \
+             ALTER TABLE job_watermarks DROP COLUMN value_type; \
              ALTER TABLE job_runs DROP COLUMN ai;",
         )
         .unwrap();
@@ -554,8 +559,10 @@ fn an_earlier_draft_of_v22_is_repaired() {
     ws.queue_job_after("j2", "A", true).unwrap();
     let n: i64 = ws.conn.lock().query_row("SELECT count(*) FROM job_after_pending WHERE job_id = 'j2'", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 2);
-    let has: i64 = ws.conn.lock().query_row("SELECT count(*) FROM pragma_table_info('job_runs') WHERE name = 'ai'", [], |r| r.get(0)).unwrap();
-    assert_eq!(has, 1, "job_runs.ai");
+    for (table, col) in [("job_runs", "ai"), ("job_watermarks", "value_type"), ("job_watermarks_pending", "taken_at")] {
+        let has: i64 = ws.conn.lock().query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = '{col}'"), [], |r| r.get(0)).unwrap();
+        assert_eq!(has, 1, "{table}.{col}");
+    }
     drop(ws);
     // At the final v22: opening again changes nothing.
     let ws = Workspace::open(&path).unwrap();
