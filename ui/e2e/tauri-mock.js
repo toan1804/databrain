@@ -62,6 +62,10 @@
     },
   };
 
+  // A handler may wait (return a promise), e.g. to hold a save while
+  // something else happens; it can still use the built-in answers.
+  mock.builtins = builtins;
+
   function answer(cmd, args) {
     if (cmd in mock.handlers) {
       const h = mock.handlers[cmd];
@@ -101,7 +105,7 @@
       }
       if (cmd === "plugin:event|unlisten" || cmd === "plugin:event|emit") return null;
       mock.calls.push({ cmd, args: clone(args) });
-      const r = answer(cmd, args);
+      const r = await answer(cmd, args);
       if (r && typeof r === "object" && r.__error) throw r.__error;
       return r;
     },

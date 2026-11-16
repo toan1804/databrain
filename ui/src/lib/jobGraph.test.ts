@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, rebaseJob, removeNode, scheduleText, uniqueName } from "./jobGraph";
+import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, rebaseClashes, rebaseJob, removeNode, scheduleText, uniqueName } from "./jobGraph";
 import type { Job, JobNode, OutputInfo } from "./types";
 
 const n = (id: string, name: string, sql = "", x = 0, y = 0): JobNode => ({ id, name, kind: "query", sql, x, y, load_mode: "append" });
@@ -210,13 +210,28 @@ describe("rebaseJob: edits made here put on top of the version saved since", () 
     expect(out.updated_at).toBe(2);
   });
 
-  it("keeps the user's own SQL edit whole (the step is then the user's to save)", () => {
+  it("keeps the user's own SQL edit whole when the step wasn't changed since (the step is then the user's to save)", () => {
     const base = job([node("a", { sql: "select 1", load_before_sql: "delete from t", ai_sql: true })]);
     const mine = job([node("a", { sql: "select 10", load_before_sql: "delete from t", ai_sql: true })]);
-    const theirs = job([node("a", { sql: "select 2", load_before_sql: "drop table t", ai_sql: true })], { updated_at: 2 });
+    const theirs = job([node("a", { sql: "select 1", load_before_sql: "delete from t", ai_sql: true, x: 9 })], { updated_at: 2 });
     const out = rebaseJob(base, mine, theirs);
-    // The user's version of every text field: never the user's SQL with the assistant's newer before-SQL.
-    expect(out.nodes[0]).toMatchObject({ sql: "select 10", load_before_sql: "delete from t" });
+    expect(out.nodes[0]).toMatchObject({ sql: "select 10", load_before_sql: "delete from t", x: 9 });
+    expect(rebaseClashes(base, mine, theirs)).toEqual([]);
+  });
+
+  it("a step both changed keeps the version since, mark included (never the user's SQL with the assistant's newer before-SQL or target)", () => {
+    const base = job([node("a", { kind: "load", sql: "select 1", load_before_sql: "delete from t", target_table: "t", ai_sql: false })]);
+    const mine = job([node("a", { kind: "load", sql: "select 10", load_before_sql: "delete from t", target_table: "t", ai_sql: false, x: 7 })]);
+    for (const since of [
+      { sql: "select 1", load_before_sql: "drop table t", target_table: "t" },
+      { sql: "select 1", load_before_sql: "delete from t", target_table: "other" },
+      { sql: "select 1", load_before_sql: "delete from t", target_table: "t", load_mode: "replace" as const },
+    ]) {
+      const theirs = job([node("a", { kind: "load", ...since, ai_sql: true })], { updated_at: 2 });
+      const out = rebaseJob(base, mine, theirs);
+      expect(out.nodes[0]).toMatchObject({ ...since, ai_sql: true, x: 7 });
+      expect(rebaseClashes(base, mine, theirs)).toEqual(["a"]);
+    }
   });
 
   it("'Trust this SQL' counts only for the SQL the user trusted", () => {

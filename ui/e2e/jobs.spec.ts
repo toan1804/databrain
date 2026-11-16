@@ -174,6 +174,60 @@ test.describe("the assistant changes a job with unsaved edits here", () => {
     expect(saved?.nodes[0].ai_sql).toBe(true);
   });
 
+  // A save sent and not answered when the assistant saves its own change:
+  // the change event and the refused save both arrive, in either order. One
+  // dialog asks, and "Keep my changes" keeps the edits that save carried.
+  for (const order of ["event first", "refusal first"] as const) {
+    test(`edits in a save under way are kept when the assistant saves meanwhile (${order})`, async ({ page }) => {
+      await openApp(page, backend({ __jobs: [job] }));
+      await page.getByRole("button", { name: "Jobs", exact: true }).click();
+      await page.getByText("Orders", { exact: true }).click();
+      const card = page.getByLabel("Job steps").locator("[data-node]").first();
+      await expect(card).toContainText("orders_today");
+      // Hold the editor's save until the assistant has saved.
+      await page.evaluate(() => {
+        const w = window as unknown as {
+          __DB_MOCK__: { handlers: Record<string, unknown>; builtins: Record<string, (a: unknown) => unknown> };
+          __release?: () => void;
+        };
+        w.__DB_MOCK__.handlers.save_job = (a: unknown) =>
+          new Promise((res) => {
+            w.__release = () => {
+              delete w.__DB_MOCK__.handlers.save_job;
+              res(w.__DB_MOCK__.builtins.save_job(a));
+            };
+          });
+      });
+      await card.click();
+      await page.getByLabel("Step details").getByRole("textbox").first().fill("mine");
+      await expect.poll(async () => (await calls(page, "save_job")).length).toBe(1);
+      // The assistant saves a change of its own (a newer version).
+      await page.evaluate((j) => {
+        const w = window as unknown as { __DB_MOCK__: { db: { jobs: unknown[] } } };
+        w.__DB_MOCK__.db.jobs = [{ ...j, nodes: [{ ...j.nodes[0], sql: "select 2" }], updated_at: 50 }];
+      }, job);
+      const event = () =>
+        page.evaluate((id) => window.dispatchEvent(new CustomEvent("db:job-changed", { detail: { id } })), job.id);
+      const refusal = () => page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+      if (order === "event first") {
+        await event();
+        await refusal();
+      } else {
+        await refusal();
+        await event();
+      }
+      const dialog = page.getByRole("dialog");
+      await expect(dialog).toContainText("This job was changed elsewhere");
+      await dialog.getByRole("button", { name: "Keep my changes" }).click();
+      await expect.poll(async () => (await lastSaved(page))?.nodes[0].name).toBe("mine");
+      const saved = await lastSaved(page);
+      expect(saved?.nodes[0].sql).toBe("select 2");
+      expect(saved?.updated_at).toBe(50);
+      await expect(dialog).toHaveCount(0);
+      await expect(card).toContainText("mine");
+    });
+  }
+
   test("a save refused as made on an older version asks too", async ({ page }) => {
     await openApp(page, backend({ __jobs: [job] }));
     await page.getByRole("button", { name: "Jobs", exact: true }).click();

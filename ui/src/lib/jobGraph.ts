@@ -348,6 +348,26 @@ const SERVER_FIELDS = new Set(["last_run", "updated_at", "created_at", "last_sch
 const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 const text = (v: unknown) => (typeof v === "string" ? v.trim() : (v ?? null));
 const sameText = (a: JobNode, b: JobNode) => TEXT_FIELDS.every((k) => same(text(a[k]), text(b[k])));
+/** Where and how a step writes (as the app's `JobNode::same_effect`, with its SQL). */
+const EFFECT_FIELDS = ["target_table", "load_mode", "key_columns", "create_table", "export_folder", "export_file", "export_format"] as const;
+const sameEffect = (a: JobNode, b: JobNode) => sameText(a, b) && EFFECT_FIELDS.every((k) => same(text(a[k]), text(b[k])));
+
+/**
+ * Steps whose SQL was edited here while the assistant changed the same step
+ * (its SQL, connections or where it writes) in the version saved since: the
+ * rebase keeps the assistant's version of those (see [`rebaseJob`]).
+ */
+export function rebaseClashes(base: Job, mine: Job, theirs: Job): string[] {
+  const baseById = new Map(base.nodes.map((n) => [n.id, n]));
+  const mineById = new Map(mine.nodes.map((n) => [n.id, n]));
+  return theirs.nodes
+    .filter((t) => {
+      const b = baseById.get(t.id);
+      const m = mineById.get(t.id);
+      return !!b && !!m && !sameText(m, b) && !sameEffect(t, b);
+    })
+    .map((t) => t.name);
+}
 
 /**
  * Edits made on `base` (`mine`) put on top of the job as saved since
@@ -357,7 +377,9 @@ const sameText = (a: JobNode, b: JobNode) => TEXT_FIELDS.every((k) => same(text(
  * them (the step is then theirs, as any step they edit), else `theirs`
  * whole, with its AI mark — so an older version of SQL the assistant wrote
  * never comes back as the user's. Clearing the mark ("Trust this SQL")
- * only counts for the SQL the user trusted.
+ * only counts for the SQL the user trusted. A step both changed (the user
+ * its SQL, the version since its SQL, connections or where it writes) keeps
+ * the version since: the user is told ([`rebaseClashes`]) and edits again.
  */
 export function rebaseJob(base: Job, mine: Job, theirs: Job): Job {
   const out: Job = { ...theirs };
@@ -382,7 +404,13 @@ export function rebaseJob(base: Job, mine: Job, theirs: Job): Job {
       if (SERVER_FIELDS.has(k) || (TEXT_FIELDS as readonly string[]).includes(k) || k === "ai_sql") continue;
       if (!same(m[k], b[k])) n[k] = m[k];
     }
-    if (!sameText(m, b)) {
+    if (!sameText(m, b) && !sameEffect(t, b)) {
+      // Both changed the step: the version saved since stays whole (SQL,
+      // connections, where it writes, its mark), so the user's SQL can't
+      // take what the assistant changed as the user's ([`rebaseClashes`]).
+      for (const k of [...TEXT_FIELDS, ...EFFECT_FIELDS]) n[k] = t[k];
+      n.ai_sql = t.ai_sql;
+    } else if (!sameText(m, b)) {
       for (const k of TEXT_FIELDS) n[k] = m[k];
       n.ai_sql = m.ai_sql;
     } else if (!same(m.ai_sql, b.ai_sql) && sameText(t, b)) {
