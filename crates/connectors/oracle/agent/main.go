@@ -124,13 +124,18 @@ func (w *writer) json(v any) error {
 	return w.frame('J', b)
 }
 
+// maxRequest is the largest request handled (MAX_REQUEST in src/agent.rs):
+// a larger one is read up to maxFrame and answered with an error, so the
+// helper goes on instead of losing its place in the stream.
+var maxRequest = 64 << 20
+
 func readFrame(r *bufio.Reader) (byte, []byte, error) {
 	var h [5]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
 		return 0, nil, err
 	}
 	n := binary.BigEndian.Uint32(h[:4])
-	if n > 64<<20 {
+	if int64(n) > int64(maxFrame) {
 		return 0, nil, fmt.Errorf("frame too large: %d", n)
 	}
 	b := make([]byte, n)
@@ -1073,25 +1078,14 @@ func (s *session) exec(ctx context.Context, w *writer, r *request) error {
 }
 
 // execMany runs r.SQL once with every row's values bound as arrays (array
-// DML: one round trip for all of them). Numbers are text read with "." as
-// the decimal separator, whatever the session's NLS settings (put back
-// afterwards). A failed call is rolled back, so it keeps none of its rows:
-// the rows before the failing one would otherwise commit with the next
-// statement.
+// DML: one round trip for all of them), as text the session reads (DataBrain
+// writes numbers with its decimal separator). A failed call is rolled back,
+// so it keeps none of its rows: the rows before the failing one would
+// otherwise commit with the next statement.
 func (s *session) execMany(ctx context.Context, w *writer, r *request) error {
 	if s.ro {
 		return errors.New("This connection is read-only")
 	}
-	var previous string
-	_ = s.conn.QueryRowContext(ctx, "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_NUMERIC_CHARACTERS'").Scan(&previous)
-	if _, err := s.conn.ExecContext(ctx, "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'"); err != nil {
-		return err
-	}
-	defer func() {
-		if len([]rune(previous)) == 2 && !strings.ContainsRune(previous, '\'') {
-			_, _ = s.conn.ExecContext(context.Background(), "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '"+previous+"'")
-		}
-	}()
 	args := make([]any, len(r.Columns))
 	for i, col := range r.Columns {
 		values := make([]sql.NullString, len(col))
@@ -1221,6 +1215,15 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 				return
 			}
 			if kind != 'J' {
+				continue
+			}
+			if len(b) > maxRequest {
+				// Only its id is read, to answer it.
+				var head struct {
+					ID uint64 `json:"id"`
+				}
+				_ = json.Unmarshal(b, &head)
+				_ = w.json(map[string]any{"id": head.ID, "type": "error", "message": fmt.Sprintf("a request of %d MB is larger than the %d MB the Oracle driver takes", len(b)>>20, maxRequest>>20)})
 				continue
 			}
 			r := new(request)

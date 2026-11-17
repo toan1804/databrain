@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -248,4 +249,44 @@ func TestAStatementThatDoesNotStopMakesTheHelperExit(t *testing.T) {
 		t.Fatal("a stuck statement kept the helper alive")
 	}
 	close(release)
+}
+
+// A request larger than the helper takes is answered with an error and the
+// next one runs: the helper doesn't take it for stdin closing and exit.
+func TestAnOversizedRequestIsRefusedAndTheHelperGoesOn(t *testing.T) {
+	old := maxRequest
+	maxRequest = 1 << 10
+	defer func() { maxRequest = old }()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	handled := make(chan uint64, 2)
+	go serve(inR, outW, func(ctx context.Context, w *writer, r *request) error {
+		handled <- r.ID
+		return w.json(map[string]any{"id": r.ID, "type": "done"})
+	}, func() { t.Error("the helper must not exit") })
+	go func() {
+		big := reqFrame(t, map[string]any{"id": 1, "op": "execmany", "sql": strings.Repeat("x", 4<<10)})
+		_, _ = inW.Write(append(big, reqFrame(t, map[string]any{"id": 2, "op": "query"})...))
+	}()
+	out := bufio.NewReader(outR)
+	var replies []map[string]any
+	for len(replies) < 2 {
+		_, b, err := readFrame(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		replies = append(replies, m)
+	}
+	if replies[0]["id"] != float64(1) || replies[0]["type"] != "error" || !strings.Contains(fmt.Sprint(replies[0]["message"]), "larger than") {
+		t.Fatalf("the oversized request: %v", replies[0])
+	}
+	if replies[1]["id"] != float64(2) || replies[1]["type"] != "done" {
+		t.Fatalf("the next request: %v", replies[1])
+	}
+	if id := <-handled; id != 2 {
+		t.Fatalf("handled %d", id)
+	}
+	inW.Close()
 }

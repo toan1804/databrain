@@ -54,6 +54,8 @@ pub fn set_dir(dir: Option<PathBuf>) {
 /// The largest frame the helper sends (`maxFrame` in agent/main.go): it
 /// refuses a row larger than this rather than wrap the 32-bit length.
 const MAX_FRAME: usize = 1 << 30;
+/// Largest request the helper reads (`maxRequest` in main.go).
+pub const MAX_REQUEST: usize = 64 << 20;
 
 /// Override the download location (setting / `DATABRAIN_ORACLE_AGENT_URL`).
 pub fn set_base_url(url: Option<String>) {

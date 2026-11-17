@@ -326,7 +326,7 @@ fn export_and_load(s: &mut Suite) {
         let mut values = 0;
         for b in &array_data {
             let mut at = 0;
-            while let Some((cols, n)) = ai.next(b, at, 10_000, 32 << 20).expect("array") {
+            while let Some((cols, n)) = ai.next(b, at, 10_000, 32 << 20, '.').expect("array") {
                 values += cols.iter().map(Vec::len).sum::<usize>();
                 at += n;
             }

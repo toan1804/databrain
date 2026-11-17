@@ -762,32 +762,76 @@ impl ArrayInsert {
         })
     }
 
-    /// Rows `start..` of `batch` as one array per column, at most `max_rows`
-    /// rows and about `max_bytes` of text (at least one row), and how many
-    /// rows they hold. `None` past the end.
-    pub fn next(&self, batch: &RecordBatch, start: usize, max_rows: usize, max_bytes: usize) -> Result<Option<(Columns, usize)>> {
+    /// Rows `start..` of `batch` as one array per column, and how many rows
+    /// they hold (at least one; `None` past the end). A call stops before a
+    /// row that would pass `max_rows`, `max_bytes` of request (the values'
+    /// JSON-escaped length: the thin Oracle helper and Snowflake get them as
+    /// JSON) or [`ARRAY_SLOT_BYTES`] of bind buffers (rows × each column's
+    /// longest value: a driver sizes every row's slot for the longest).
+    /// `decimal`: the session's decimal separator, written in numbers so
+    /// they convert as the INSERT's literals do (Oracle; `.` elsewhere).
+    pub fn next(&self, batch: &RecordBatch, start: usize, max_rows: usize, max_bytes: usize, decimal: char) -> Result<Option<(Columns, usize)>> {
         if start >= batch.num_rows() {
             return Ok(None);
         }
         let fopts = format_options();
         let fmts: Vec<ArrayFormatter<'_>> =
             batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
-        let mut cols: Vec<Vec<Option<String>>> = vec![Vec::new(); batch.num_columns()];
+        let ncols = batch.num_columns();
+        let mut cols: Vec<Vec<Option<String>>> = (0..ncols).map(|_| Vec::with_capacity(max_rows.min(batch.num_rows() - start))).collect();
+        let mut longest = vec![0usize; ncols];
+        let mut row: Vec<Option<String>> = Vec::with_capacity(ncols);
+        let sep = decimal.to_string();
         let (mut bytes, mut n) = (0usize, 0usize);
         for r in start..batch.num_rows() {
-            if n > 0 && (n >= max_rows || bytes >= max_bytes) {
+            if n >= max_rows {
                 break;
             }
-            for ((col, (a, f)), k) in cols.iter_mut().zip(batch.columns().iter().zip(&fmts)).zip(&self.kinds) {
+            row.clear();
+            let (mut row_bytes, mut wider) = (0usize, 0usize);
+            for (i, ((a, f), k)) in batch.columns().iter().zip(&fmts).zip(&self.kinds).enumerate() {
                 let cell = (!a.is_null(r)).then(|| f.value(r).to_string());
-                let v = oracle_text(cell.as_deref(), *k);
-                bytes += v.as_ref().map_or(0, String::len);
+                let mut v = oracle_text(cell.as_deref(), *k);
+                if decimal != '.'
+                    && matches!(k, Lit::Number | Lit::Float)
+                    && let Some(t) = v.as_mut()
+                {
+                    *t = t.replace('.', &sep);
+                }
+                row_bytes += v.as_deref().map_or(5, json_len);
+                wider += longest[i].max(v.as_ref().map_or(0, String::len));
+                row.push(v);
+            }
+            if n > 0 && (bytes + row_bytes > max_bytes || (n + 1) * wider > ARRAY_SLOT_BYTES) {
+                break;
+            }
+            for (i, (col, v)) in cols.iter_mut().zip(row.drain(..)).enumerate() {
+                longest[i] = longest[i].max(v.as_ref().map_or(0, String::len));
                 col.push(v);
             }
+            bytes += row_bytes;
             n += 1;
         }
         Ok(Some((cols, n)))
     }
+}
+
+/// Bind buffer an array call may take: its rows times the sum of each
+/// column's longest value (Instant Client allocates every row's slot for a
+/// column's longest value, up to 4 bytes a character).
+pub const ARRAY_SLOT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Length of `s` as a JSON string with its comma: quotes, `\"` `\\` and
+/// short escapes 2 bytes, other control characters 6.
+fn json_len(s: &str) -> usize {
+    3 + s.len()
+        + s.bytes()
+            .filter(|b| *b < 0x20 || *b == b'"' || *b == b'\\')
+            .map(|b| match b {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 1,
+                _ => 5,
+            })
+            .sum::<usize>()
 }
 
 /// A value as the text its Oracle INSERT literal stands for (`None`: NULL):
@@ -1200,7 +1244,7 @@ mod tests {
              TO_DATE(:5, 'YYYY-MM-DD'), TO_TIMESTAMP(:6, 'YYYY-MM-DD HH24:MI:SS.FF'), TO_TIMESTAMP(:7, 'YYYY-MM-DD HH24:MI:SS.FF'), \
              TO_TIMESTAMP_TZ(:8, 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), HEXTORAW(:9))"
         );
-        let (cols, n) = ai.next(&batch, 0, 10, MB).unwrap().unwrap();
+        let (cols, n) = ai.next(&batch, 0, 10, MB, '.').unwrap().unwrap();
         assert_eq!(n, 2);
         let s = |v: &str| Some(v.to_string());
         assert_eq!(cols[0], vec![s("1"), s("2")]);
@@ -1213,9 +1257,36 @@ mod tests {
         assert!(cols[7][0].as_deref().is_some_and(|v| v.ends_with(" +02:00")), "the offset after a space: {:?}", cols[7]);
         assert_eq!(cols[8], vec![s("00ff"), None]);
         // At most `max_rows`, or about `max_bytes` (at least one row).
-        assert_eq!(ai.next(&batch, 0, 1, MB).unwrap().unwrap().1, 1);
-        assert_eq!(ai.next(&batch, 0, 10, 1).unwrap().unwrap().1, 1);
-        assert!(ai.next(&batch, 2, 10, MB).unwrap().is_none());
+        assert_eq!(ai.next(&batch, 0, 1, MB, '.').unwrap().unwrap().1, 1);
+        assert_eq!(ai.next(&batch, 0, 10, 1, '.').unwrap().unwrap().1, 1);
+        assert!(ai.next(&batch, 2, 10, MB, '.').unwrap().is_none());
+        // A session whose decimal separator is ',': numbers written with it.
+        let (cols, _) = ai.next(&batch, 0, 10, MB, ',').unwrap().unwrap();
+        assert_eq!(cols[3][0].as_deref(), Some("2,5"));
+        assert_eq!(cols[1][0].as_deref(), Some("it's"), "text as it is");
+    }
+
+    /// An array call stays within its request size counted as JSON (quotes
+    /// and backslashes doubled, control characters 6 bytes) and within its
+    /// bind buffers (rows × each column's longest value).
+    #[test]
+    fn array_calls_count_escaped_text_and_bind_buffers() {
+        assert_eq!(json_len("ab"), 5);
+        assert_eq!(json_len(r#"a"b\c"#), 3 + 7);
+        assert_eq!(json_len("\u{1}\n"), 3 + 6 + 2);
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let quoted = "\"\\".repeat(50); // 100 bytes of text, 200 as JSON
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec![quoted.as_str(); 10]))]).unwrap();
+        let ai = ArrayInsert::new(ConnectorKind::Oracle, "t", &schema).unwrap();
+        // 1,000 bytes: 4 rows of 203 bytes as JSON (not 9 of 100 as text).
+        assert_eq!(ai.next(&batch, 0, 100, 1000, '.').unwrap().unwrap().1, 4);
+        // One 8 KB value among short ones: rows × 8 KB within 16 MB.
+        let mut values = vec!["x".to_string(); 10_000];
+        values[0] = "y".repeat(8 * 1024);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))]).unwrap();
+        let (_, n) = ai.next(&batch, 0, 10_000, 32 * MB, '.').unwrap().unwrap();
+        assert_eq!(n, ARRAY_SLOT_BYTES / (8 * 1024));
+        assert!(n * 8 * 1024 <= ARRAY_SLOT_BYTES);
     }
 
     /// A Databricks bulk load: one INSERT … SELECT casting each text column
