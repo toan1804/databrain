@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Security
+
+- zlib (libz-sys 1.1.33): a heap buffer overflow in writing gzip data (RUSTSEC-2026-0544), in the compression MySQL connections and xlsx files use.
+
 ### Fixed
 
 - AI usage with Kiro: "today" and "this month" showed 0 tokens, since Kiro bills credits, not tokens. They now show the credits DataBrain's conversations and test data spent, including turns that were stopped.
