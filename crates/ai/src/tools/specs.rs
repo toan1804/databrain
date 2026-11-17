@@ -111,7 +111,7 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         ),
         s(
             "create_job",
-            "Create a job (asks the user to approve): SQL steps that run in order, by hand or on a schedule. Steps can run on different connections; a step on \"Results\" reads earlier steps' outputs as results.<step> with DuckDB SQL, to join data across databases. Then load steps write rows into a table of any connection and export steps save a file. Check table names with search_schema / describe_table (connection argument) first.",
+            "Create a job (asks the user to approve): SQL steps that run in order, by hand or on a schedule. Steps can run on different connections; a step on \"Results\" reads earlier steps' outputs as results.<step> with DuckDB SQL, to join data across databases. Then load steps write rows into a table of any connection and export steps save a file. Check table names with search_schema / describe_table (connection argument) first. For the day a run processes, use :run_date (the date the run is for, a date literal; :run_time with its time), e.g. where day = :run_date - 1, not current_date: a late, made-up or resumed run then still reads its own day.",
             crate::jobs::create_job_schema(),
         ),
         s(

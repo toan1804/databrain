@@ -16,6 +16,7 @@ import { IncrementalFields } from "./IncrementalFields";
 import { LoadFields } from "./LoadFields";
 import { StepLimitFields } from "./LimitFields";
 import { RunLog } from "./RunLog";
+import { RUN_DATE, wallClockUse } from "./runDate";
 import { EDITOR_KEY, NodeList, ProgressBar, StatusIcon, actionIcon, field, isResults, label, latestTab, statusText, type Patch } from "./shared";
 import { outputNames } from "../../lib/sqlText";
 
@@ -293,6 +294,7 @@ export function NodePanel({
             onRunAdvance={onRun}
             onFocus={() => {}}
           />
+          <WallClockHint sql={[node.sql, node.load_before_sql, node.load_after_sql].filter(Boolean).join("\n")} />
         </div>
         </>
       ) : (
@@ -312,6 +314,21 @@ export function NodePanel({
           <NodeList title="Downstream" nodes={downs} onSelect={onSelect} empty="none" />
         </div>
       )}
+    </div>
+  );
+}
+
+/** SQL that reads today's date: a run late, made up or resumed later reads another day; `:run_date` doesn't. */
+function WallClockHint({ sql }: { sql: string }) {
+  const fn = wallClockUse(sql);
+  if (!fn) return null;
+  return (
+    <div className="mt-1 flex items-start gap-1 rounded-md border border-warning/40 bg-warning/10 px-2 py-1 text-[11.5px]" role="note">
+      <AlertTriangle size={12} className="mt-0.5 shrink-0 text-warning" />
+      <span>
+        Uses <code>{fn}</code>: a run that starts late, a missed run made up later or a Resume the next day reads the day it runs, not the day it is for. Use{" "}
+        <code>:{RUN_DATE}</code> (the date the run is for), e.g. <code>where day = :{RUN_DATE} - 1</code>.
+      </span>
     </div>
   );
 }

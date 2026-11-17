@@ -11,6 +11,7 @@ import { JobLimits } from "./LimitFields";
 import { ScheduleSection } from "./ScheduleSection";
 import { triggerText } from "../../lib/jobGraph";
 import { WATERMARK, isIncremental } from "./IncrementalFields";
+import { RUN_DATE, RUN_TIME, isRunMoment, today } from "./runDate";
 import { ProgressBar, StatusIcon, field, label, statusText, type Patch } from "./shared";
 
 /** "2 succeeded · 1 failed" for a run's steps. */
@@ -59,7 +60,11 @@ function useJobParamNames(job: Job): string[] {
 
 /** The job's `:name` values: a saved set, values of its own over it, and "Run with" another set. */
 function JobParams({ job, onChange, onRunWith }: { job: Job; onChange: (patch: Partial<Job>) => void; onRunWith: (p: RunParams) => void }) {
-  const names = useJobParamNames(job);
+  const used = useJobParamNames(job);
+  // `:run_date` / `:run_time` are filled by the runner, not typed here.
+  const names = used.filter((n) => !isRunMoment(n));
+  const usesRunDate = used.length > names.length;
+  const [forDate, setForDate] = useState(() => today());
   const sets = useStore((s) => s.paramSets);
   useEffect(() => {
     void useStore.getState().loadParamSets();
@@ -73,7 +78,7 @@ function JobParams({ job, onChange, onRunWith }: { job: Job; onChange: (patch: P
     else delete next[n];
     onChange({ params: next });
   };
-  if (!names.length && !Object.keys(own).length && !job.param_set) return null;
+  if (!names.length && !usesRunDate && !Object.keys(own).length && !job.param_set) return null;
   return (
     <section className="space-y-2">
       <div className={`${label} flex items-center gap-1`}>
@@ -129,9 +134,36 @@ function JobParams({ job, onChange, onRunWith }: { job: Job; onChange: (patch: P
           </div>
         );
       })}
+      {usesRunDate && (
+        <div className="space-y-1 rounded-md border border-line p-2 text-[11.5px]" aria-label="Run date">
+          <div>
+            <code className="text-accent">:{RUN_DATE}</code> / <code className="text-accent">:{RUN_TIME}</code>: the date (and time) the run is for, in the job's time zone. A scheduled
+            run gets its scheduled time however late it starts (each missed run its own), a Resume the run's it resumes, a run after another job that
+            job's; a run started by hand, today.
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="date"
+              className={`${field} w-auto font-mono`}
+              aria-label="Date to run the job for"
+              value={forDate}
+              max="9999-12-31"
+              onChange={(e) => setForDate(e.target.value)}
+            />
+            <button
+              className="btn-ghost border border-line py-1 text-[12px]"
+              disabled={!/^\d{4}-\d{2}-\d{2}$/.test(forDate)}
+              title="Run now as the run for this date (to make up a day or run one again)"
+              onClick={() => onRunWith({ values: { [RUN_DATE]: { value: forDate } } })}
+            >
+              <Play size={11} /> Run for this date
+            </button>
+          </div>
+        </div>
+      )}
       <div className="flex items-start gap-1 text-[11.5px] text-muted">
         <Play size={11} className="mt-0.5 shrink-0" />
-        Every run fills the steps' :name with these values (a value here wins over the set's), on the schedule too. From a terminal: databrain-jobs run "{job.name}" --set NAME --param name=value.
+        Every run fills the steps' :name with these values (a value here wins over the set's), on the schedule too. From a terminal: databrain-jobs run "{job.name}" --set NAME --param name=value{usesRunDate ? ` (for a date: --param ${RUN_DATE}=2026-11-16)` : ""}.
       </div>
     </section>
   );

@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **Jobs, run date:** `:run_date` (and `:run_time`) is the date a run is for, so a run that starts late, a missed run made up later or a Resume the next day still reads its own day: `where day = :run_date - 1` instead of `current_date - 1`. A scheduled run gets its scheduled time (each missed one its own with "run each"), Resume the run's it resumes, a run after another job that job's, a run by hand today; "Run for this date" in the job's parameters (or `--param run_date=…`) runs for another day. The step panel warns when a step's SQL reads `current_date`, `now()`, `sysdate` or `getdate()`. A job's own value named `run_date` is now checked as a date, and a scheduled run uses its scheduled date over it.
+
 ### Security
 
 - zlib (libz-sys 1.1.33): a heap buffer overflow in writing gzip data (RUSTSEC-2026-0544), in the compression MySQL connections and xlsx files use.
