@@ -1,4 +1,5 @@
-# Build and test on macOS, Linux and Windows for every push to main and pull request.
+# Build and test on macOS, Linux and Windows for every push to main (and on
+# request); pull requests run the other checks, not the three-system tests.
 name: CI
 
 on:
@@ -17,6 +18,8 @@ permissions:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    # The longest jobs (about 1-2 h): after the merge, on main, not on each pull request.
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
