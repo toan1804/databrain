@@ -19,6 +19,9 @@ ignore = [
   { id = "RUSTSEC-2026-0368", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
   { id = "RUSTSEC-2026-0369", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
   { id = "RUSTSEC-2026-0429", reason = "zip extract() aborts on a huge declared symlink size: libduckdb-sys's build script (its own sources) and the updater (archives whose signature checked); DataBrain's own use is zip 9" },
+  { id = "RUSTSEC-2026-0545", reason = "zip AES entries (aes-crypto feature): not enabled for zip 4 (updater) or zip 6 (libduckdb-sys build script, deflate only); zip 9 isn't affected" },
+  { id = "RUSTSEC-2026-0547", reason = "zip Shrink/Reduce/Implode decoders (legacy-zip feature): not enabled for zip 4 or 6" },
+  { id = "RUSTSEC-2026-0548", reason = "zip ZipStreamReader: the updater and libduckdb-sys's build script read with ZipArchive, not ZipStreamReader" },
 
   # --- Upstream has no fix in a version DataBrain can take yet.
 
@@ -40,6 +43,12 @@ ignore = [
   { id = "RUSTSEC-2026-0391", reason = "zstd via arrow/parquet: they use the one-shot bulk API, not abandoned streaming contexts; moves with arrow/duckdb" },
   { id = "RUSTSEC-2026-0398", reason = "zstd-safe Seekable: the seekable feature is not enabled" },
   { id = "RUSTSEC-2026-0403", reason = "zstd-safe legacy frames (default feature of zstd): accepted until arrow/parquet move with duckdb" },
+  # chrono and chrono-tz unmaintained (no vulnerability, no successor
+  # release). arrow, parquet, neo4rs and russh use chrono, so it stays in
+  # the build whatever DataBrain does; moving DataBrain's own uses (job
+  # schedules' time zones, a few connectors) to jiff is in docs/TODO.md.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, not vulnerable; arrow/parquet/neo4rs/russh depend on it; DataBrain's own uses may move to jiff (docs/TODO.md)" },
+  { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, not vulnerable; job schedules' time zones; may move to jiff with chrono (docs/TODO.md)" },
 ]
 
 [licenses]
