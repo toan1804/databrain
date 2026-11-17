@@ -1252,6 +1252,9 @@ async fn next_batch(stream: &mut QueryStream) -> Result<Option<RecordBatch>> {
 struct Written {
     rows: u64,
     statements: usize,
+    /// An INSERT refused as too large was split: its rows, and the rows
+    /// per statement the load went on with.
+    split: Option<(usize, usize)>,
     /// The first statement, or the one that failed.
     sql: String,
     result: Result<()>,
@@ -1275,7 +1278,14 @@ impl Feed<'_, '_> {
     }
 }
 
-/// Batched INSERTs, built one at a time while the rows are sent.
+/// Batched INSERTs, built one at a time while the rows are sent. A
+/// statement takes rows from as many incoming batches as it needs (rows
+/// arrive 2,000 at a time from a query or a result on disk, which capped
+/// every INSERT at that, whatever the step's setting). An INSERT the
+/// server refuses as too large ([`rejected_as_too_large`]) is sent again
+/// as two of half the rows, and the rest of the load uses that size; only
+/// outside a transaction, where a refused statement wrote nothing and the
+/// session goes on.
 async fn insert_rows(
     p: &Prepared,
     table: &str,
@@ -1285,42 +1295,106 @@ async fn insert_rows(
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
     let b = sqlgen::InsertSql::new(p.dialect, table, schema, p.batch);
-    let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()) };
-    'rows: loop {
-        let batch = match feed.next().await {
-            Ok(Some(b)) => b,
-            Ok(None) => break,
-            Err(e) => {
-                w.result = Err(e);
-                break;
+    let want = p.batch.rows.max(1);
+    let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None };
+    // Rows read and not written yet, and whether the feed has ended.
+    let mut pending: Vec<RecordBatch> = Vec::new();
+    let mut pending_rows = 0usize;
+    let mut ended = false;
+    // Rows per statement after a refusal as too large.
+    let mut cap: Option<usize> = None;
+    loop {
+        let fill = cap.unwrap_or(want);
+        while !ended && pending_rows < fill {
+            match feed.next().await {
+                Ok(Some(batch)) => {
+                    pending_rows += batch.num_rows();
+                    pending.push(batch);
+                }
+                Ok(None) => ended = true,
+                Err(e) => {
+                    w.result = Err(e);
+                    return w;
+                }
             }
-        };
+        }
+        if pending_rows == 0 {
+            break;
+        }
         // Batches carry the rows' names; the statement uses the target's.
+        let rows = match pending.as_slice() {
+            [one] => one.clone(),
+            many => match databrain_connector_core::arrow::compute::concat_batches(&many[0].schema(), many) {
+                Ok(b) => b,
+                Err(e) => {
+                    w.result = Err(EngineError::new("internal", e.to_string()));
+                    return w;
+                }
+            },
+        };
+        pending.clear();
         let mut at = 0;
-        loop {
-            let (sql, k) = match b.next(&batch, at, None) {
+        // Full statements while the rows last; at the end, the rest too.
+        while at < rows.num_rows() && (ended || rows.num_rows() - at >= cap.unwrap_or(want)) {
+            let (sql, k) = match b.next(&rows, at, cap) {
                 Ok(Some(x)) => x,
                 Ok(None) => break,
                 Err(e) => {
                     w.result = Err(EngineError::new("internal", e.to_string()));
-                    break 'rows;
+                    return w;
                 }
             };
             if w.sql.is_empty() {
                 w.sql = sql.clone();
             }
-            if let Err(e) = exec(&p.session, Statement::internal(&sql), cancel).await {
-                w.sql = sql;
-                w.result = Err(e);
-                break 'rows;
+            match exec(&p.session, Statement::internal(&sql), cancel).await {
+                Ok(_) => {}
+                Err(e) if k > 1 && p.tx.is_none() && rejected_as_too_large(&e) => {
+                    let half = k / 2;
+                    w.split.get_or_insert((k, half)).1 = half;
+                    cap = Some(half);
+                    continue;
+                }
+                Err(e) => {
+                    w.sql = sql;
+                    w.result = Err(e);
+                    return w;
+                }
             }
             at += k;
             w.rows += k as u64;
             w.statements += 1;
             progress(w.rows);
         }
+        if at < rows.num_rows() {
+            pending_rows = rows.num_rows() - at;
+            pending.push(rows.slice(at, pending_rows));
+        } else {
+            pending_rows = 0;
+        }
     }
     w
+}
+
+/// The server refused a statement for its size before running it: the
+/// request or statement is too large (Databricks' message size, MySQL's
+/// `max_allowed_packet`, an HTTP 413), not an error in its rows.
+fn rejected_as_too_large(e: &EngineError) -> bool {
+    if e.kind == "cancelled" {
+        return false;
+    }
+    let m = e.message.to_ascii_lowercase();
+    m.contains("(413")
+        || m.contains("request entity too large")
+        || m.contains("payload too large")
+        || m.contains("max_allowed_packet")
+        || m.contains("packet too large")
+        || m.contains("statement is too large")
+        || m.contains("statement too large")
+        || m.contains("query is too large")
+        || m.contains("message size")
+        || m.contains("message too large")
+        || ((m.contains("exceed") || m.contains("too long") || m.contains("too large")) && (m.contains("size") || m.contains("length") || m.contains("bytes")))
 }
 
 /// Rows go in INSERTs only: the step says so, or the connection is Amazon
@@ -1455,7 +1529,7 @@ async fn copy_rows(
     mut feed: Feed<'_, '_>,
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
-    let mut w = Written { rows: 0, statements: 1, sql: c.sql.clone(), result: Ok(()) };
+    let mut w = Written { rows: 0, statements: 1, sql: c.sql.clone(), result: Ok(()), split: None };
     'rows: loop {
         let batch = match feed.next().await {
             Ok(Some(b)) => b,
@@ -1600,7 +1674,13 @@ async fn run_plan(
                     Some((c, writer)) => copy_rows(p, c, writer, feed, &progress).await,
                     None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
                 };
-                let Written { rows: n, statements, sql: first, result: r } = w;
+                let Written { rows: n, statements, sql: first, result: r, split } = w;
+                if let Some((refused, rows)) = split {
+                    obs.event(LoadEvent::Info(format!(
+                        "{label}: {} refused an INSERT of {refused} rows as too large; it was split, and the rest went in INSERTs of up to {rows} rows (lower the step's rows or KB per INSERT to start there)",
+                        engine_name(p.dialect)
+                    )));
+                }
                 obs.event(LoadEvent::Inserted {
                     label: label.clone(),
                     table: table.clone(),
@@ -1755,6 +1835,144 @@ fn create_schema_sql(kind: ConnectorKind, path: &str, name: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A warehouse that refuses an INSERT of more than `limit` rows as too
+    /// large, and records the rows of each INSERT it takes.
+    struct Warehouse {
+        limit: usize,
+        taken: parking_lot::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for Warehouse {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind::Databricks
+        }
+        async fn server_version(&self) -> databrain_connector_core::Result<String> {
+            Ok("test".into())
+        }
+        async fn ping(&self) -> databrain_connector_core::Result<()> {
+            Ok(())
+        }
+        async fn execute(&self, stmt: Statement<'_>, _: ExecOptions) -> databrain_connector_core::Result<QueryStream> {
+            let rows = stmt.sql().matches("), (").count() + 1;
+            if rows > self.limit {
+                return Err(databrain_connector_core::ConnectorError::query("Databricks (413 Payload Too Large): request too large"));
+            }
+            self.taken.lock().push(rows);
+            let (tx, stream) = QueryStream::channel(1);
+            tx.send(StreamEvent::Done(Default::default())).await;
+            Ok(stream)
+        }
+        async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<databrain_connector_core::SchemaInfo>> {
+            Ok(vec![])
+        }
+        async fn list_objects(&self, _: &str) -> databrain_connector_core::Result<Vec<databrain_connector_core::DbObject>> {
+            Ok(vec![])
+        }
+        async fn describe(&self, _: &str, _: &str) -> databrain_connector_core::Result<databrain_connector_core::ObjectDetail> {
+            Err(databrain_connector_core::ConnectorError::query("no"))
+        }
+    }
+
+    fn prepared(w: Arc<Warehouse>, rows: usize, tx: Option<Tx>) -> Prepared {
+        Prepared {
+            dialect: ConnectorKind::Databricks,
+            connection: "dbx".into(),
+            table: "t".into(),
+            session: w,
+            exists: Some(true),
+            creates: false,
+            plan: vec![],
+            schema: None,
+            tx,
+            batch: sqlgen::BatchSize { rows, bytes: 16 * 1024 * 1024 },
+            permanent_stage: None,
+            notices: vec![],
+            may_commit: false,
+            insert_only: false,
+        }
+    }
+
+    /// `n` rows of one column, in batches of `per` (as a query or a result
+    /// on disk sends them).
+    fn batches(n: i64, per: i64) -> (SchemaRef, Vec<RecordBatch>) {
+        use databrain_connector_core::arrow::array::Int64Array;
+        use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let out = (0..n)
+            .step_by(per as usize)
+            .map(|from| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from((from..(from + per).min(n)).collect::<Vec<_>>()))]).unwrap())
+            .collect();
+        (schema, out)
+    }
+
+    /// An INSERT takes as many rows as the step says, from as many incoming
+    /// batches as that needs (they come 2,000 at a time, which capped every
+    /// INSERT at 2,000 rows); the last one takes what is left.
+    #[tokio::test]
+    async fn inserts_fill_up_across_incoming_batches() {
+        let w = Arc::new(Warehouse { limit: usize::MAX, taken: Default::default() });
+        let p = prepared(w.clone(), 10, None);
+        let (schema, held) = batches(33, 3);
+        let written = insert_rows(&p, "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_ok());
+        assert_eq!((written.rows, written.statements, written.split), (33, 4, None));
+        assert_eq!(*w.taken.lock(), vec![10, 10, 10, 3]);
+    }
+
+    /// An INSERT refused as too large is sent again as two of half its rows,
+    /// and the rest of the load goes in INSERTs of that size; every row once.
+    /// Not in a transaction, where the refused statement may have spoilt it,
+    /// and not when a single row is refused.
+    #[tokio::test]
+    async fn an_insert_refused_as_too_large_is_split() {
+        let w = Arc::new(Warehouse { limit: 4, taken: Default::default() });
+        let p = prepared(w.clone(), 10, None);
+        let (schema, held) = batches(25, 2000);
+        let written = insert_rows(&p, "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_ok(), "{:?}", written.result.err());
+        assert_eq!(written.rows, 25);
+        assert_eq!(written.split, Some((10, 2)), "10 refused, then 5 refused: the load went on with 2");
+        assert_eq!(w.taken.lock().iter().sum::<usize>(), 25);
+        assert!(w.taken.lock().iter().all(|n| *n <= 4));
+
+        let one = Arc::new(Warehouse { limit: 0, taken: Default::default() });
+        let written = insert_rows(&prepared(one, 10, None), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_err_and(|e| e.message.contains("413")));
+
+        let in_tx = Arc::new(Warehouse { limit: 4, taken: Default::default() });
+        let tx = Tx { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK" };
+        let written =
+            insert_rows(&prepared(in_tx.clone(), 10, Some(tx)), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_err() && written.split.is_none());
+        assert!(in_tx.taken.lock().is_empty());
+    }
+
+    /// What counts as refused for its size (sent again smaller), and what doesn't.
+    #[test]
+    fn too_large_is_a_refusal_for_size_only() {
+        let e = |m: &str| EngineError::new("query", m);
+        for m in [
+            "Databricks (413 Payload Too Large): request too large",
+            "Got a packet bigger than 'max_allowed_packet' bytes",
+            "The statement exceeds the maximum size of 16 MiB",
+            "[REQUEST_LIMIT_EXCEEDED] message size 17000000 exceeds the limit",
+            "Query is too large",
+        ] {
+            assert!(rejected_as_too_large(&e(m)), "{m}");
+        }
+        for m in [
+            "[TABLE_OR_VIEW_NOT_FOUND] The table t cannot be found",
+            "value too long for type character varying(10)",
+            "Numeric value out of range",
+            "duplicate key value violates unique constraint",
+            "connection reset",
+        ] {
+            assert!(!rejected_as_too_large(&e(m)), "{m}");
+        }
+        assert!(!rejected_as_too_large(&EngineError::new("cancelled", "request too large")));
+    }
 
     /// Redshift loads go in INSERTs (no COPY, and no SAVEPOINT for its
     /// check, which aborts a Redshift transaction), however the connection
