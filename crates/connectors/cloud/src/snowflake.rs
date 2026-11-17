@@ -105,6 +105,9 @@ impl Connector for SnowflakeConnector {
                 FieldSpec::new("warehouse", "Warehouse").placeholder("COMPUTE_WH"),
                 FieldSpec::new("database", "Database").placeholder("(optional)"),
                 FieldSpec::new("schema", "Schema").placeholder("PUBLIC"),
+                FieldSpec::new(ARRAY_BINDS_OPTION, "Array binds for loads (beta)").placeholder("off").help(
+                    "on: job loads and \"Load into…\" send the rows as arrays bound to one INSERT (as the official drivers' executemany), much faster than INSERTs of SQL text. Off by default until it has been tried against live accounts.",
+                ),
                 FieldSpec::new("role", "Role").placeholder("(optional)"),
                 FieldSpec::new("authenticator", "Okta URL")
                     .placeholder("(optional) https://myorg.okta.com for native SSO")
@@ -157,6 +160,7 @@ impl Connector for SnowflakeConnector {
             token: Mutex::new(token),
             request_seq: std::sync::atomic::AtomicU64::new(1),
             state: databrain_connector_core::conn_state::ConnState::new(),
+            array_binds: cfg.opt(ARRAY_BINDS_OPTION).is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")),
         });
         Ok(Box::new(SfSession(inner)))
     }
@@ -165,6 +169,15 @@ impl Connector for SnowflakeConnector {
 struct Tokens {
     session: String,
     master: String,
+    /// `CLIENT_STAGE_ARRAY_BINDING_THRESHOLD` from the login: past this many
+    /// bound values the official drivers stage the binds in files.
+    bind_threshold: Option<usize>,
+}
+
+/// A session parameter from the login response's `parameters` list.
+fn login_parameter(v: &serde_json::Value, name: &str) -> Option<usize> {
+    let p = v.pointer("/data/parameters")?.as_array()?.iter().find(|p| p["name"].as_str() == Some(name))?;
+    p["value"].as_u64().map(|n| n as usize).or_else(|| p["value"].as_str().and_then(|s| s.parse().ok()))
 }
 
 fn client_env() -> serde_json::Value {
@@ -258,6 +271,7 @@ async fn login(http: &reqwest::Client, base: &str, acct: &str, cfg: &ConnectionC
     Ok(Tokens {
         session: v.pointer("/data/token").and_then(|t| t.as_str()).unwrap_or_default().to_string(),
         master: v.pointer("/data/masterToken").and_then(|t| t.as_str()).unwrap_or_default().to_string(),
+        bind_threshold: login_parameter(&v, "CLIENT_STAGE_ARRAY_BINDING_THRESHOLD"),
     })
 }
 
@@ -299,6 +313,12 @@ async fn external_browser(http: &reqwest::Client, base: &str, acct: &str, user: 
 
 pub struct SfSession(Arc<Inner>);
 
+/// Rows an INSERT says it inserted (`number of rows inserted`).
+fn inserted_rows(data: &serde_json::Value) -> Option<u64> {
+    let v = data.pointer("/rowset/0/0")?;
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
 struct Inner {
     base: String,
     http: reqwest::Client,
@@ -306,7 +326,14 @@ struct Inner {
     request_seq: std::sync::atomic::AtomicU64,
     /// Transactions and settings, followed from the statements run.
     state: databrain_connector_core::conn_state::ConnState,
+    /// Loads bind arrays of rows ([`ARRAY_BINDS_OPTION`]).
+    array_binds: bool,
 }
+
+/// Connection option: loads send their rows as array binds (one INSERT,
+/// each column's values bound as an array), not INSERTs of SQL text. Off
+/// by default until tried against live accounts.
+pub const ARRAY_BINDS_OPTION: &str = "array_binds";
 
 fn col_type(rt: &serde_json::Value) -> (ColType, String) {
     let t = rt["type"].as_str().unwrap_or("text").to_ascii_lowercase();
@@ -459,8 +486,25 @@ impl Inner {
         cancel: &databrain_connector_core::CancellationToken,
         tx: Option<&StreamSender>,
     ) -> Result<serde_json::Value> {
+        self.query_bound(sql, None, request_id, cancel, tx).await
+    }
+
+    /// [`Self::query`] with bind variables (`{"1": {"type": …, "value": …}}`;
+    /// an array `value` binds one row per element, as the official drivers
+    /// send `executemany`).
+    async fn query_bound(
+        &self,
+        sql: &str,
+        bindings: Option<serde_json::Value>,
+        request_id: &str,
+        cancel: &databrain_connector_core::CancellationToken,
+        tx: Option<&StreamSender>,
+    ) -> Result<serde_json::Value> {
         let seq = self.request_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let body = json!({ "sqlText": sql, "asyncExec": false, "sequenceId": seq, "querySubmissionTime": now_secs() * 1000 });
+        let mut body = json!({ "sqlText": sql, "asyncExec": false, "sequenceId": seq, "querySubmissionTime": now_secs() * 1000 });
+        if let Some(b) = bindings {
+            body["bindings"] = b;
+        }
         let submit = self.post_as("/queries/v1/query-request", request_id, body);
         tokio::pin!(submit);
         let mut v = tokio::select! {
@@ -636,6 +680,46 @@ impl Session for SfSession {
 
     async fn ping(&self) -> Result<()> {
         self.0.run_small("select 1").await.map(|_| ())
+    }
+
+    /// Array binding: one INSERT, each column's values bound as an array
+    /// (a row per element) of the type `types` names (`FIXED`, `REAL`,
+    /// `BOOLEAN`, `BINARY` as hex, `TEXT`), as the official drivers send
+    /// `executemany`. An INSERT is all or nothing; the rows it inserted are
+    /// Snowflake's count. A server that refuses array binds for it:
+    /// `Ok(None)` (INSERTs). Snowflake publishes no code for that refusal,
+    /// so its message is what is matched.
+    async fn insert_array(
+        &self,
+        sql: &str,
+        columns: Vec<Vec<Option<String>>>,
+        types: &[&str],
+        cancel: databrain_connector_core::CancellationToken,
+    ) -> Result<Option<u64>> {
+        let rows = columns.first().map_or(0, Vec::len);
+        if rows == 0 {
+            return Ok(Some(0));
+        }
+        let bindings: serde_json::Map<String, serde_json::Value> = columns
+            .into_iter()
+            .enumerate()
+            .map(|(i, values)| ((i + 1).to_string(), json!({"type": types.get(i).copied().unwrap_or("TEXT"), "value": values})))
+            .collect();
+        let rid = uuid::Uuid::new_v4().to_string();
+        match self.0.query_bound(sql, Some(serde_json::Value::Object(bindings)), &rid, &cancel, None).await {
+            Ok(data) => Ok(Some(inserted_rows(&data).unwrap_or(rows as u64))),
+            Err(e) if e.message.to_ascii_lowercase().contains("array bind") && e.message.to_ascii_lowercase().contains("not supported") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn insert_array_possible(&self) -> bool {
+        self.0.array_binds
+    }
+
+    /// Under the login's `CLIENT_STAGE_ARRAY_BINDING_THRESHOLD`, when it says.
+    fn insert_array_values(&self) -> Option<usize> {
+        self.0.token.try_lock().ok().and_then(|t| t.bind_threshold).map(|t| t.saturating_sub(1).max(1))
     }
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
@@ -1252,9 +1336,10 @@ mod literal_tests {
         Inner {
             base: origin.to_string(),
             http: crate::common::http(),
-            token: Mutex::new(Tokens { session: "s".into(), master: "m".into() }),
+            token: Mutex::new(Tokens { session: "s".into(), master: "m".into(), bind_threshold: None }),
             request_seq: std::sync::atomic::AtomicU64::new(0),
             state: databrain_connector_core::conn_state::ConnState::new(),
+            array_binds: false,
         }
     }
 
@@ -1278,6 +1363,59 @@ mod literal_tests {
 
     fn aborts(log: &crate::mock_http::Log) -> Vec<String> {
         log.lock().unwrap().iter().filter(|(_, p, _)| p.starts_with("/queries/v1/abort-request")).map(|(_, _, b)| b.clone()).collect()
+    }
+
+    /// An INSERT with array binds: one TEXT array per column (a row per
+    /// element, nulls kept), the rows Snowflake says it inserted; a server
+    /// that refuses array binds for it gets INSERTs instead.
+    #[tokio::test]
+    async fn array_inserts_bind_a_text_array_per_column() {
+        use databrain_connector_core::{CancellationToken, Session};
+        let (origin, log) = crate::mock_http::serve(move |m, p, body| {
+            if m == "POST" && p.starts_with("/queries/v1/query-request?") {
+                if body.contains("INSERT INTO refused") {
+                    (
+                        200,
+                        json!({"success": false, "code": "002014", "message": "Array bind currently not supported for this query type", "data": {}})
+                            .to_string(),
+                    )
+                } else if body.contains("INSERT INTO bad") {
+                    (200, json!({"success": false, "code": "100038", "message": "Numeric value 'x' is not recognized", "data": {}}).to_string())
+                } else {
+                    (200, json!({"success": true, "code": null, "data": {"rowtype": [{"name": "number of rows inserted"}], "rowset": [["3"]]}}).to_string())
+                }
+            } else {
+                (404, "{}".into())
+            }
+        })
+        .await;
+        // Off unless the connection turns it on.
+        assert!(!SfSession(Arc::new(inner(&origin))).insert_array_possible());
+        let s = SfSession(Arc::new(Inner { array_binds: true, ..inner(&origin) }));
+        let v = |x: &str| Some(x.to_string());
+        let cols = vec![vec![v("1234567890123456789"), v("2"), v("3")], vec![v("0a1b"), None, v("ff")]];
+        let types = ["FIXED", "BINARY"];
+        assert!(s.insert_array_possible());
+        assert_eq!(s.insert_array("INSERT INTO t (a, b) VALUES (?, ?)", cols.clone(), &types, CancellationToken::new()).await.unwrap(), Some(3));
+        let sent = log.lock().unwrap().last().unwrap().2.clone();
+        let body: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(body["bindings"]["1"], json!({"type": "FIXED", "value": ["1234567890123456789", "2", "3"]}));
+        assert_eq!(body["bindings"]["2"], json!({"type": "BINARY", "value": ["0a1b", null, "ff"]}));
+        assert_eq!(body["sqlText"], "INSERT INTO t (a, b) VALUES (?, ?)");
+        assert_eq!(s.insert_array("INSERT INTO refused (a, b) VALUES (?, ?)", cols.clone(), &types, CancellationToken::new()).await.unwrap(), None);
+        let e = s.insert_array("INSERT INTO bad (a, b) VALUES (?, ?)", cols, &types, CancellationToken::new()).await.unwrap_err();
+        assert!(e.message.contains("not recognized"), "{}", e.message);
+    }
+
+    /// The login's array bind threshold limits the values of a call.
+    #[test]
+    fn the_login_says_how_many_values_a_call_may_bind() {
+        let v = json!({"data": {"parameters": [{"name": "TIMEZONE", "value": "UTC"}, {"name": "CLIENT_STAGE_ARRAY_BINDING_THRESHOLD", "value": 65280}]}});
+        assert_eq!(login_parameter(&v, "CLIENT_STAGE_ARRAY_BINDING_THRESHOLD"), Some(65_280));
+        assert_eq!(login_parameter(&json!({"data": {}}), "CLIENT_STAGE_ARRAY_BINDING_THRESHOLD"), None);
+        let i = inner("http://x");
+        i.token.try_lock().unwrap().bind_threshold = Some(65_280);
+        assert_eq!(databrain_connector_core::Session::insert_array_values(&SfSession(Arc::new(i))), Some(65_279));
     }
 
     /// The submit carries one requestId, and an abort names that one.

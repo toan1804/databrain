@@ -724,18 +724,75 @@ pub type Columns = Vec<Vec<Option<String>>>;
 /// whatever the session's language settings (the session fixes the
 /// decimal separator while it runs, see `Session::insert_array`).
 pub struct ArrayInsert {
+    dialect: ConnectorKind,
     kinds: Vec<Lit>,
     /// `INSERT INTO table (cols) VALUES (:1, TO_DATE(:2, …), …)`.
     pub sql: String,
 }
 
 impl ArrayInsert {
-    /// For a dialect with array binding (Oracle); `None` otherwise.
+    /// For a dialect with array binding (Oracle, Snowflake); `None` otherwise.
     pub fn new(dialect: ConnectorKind, table: &str, schema: &SchemaRef) -> Option<Self> {
-        if dialect != ConnectorKind::Oracle {
-            return None;
+        let values: Vec<String> = match dialect {
+            // Each value TEXT, cast to its column's type as its literal is
+            // (dates are quoted text there too). Plain placeholders: an array
+            // bind of an expression may be refused.
+            ConnectorKind::Snowflake => vec!["?".to_string(); schema.fields().len()],
+            ConnectorKind::Oracle => Self::oracle_values(schema),
+            _ => return None,
+        };
+        Some(Self {
+            dialect,
+            kinds: schema.fields().iter().map(|f| lit_kind(f)).collect(),
+            sql: format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                quote_path(dialect, table),
+                schema.fields().iter().map(|f| quote_ident(dialect, f.name())).collect::<Vec<_>>().join(", "),
+                values.join(", ")
+            ),
+        })
+    }
+
+    /// Rows per call: at most 10,000, and on Snowflake as many as stay
+    /// under `values` bound values (the session's limit, else 60,000: past
+    /// about 65,000 its drivers stage the binds in files).
+    pub fn rows_per_call(&self, values: Option<usize>) -> usize {
+        match self.dialect {
+            ConnectorKind::Snowflake => (values.unwrap_or(60_000) / self.kinds.len().max(1)).clamp(1, 10_000),
+            _ => 10_000,
         }
-        let values: Vec<String> = schema
+    }
+
+    /// Each column's bind type, as the official Snowflake drivers name them:
+    /// numbers `FIXED` and floats `REAL` (a TEXT bind into a number column
+    /// may be cast as NUMBER(18,5) and lose digits), `BOOLEAN`, `BINARY` with
+    /// the hex (text doesn't convert to binary), the rest `TEXT` as their
+    /// literals are quoted text. Oracle binds text throughout (`TEXT`).
+    pub fn bind_types(&self) -> Vec<&'static str> {
+        self.kinds
+            .iter()
+            .map(|k| match (self.dialect, k) {
+                (ConnectorKind::Snowflake, Lit::Number) => "FIXED",
+                (ConnectorKind::Snowflake, Lit::Float) => "REAL",
+                (ConnectorKind::Snowflake, Lit::Bool) => "BOOLEAN",
+                (ConnectorKind::Snowflake, Lit::Binary) => "BINARY",
+                _ => "TEXT",
+            })
+            .collect()
+    }
+
+    /// Bytes of values per call, counted as the request sends them (JSON):
+    /// Oracle 32 MB (the thin helper reads requests up to 64 MB); Snowflake
+    /// 1 MB, as its INSERTs had (it documents no limit for inline binds).
+    pub fn bytes_per_call(&self) -> usize {
+        match self.dialect {
+            ConnectorKind::Snowflake => 1_000_000,
+            _ => 32 * 1024 * 1024,
+        }
+    }
+
+    fn oracle_values(schema: &SchemaRef) -> Vec<String> {
+        schema
             .fields()
             .iter()
             .enumerate()
@@ -750,16 +807,7 @@ impl ArrayInsert {
                     _ => p,
                 }
             })
-            .collect();
-        Some(Self {
-            kinds: schema.fields().iter().map(|f| lit_kind(f)).collect(),
-            sql: format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                quote_path(dialect, table),
-                schema.fields().iter().map(|f| quote_ident(dialect, f.name())).collect::<Vec<_>>().join(", "),
-                values.join(", ")
-            ),
-        })
+            .collect()
     }
 
     /// Rows `start..` of `batch` as one array per column, and how many rows
@@ -791,7 +839,10 @@ impl ArrayInsert {
             let (mut row_bytes, mut wider) = (0usize, 0usize);
             for (i, ((a, f), k)) in batch.columns().iter().zip(&fmts).zip(&self.kinds).enumerate() {
                 let cell = (!a.is_null(r)).then(|| f.value(r).to_string());
-                let mut v = oracle_text(cell.as_deref(), *k);
+                let mut v = match self.dialect {
+                    ConnectorKind::Snowflake => snowflake_text(cell.as_deref(), *k),
+                    _ => oracle_text(cell.as_deref(), *k),
+                };
                 if decimal != '.'
                     && matches!(k, Lit::Number | Lit::Float)
                     && let Some(t) = v.as_mut()
@@ -832,6 +883,18 @@ fn json_len(s: &str) -> usize {
                 _ => 5,
             })
             .sum::<usize>()
+}
+
+/// A value as its Snowflake bind (see [`ArrayInsert::bind_types`]) holds
+/// it (`None`: NULL): NaN/±inf NULL (as the INSERT writes them), booleans
+/// `true` / `false`, binary as hex, the rest the text of its literal.
+fn snowflake_text(cell: Option<&str>, kind: Lit) -> Option<String> {
+    let s = cell?;
+    match kind {
+        Lit::Number | Lit::Float if non_finite(s).is_some() => None,
+        Lit::Bool => Some(s.to_ascii_lowercase()),
+        _ => Some(s.to_string()),
+    }
 }
 
 /// A value as the text its Oracle INSERT literal stands for (`None`: NULL):
@@ -1287,6 +1350,42 @@ mod tests {
         let (_, n) = ai.next(&batch, 0, 10_000, 32 * MB, '.').unwrap().unwrap();
         assert_eq!(n, ARRAY_SLOT_BYTES / (8 * 1024));
         assert!(n * 8 * 1024 <= ARRAY_SLOT_BYTES);
+    }
+
+    /// Snowflake array binds: plain placeholders, each value the text its
+    /// literal holds (cast as the literal is), at most 60,000 values a call.
+    #[test]
+    fn snowflake_array_insert_binds_text() {
+        use databrain_connector_core::arrow::array::Float64Array;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ok", DataType::Boolean, true),
+            Field::new("f", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("it's \\ x"), None])),
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+                Arc::new(Float64Array::from(vec![Some(2.5), Some(f64::INFINITY)])),
+            ],
+        )
+        .unwrap();
+        let ai = ArrayInsert::new(ConnectorKind::Snowflake, "db.s.t", &schema).unwrap();
+        assert_eq!(ai.sql, r#"INSERT INTO "db"."s"."t" ("id", "name", "ok", "f") VALUES (?, ?, ?, ?)"#);
+        assert_eq!(ai.rows_per_call(None), 10_000, "4 columns: 15,000 rows would pass 60,000 values; 10,000 at most");
+        assert_eq!(ai.rows_per_call(Some(4_000)), 1_000, "the session's limit");
+        assert_eq!(ai.bind_types(), vec!["FIXED", "TEXT", "BOOLEAN", "REAL"]);
+        let wide: SchemaRef = Arc::new(Schema::new((0..30).map(|i| Field::new(format!("c{i}"), DataType::Utf8, true)).collect::<Vec<_>>()));
+        assert_eq!(ArrayInsert::new(ConnectorKind::Snowflake, "t", &wide).unwrap().rows_per_call(None), 2_000);
+        let (cols, n) = ai.next(&batch, 0, ai.rows_per_call(None), MB, '.').unwrap().unwrap();
+        assert_eq!(n, 2);
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(cols[1], vec![s("it's \\ x"), None], "text as it is: no SQL quoting or escapes");
+        assert_eq!(cols[2], vec![s("true"), s("false")]);
+        assert_eq!(cols[3], vec![s("2.5"), None], "inf: NULL, as Snowflake's INSERT writes it");
     }
 
     /// A Databricks bulk load: one INSERT … SELECT casting each text column
