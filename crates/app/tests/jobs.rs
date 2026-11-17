@@ -816,8 +816,9 @@ async fn runs_log_each_statement_and_report_insert_progress() {
         let ui = Arc::new(Recorder::default());
         let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), ui.clone());
         let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
-        // 1,200 rows: three INSERT batches of at most 500.
+        // 1,200 rows: three INSERT batches of at most 500 (set: the default is larger).
         let job = load_job(&st, &dst, "big", "select range as id, 'r' || range as name from range(1200)", |n| {
+            n.batch_rows = Some(500);
             n.load_before_sql = Some("create table if not exists audit (n integer)".into());
             n.load_after_sql = Some("insert into audit select count(*) from big".into());
         });

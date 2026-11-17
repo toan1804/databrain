@@ -1341,6 +1341,10 @@ impl Pending<'_, '_, '_> {
     }
 }
 
+/// One INSERT that ended: its SQL, rows and result, whether another was
+/// running when it started, and how many had started before it.
+type Ran = (String, RecordBatch, Result<Option<u64>>, bool, usize);
+
 /// Batched INSERTs, built while the rows are sent: one after the other, or
 /// outside a transaction up to the database's `parallel_inserts` at once
 /// (Databricks: each waits seconds for its Delta commit, and appends don't
@@ -1363,9 +1367,7 @@ async fn insert_rows(
     let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None, parallel: false, serialized: false };
     let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     let mut size = p.batch.rows.max(1);
-    // Each INSERT's SQL, rows, result, whether another was running when it
-    // started, and how many had started before it.
-    let mut running: tokio::task::JoinSet<(String, RecordBatch, Result<Option<u64>>, bool, usize)> = tokio::task::JoinSet::new();
+    let mut running: tokio::task::JoinSet<Ran> = tokio::task::JoinSet::new();
     let mut started = 0usize;
     let mut failed: Option<(String, EngineError)> = None;
     let mut drained = false;
