@@ -86,6 +86,17 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 - **chrono / chrono-tz are unmaintained** (RUSTSEC-2026-0543, -0555; ignored in `deny.toml`): DataBrain's own uses (job schedules and their time zones, `databrain-jobs`, export file names, the Neo4j, Oracle and Databricks connectors) could move to `jiff`, but arrow, parquet, neo4rs and russh keep chrono in the build, so it would add a crate without removing one. Revisit when arrow moves off chrono or a vulnerability is reported.
 - **Run date:** the assistant's `run_job` can't run for a given date (no `run_date` argument); a range of days ("run for 1–15 November") is one "Run for this date" per day; the `current_date` hint reads the step's SQL text only (not a parameter set's `{}` expressions such as `current_date - 1`); a queued "run after" start takes the date of the other job's latest success, which a newer run of it may have replaced meanwhile.
 
+## `dbr` command (idea, 2026-11-18)
+
+A short command that opens files in DataBrain or queries from a terminal, for what DuckDB's own CLI can't do: DataBrain's file reading (Excel sheets, blank headers, Delta/Iceberg), its grid, charts, export and AI on the result, and its saved connections with their rules.
+
+- **`dbr data.parquet orders.xlsx`**: opens the app (or the window already running) with a tab per file, `select * from …` run on the local DuckDB connection, as "Query a local file…" does.
+- **`dbr report.sql`** (and double-click / "Open with" on a `.sql` file): opens it in a file tab, as ⌘O does (saved back with ⌘S, reloaded when changed outside); `--run` runs it, `-c "Sales PG"` picks its connection.
+- **`dbr query "<sql>" [files…]`**: runs in the terminal on the bundled DuckDB and prints a table, `--csv` or `--json`, for pipes.
+- **`dbr query -c "Sales PG" "<sql>"`**: any saved connection by name, with its credentials, read-only setting, production confirmation, PII masking and history; the part DuckDB's CLI can't do.
+
+To build: a launcher like `databrain-mcp` / `databrain-jobs` (`dbr` → `databrain open …` / `databrain query …`; almost no app size); the single-instance plugin to pass "open these files" to a running window; a file association for `.sql` (and optionally `.parquet`, `.csv`) in `tauri.conf.json`; an "Install the `dbr` command" item (as VS Code's `code`), since the launchers aren't on PATH; and in the build without bundled DuckDB, a clear message when no DuckDB library is installed. Start with opening files and `.sql` in the app, then `query -c`; plain `query` only if it gets used.
+
 ## Loads into other databases (review of 2026-11-17, checked against vendor docs)
 
 Every target but PostgreSQL (`COPY`) and Databricks (staged files, INSERTs 4 at once) loads with multi-row INSERTs, one after the other. In order of value for the work, with what the docs say may go wrong:
