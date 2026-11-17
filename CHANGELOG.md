@@ -7,10 +7,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Added
 
 - **Jobs, run date:** `:run_date` (and `:run_time`) is the date a run is for, so a run that starts late, a missed run made up later or a Resume the next day still reads its own day: `where day = :run_date - 1` instead of `current_date - 1`. A scheduled run gets its scheduled time (each missed one its own with "run each"), Resume the run's it resumes, a run after another job that job's, a run by hand today; "Run for this date" in the job's parameters (or `--param run_date=…`) runs for another day. The step panel warns when a step's SQL reads `current_date`, `now()`, `sysdate` or `getdate()`. A job's own value named `run_date` is now checked as a date, and a scheduled run uses its scheduled date over it.
+- **Databricks bulk loads:** with a "Staging volume" in the connection's settings, job loads and "Load into…" upload the rows as Parquet files to that Unity Catalog volume and insert them with one statement (one commit), then delete the files: minutes instead of an hour for millions of rows. Columns that can't be cast as an INSERT would, or no staging volume, use INSERTs, and the run log says why.
 
 ### Changed
 
-- **Faster loads into Databricks:** INSERTs default to 10,000 rows and 8 MB each (were 500 rows and 1 MB; each INSERT is one Delta commit, taking seconds whatever its size), up to 100,000 rows. An INSERT the database refuses for its size is split in two and sent again, outside a transaction, on any database; the run log says so.
+- **Faster loads into Databricks:** INSERTs default to 10,000 rows and 8 MB each (were 500 rows and 1 MB; each INSERT is one Delta commit, taking seconds whatever its size), up to 100,000 rows, and up to 4 run at once (one at a time again for a table that refuses concurrent writers, such as one with an identity column). An INSERT the database refuses for its size is split in two and sent again, outside a transaction, on any database; the run log says so.
 
 ### Security
 

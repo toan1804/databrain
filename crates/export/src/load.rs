@@ -714,6 +714,138 @@ fn pg_copy_value(out: &mut Vec<u8>, cell: Option<&str>, kind: Lit) {
     }
 }
 
+/// Rows for a Databricks bulk load: Parquet files of text columns `c0`,
+/// `c1`, … holding each value as the text its INSERT literal stands for
+/// (NULL for NaN/±inf, which the INSERT writes as NULL, booleans as
+/// `true`/`false`, binary as hex), and one `INSERT … SELECT` that casts each
+/// column to the table's type, as the INSERT's literal is ([`dbx_fits`]
+/// says when it is the same), from all the files at once: one commit.
+pub struct DbxStage {
+    kinds: Vec<Lit>,
+    /// `INSERT INTO table (cols) SELECT … FROM read_files(BULK_FILES, …)`.
+    pub sql: String,
+}
+
+impl DbxStage {
+    /// `target`: each row column's type in the table, as `DESCRIBE TABLE`
+    /// writes it (checked by [`dbx_fits`] first).
+    pub fn new(table: &str, schema: &SchemaRef, target: &[String]) -> Self {
+        let d = ConnectorKind::Databricks;
+        let exprs: Vec<String> = schema.fields().iter().zip(target).enumerate().map(|(i, (f, t))| dbx_expr(&format!("c{i}"), f, t)).collect();
+        let read_schema = (0..schema.fields().len()).map(|i| format!("c{i} STRING")).collect::<Vec<_>>().join(", ");
+        Self {
+            kinds: schema.fields().iter().map(|f| lit_kind(f)).collect(),
+            sql: format!(
+                "INSERT INTO {} ({}) SELECT {} FROM read_files({}, format => 'parquet', schema => '{read_schema}')",
+                quote_path(d, table),
+                schema.fields().iter().map(|f| quote_ident(d, f.name())).collect::<Vec<_>>().join(", "),
+                exprs.join(", "),
+                databrain_connector_core::BULK_FILES,
+            ),
+        }
+    }
+
+    /// One Parquet file of rows `start..` of `batch`, up to about
+    /// `max_bytes` of text (at least one row): the file and how many rows it
+    /// holds. `None` past the end.
+    pub fn next(&self, batch: &RecordBatch, start: usize, max_bytes: usize) -> Result<Option<(Vec<u8>, usize)>> {
+        use databrain_connector_core::arrow::array::StringBuilder;
+        use databrain_connector_core::arrow::datatypes::Schema;
+        if start >= batch.num_rows() {
+            return Ok(None);
+        }
+        let fopts = format_options();
+        let fmts: Vec<ArrayFormatter<'_>> =
+            batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
+        let mut cols: Vec<StringBuilder> = (0..batch.num_columns()).map(|_| StringBuilder::new()).collect();
+        let (mut bytes, mut n) = (0usize, 0usize);
+        for r in start..batch.num_rows() {
+            if n > 0 && bytes >= max_bytes {
+                break;
+            }
+            for ((col, (a, f)), k) in cols.iter_mut().zip(batch.columns().iter().zip(&fmts)).zip(&self.kinds) {
+                let cell = (!a.is_null(r)).then(|| f.value(r).to_string());
+                match dbx_text(cell.as_deref(), *k) {
+                    Some(t) => {
+                        bytes += t.len();
+                        col.append_value(t);
+                    }
+                    None => col.append_null(),
+                }
+            }
+            n += 1;
+        }
+        let schema = std::sync::Arc::new(Schema::new((0..cols.len()).map(|i| Field::new(format!("c{i}"), DataType::Utf8, true)).collect::<Vec<_>>()));
+        let arrays: Vec<std::sync::Arc<dyn Array>> = cols.iter_mut().map(|c| std::sync::Arc::new(c.finish()) as std::sync::Arc<dyn Array>).collect();
+        let rows = RecordBatch::try_new(schema.clone(), arrays)?;
+        let props = parquet::file::properties::WriterProperties::builder().set_compression(parquet::basic::Compression::SNAPPY).build();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, schema, Some(props))?;
+        w.write(&rows)?;
+        w.close()?;
+        Ok(Some((out, n)))
+    }
+}
+
+/// A value as the text its Databricks INSERT literal stands for (`None`: NULL).
+fn dbx_text(cell: Option<&str>, kind: Lit) -> Option<String> {
+    let s = cell?;
+    match kind {
+        // NaN/±inf: the INSERT writes NULL on Databricks.
+        Lit::Number | Lit::Float if non_finite(s).is_some() => None,
+        Lit::Bool => Some(s.to_ascii_lowercase()),
+        _ => Some(s.to_string()),
+    }
+}
+
+/// The table's base type, lowercase, without its parameters (`decimal(10,2)` → `decimal`).
+fn dbx_base(target: &str) -> String {
+    target.trim().to_ascii_lowercase().split(['(', '<', ' ']).next().unwrap_or_default().to_string()
+}
+
+const DBX_INTEGRAL: [&str; 7] = ["tinyint", "byte", "smallint", "short", "int", "integer", "bigint"];
+
+/// The SELECT expression that turns text column `c` into column `f`'s
+/// value in a `target` column as the INSERT's literal would be: a number
+/// into an integer column through a decimal (`12.5` truncates to 12, as
+/// the literal does), binary from its hex, text as a string (the table
+/// checks a VARCHAR's length, as for an INSERT), the rest cast to the type.
+fn dbx_expr(c: &str, f: &Field, target: &str) -> String {
+    let base = dbx_base(target);
+    match lit_kind(f) {
+        Lit::Binary => format!("unhex({c})"),
+        Lit::Text => format!("CAST({c} AS STRING)"),
+        Lit::Number if DBX_INTEGRAL.contains(&base.as_str()) => format!("CAST(CAST({c} AS DECIMAL(38, 10)) AS {})", target.trim()),
+        _ => format!("CAST({c} AS {})", target.trim()),
+    }
+}
+
+/// Whether column `f` of the rows can go into a Databricks column of type
+/// `target` (as `DESCRIBE TABLE` writes it) by a bulk load with the same
+/// result as its INSERT literal; `Err` says why not (its rows then go by
+/// INSERTs). Casting text is stricter or looser than assigning a literal
+/// for other pairs (text into a number column, a fraction into a boolean),
+/// so only these go: text into strings, numbers into numbers, booleans into
+/// booleans, binary into binary, dates and times into dates and timestamps.
+pub fn dbx_fits(f: &Field, target: &str) -> std::result::Result<(), String> {
+    let t = target.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b"_(), ".contains(&b)) {
+        return Err(format!("{} has a column type DataBrain doesn't read ({t})", f.name()));
+    }
+    let base = dbx_base(t);
+    let ok = match lit_kind(f) {
+        Lit::Text => matches!(base.as_str(), "string" | "varchar" | "char"),
+        Lit::Number => DBX_INTEGRAL.contains(&base.as_str()) || matches!(base.as_str(), "decimal" | "dec" | "numeric" | "double" | "float" | "real"),
+        Lit::Float => matches!(base.as_str(), "decimal" | "dec" | "numeric" | "double" | "float" | "real"),
+        Lit::Bool => base == "boolean",
+        Lit::Binary => base == "binary",
+        Lit::Date => matches!(base.as_str(), "date" | "timestamp" | "timestamp_ntz"),
+        Lit::Timestamp => matches!(base.as_str(), "timestamp" | "timestamp_ntz"),
+        Lit::TimestampTz => base == "timestamp",
+    };
+    if ok { Ok(()) } else { Err(format!("{} ({}) into a {t} column", f.name(), f.data_type())) }
+}
+
 /// Whether column `f` of the rows can go into a Postgres column of type
 /// `target` (as `format_type` names it) by COPY with the same result as its
 /// INSERT literal; `Err` says why not. An INSERT writes numbers and
@@ -938,6 +1070,97 @@ mod tests {
         assert_eq!(edit_literal(&f, Some(" -inf "), K::Postgres).unwrap(), "'-Infinity'::float8");
         assert_eq!(edit_literal(&f, Some(" 2.5 "), K::Mssql).unwrap(), "2.5");
         assert!(edit_literal(&Field::new("n", DataType::Int64, true), Some("inf"), K::Postgres).is_err());
+    }
+
+    /// A Databricks bulk load: one INSERT … SELECT casting each text column
+    /// as its INSERT literal is, and Parquet files of the literals' text.
+    #[test]
+    fn dbx_stage_writes_the_inserts_text_as_parquet() {
+        use databrain_connector_core::arrow::array::{BinaryArray, Float64Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ok", DataType::Boolean, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("weird `col`", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a'b\\c\n"), None, Some("ünï")])),
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+                Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(2.5), Some(f64::INFINITY)])),
+                Arc::new(BinaryArray::from(vec![Some(&b"\x00\xff"[..]), None, Some(&b"A"[..])])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("y"), Some("z")])),
+            ],
+        )
+        .unwrap();
+        let target = ["int", "varchar(10)", "boolean", "double", "binary", "string"].map(String::from);
+        let st = DbxStage::new("main.s.t", &schema, &target);
+        assert_eq!(
+            st.sql,
+            "INSERT INTO `main`.`s`.`t` (`id`, `name`, `ok`, `f`, `b`, `weird ``col```) SELECT CAST(CAST(c0 AS DECIMAL(38, 10)) AS int), CAST(c1 AS STRING), \
+             CAST(c2 AS boolean), CAST(c3 AS double), unhex(c4), CAST(c5 AS STRING) FROM read_files({databrain_bulk_files}, format => 'parquet', \
+             schema => 'c0 STRING, c1 STRING, c2 STRING, c3 STRING, c4 STRING, c5 STRING')"
+        );
+        let (file, n) = st.next(&batch, 0, MB).unwrap().unwrap();
+        assert_eq!(n, 3);
+        let mut tmp = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut tmp, &file).unwrap();
+        let read: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(tmp).unwrap().build().unwrap().map(|b| b.unwrap()).collect();
+        let col = |i: usize| -> Vec<Option<String>> {
+            read.iter()
+                .flat_map(|b| b.column(i).as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.map(str::to_string)).collect::<Vec<_>>())
+                .collect()
+        };
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(col(0), vec![s("1"), s("2"), s("3")]);
+        assert_eq!(col(1), vec![s("a'b\\c\n"), None, s("ünï")], "text as it is: no SQL quoting");
+        assert_eq!(col(2), vec![s("true"), s("false"), None]);
+        assert_eq!(col(3), vec![None, s("2.5"), None], "NaN and inf: NULL, as the INSERT writes them");
+        assert_eq!(col(4), vec![s("00ff"), None, s("41")], "binary as hex, unhex()ed back");
+        // A file ends past the byte size (at least one row); the next starts there.
+        let (_, first) = st.next(&batch, 0, 1).unwrap().unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(st.next(&batch, 2, 1).unwrap().unwrap().1, 1);
+        assert!(st.next(&batch, 3, 1).unwrap().is_none());
+    }
+
+    /// Which columns a Databricks bulk load takes (the cast gives what the
+    /// INSERT literal would), and which go by INSERTs.
+    #[test]
+    fn dbx_fits_per_type() {
+        let f = |t: DataType| Field::new("c", t, true);
+        for (field, target) in [
+            (f(DataType::Utf8), "string"),
+            (f(DataType::Utf8), "varchar(20)"),
+            (f(DataType::Int64), "bigint"),
+            (f(DataType::Int64), "decimal(10,2)"),
+            (f(DataType::Float64), "double"),
+            (f(DataType::Boolean), "boolean"),
+            (f(DataType::Binary), "binary"),
+            (f(DataType::Date32), "date"),
+            (f(DataType::Date32), "timestamp"),
+            (f(DataType::Timestamp(TimeUnit::Microsecond, None)), "timestamp_ntz"),
+            (f(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))), "timestamp"),
+        ] {
+            assert!(dbx_fits(&field, target).is_ok(), "{field:?} into {target}");
+        }
+        for (field, target) in [
+            (f(DataType::Utf8), "int"),
+            (f(DataType::Float64), "bigint"),
+            (f(DataType::Boolean), "int"),
+            (f(DataType::Int64), "string"),
+            (f(DataType::Timestamp(TimeUnit::Microsecond, None)), "date"),
+            (f(DataType::Utf8), "array<string>"),
+            (f(DataType::Utf8), "string'); drop table t; --"),
+            (f(DataType::Utf8), ""),
+        ] {
+            assert!(dbx_fits(&field, target).is_err(), "{field:?} into {target}");
+        }
     }
 
     /// COPY text: NULL as `\N`, the escapes COPY reads (backslash, tab,

@@ -15,6 +15,7 @@
     "export/xlsx_100k_rows": 335735583,
     "lineage/query": 88271,
     "lineage/script_100": 1298875,
+    "load/dbx_stage_100k_rows": 65143167,
     "load/insert_sql_100k_rows": 89770333,
     "load/pg_copy_100k_rows": 33930291,
     "redact/create_user": 14732,

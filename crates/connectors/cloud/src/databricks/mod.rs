@@ -14,9 +14,11 @@ mod stream;
 #[cfg(test)]
 mod testutil;
 mod types;
+mod volume;
 
 pub use client::DbxSession;
 pub use connector::DatabricksConnector;
+pub use volume::STAGING_VOLUME_OPTION;
 
 /// Public OAuth client registered by Databricks for CLI/SDK tools.
 pub const DEFAULT_CLIENT_ID: &str = "databricks-cli";
