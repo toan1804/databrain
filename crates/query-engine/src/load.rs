@@ -1255,6 +1255,11 @@ struct Written {
     /// An INSERT refused as too large was split: its rows, and the rows
     /// per statement the load went on with.
     split: Option<(usize, usize)>,
+    /// Several INSERTs ran at once: the rows written before a failure
+    /// aren't necessarily the first ones.
+    parallel: bool,
+    /// INSERTs running at once were refused for that; the rest went one at a time.
+    serialized: bool,
     /// The first statement, or the one that failed.
     sql: String,
     result: Result<()>,
@@ -1327,23 +1332,7 @@ impl Pending<'_, '_, '_> {
             return Ok(Some((sql, chunk.slice(0, k))));
         }
         // Rows enough for a full statement, or all that is left.
-        let mut have: Vec<RecordBatch> = self.rows.take().map(|r| r.slice(self.at, r.num_rows() - self.at)).into_iter().filter(|r| r.num_rows() > 0).collect();
-        let mut n: usize = have.iter().map(RecordBatch::num_rows).sum();
-        while !self.ended && n < size {
-            match self.feed.next().await? {
-                Some(batch) => {
-                    n += batch.num_rows();
-                    have.push(batch);
-                }
-                None => self.ended = true,
-            }
-        }
-        self.at = 0;
-        let rows = match have.as_slice() {
-            [] => return Ok(None),
-            [one] => one.clone(),
-            many => databrain_connector_core::arrow::compute::concat_batches(&many[0].schema(), many).map_err(internal)?,
-        };
+        let Some(rows) = self.gather(size).await? else { return Ok(None) };
         let Some((sql, k)) = b.next(&rows, 0, Some(size)).map_err(internal)? else { return Ok(None) };
         self.at = k;
         let taken = rows.slice(0, k);
@@ -1370,11 +1359,12 @@ async fn insert_rows(
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
     let b = sqlgen::InsertSql::new(p.dialect, table, schema, p.batch);
-    let at_once = if p.tx.is_none() { p.dialect.traits().load.map_or(1, |l| l.parallel_inserts).max(1) } else { 1 };
-    let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None };
+    let mut at_once = if p.tx.is_none() { p.dialect.traits().load.map_or(1, |l| l.parallel_inserts).max(1) } else { 1 };
+    let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None, parallel: at_once > 1, serialized: false };
     let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     let mut size = p.batch.rows.max(1);
-    let mut running: tokio::task::JoinSet<(String, RecordBatch, Result<Option<u64>>)> = tokio::task::JoinSet::new();
+    // Each INSERT's SQL, rows, result, and whether it ran beside others.
+    let mut running: tokio::task::JoinSet<(String, RecordBatch, Result<Option<u64>>, bool)> = tokio::task::JoinSet::new();
     let mut failed: Option<(String, EngineError)> = None;
     let mut drained = false;
     loop {
@@ -1384,10 +1374,10 @@ async fn insert_rows(
                     if w.sql.is_empty() {
                         w.sql = sql.clone();
                     }
-                    let (session, cancel) = (p.session.clone(), cancel.clone());
+                    let (session, cancel, together) = (p.session.clone(), cancel.clone(), at_once > 1);
                     running.spawn(async move {
                         let r = exec(&session, Statement::internal(&sql), &cancel).await;
-                        (sql, chunk, r)
+                        (sql, chunk, r, together)
                     });
                 }
                 Ok(None) => drained = true,
@@ -1395,7 +1385,7 @@ async fn insert_rows(
             }
         }
         let Some(done) = running.join_next().await else { break };
-        let (sql, chunk, r) = match done {
+        let (sql, chunk, r, together) = match done {
             Ok(x) => x,
             Err(e) => {
                 failed.get_or_insert((String::new(), EngineError::new("internal", e.to_string())));
@@ -1408,6 +1398,15 @@ async fn insert_rows(
                 w.rows += k as u64;
                 w.statements += 1;
                 progress(w.rows);
+            }
+            // Refused for running beside the others (a table with an identity
+            // column takes one writer at a time): the refused commit wrote
+            // nothing; its rows go again, and the rest one at a time.
+            Err(e) if together && failed.is_none() && concurrent_write_conflict(&e) => {
+                at_once = 1;
+                w.serialized = true;
+                rows.retry.push_back(chunk);
+                drained = false;
             }
             Err(e) if k > 1 && p.tx.is_none() && failed.is_none() && rejected_as_too_large(&e) => {
                 size = size.min(k / 2);
@@ -1427,6 +1426,24 @@ async fn insert_rows(
         w.result = Err(e);
     }
     w
+}
+
+/// Delta refused a commit because another one changed the table at the
+/// same time (`ConcurrentAppendException`, `MetadataChangedException`, …:
+/// a table with an identity column takes one writer at a time). The
+/// refused statement wrote nothing.
+fn concurrent_write_conflict(e: &EngineError) -> bool {
+    let m = format!("{} {}", e.code.as_deref().unwrap_or_default(), e.message).to_ascii_lowercase();
+    [
+        "concurrentappendexception",
+        "metadatachangedexception",
+        "concurrenttransactionexception",
+        "delta_concurrent_append",
+        "delta_metadata_changed",
+        "delta_concurrent_transaction",
+    ]
+    .iter()
+    .any(|w| m.contains(w))
 }
 
 /// The server refused a statement for its size before running it: the
@@ -1465,12 +1482,6 @@ enum CopyCheck {
     Fatal(EngineError),
 }
 
-/// Postgres `COPY … FROM STDIN` for these rows into `table`, when it writes
-/// what the INSERTs would (`Ok(None)` when the session has no COPY, `Err`
-/// says why not): every column's rows fit the table's column type
-/// ([`sqlgen::pg_copy_fits`]), and the table is a plain or partitioned table
-/// without rules (COPY doesn't apply rules) or row-level security (COPY
-/// refuses a table whose policies apply to the user).
 /// A bulk load instead of INSERTs: Postgres `COPY`, or Databricks files
 /// staged in a volume and read by one `INSERT … SELECT`.
 enum Bulk {
@@ -1492,6 +1503,12 @@ impl Bulk {
 async fn bulk_plan(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<Bulk>, CopyCheck> {
     if p.insert_only {
         return Ok(None);
+    }
+    if !p.session.bulk_load_possible() {
+        return Err(CopyCheck::Inserts(match p.dialect {
+            ConnectorKind::Databricks => "no staging volume is set in the connection's settings".into(),
+            _ => "this connection has no bulk load".into(),
+        }));
     }
     match p.dialect {
         ConnectorKind::Postgres => Ok(bulk_copy(p, table, schema, cancel).await?.map(Bulk::Copy)),
@@ -1539,6 +1556,12 @@ async fn bulk_staged(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &Can
     Ok(Some(sqlgen::DbxStage::new(table, schema, &types)))
 }
 
+/// Postgres `COPY … FROM STDIN` for these rows into `table`, when it writes
+/// what the INSERTs would (`Ok(None)` when the session has no COPY, `Err`
+/// says why not): every column's rows fit the table's column type
+/// ([`sqlgen::pg_copy_fits`]), and the table is a plain or partitioned table
+/// without rules (COPY doesn't apply rules) or row-level security (COPY
+/// refuses a table whose policies apply to the user).
 async fn bulk_copy(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<sqlgen::PgCopy>, CopyCheck> {
     if p.dialect != ConnectorKind::Postgres {
         return Ok(None);
@@ -1650,7 +1673,7 @@ async fn copy_rows(
     mut feed: Feed<'_, '_>,
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
-    let mut w = Written { rows: 0, statements: 1, sql: c.sql.clone(), result: Ok(()), split: None };
+    let mut w = Written { rows: 0, statements: 1, sql: c.sql.clone(), result: Ok(()), split: None, parallel: false, serialized: false };
     'rows: loop {
         let batch = match feed.next().await {
             Ok(Some(b)) => b,
@@ -1716,7 +1739,7 @@ async fn staged_rows(
     mut feed: Feed<'_, '_>,
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
-    let mut w = Written { rows: 0, statements: 1, sql: stage.sql.clone(), result: Ok(()), split: None };
+    let mut w = Written { rows: 0, statements: 1, sql: stage.sql.clone(), result: Ok(()), split: None, parallel: false, serialized: false };
     let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     let failed = loop {
         let batch = match rows.gather(STAGED_FILE_ROWS).await {
@@ -1865,7 +1888,13 @@ async fn run_plan(
                     Some((Bulk::Staged(s), writer)) => staged_rows(s, writer, feed, &progress).await,
                     None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
                 };
-                let Written { rows: n, statements, sql: first, result: r, split } = w;
+                let Written { rows: n, statements, sql: first, result: r, split, parallel, serialized } = w;
+                if serialized {
+                    obs.event(LoadEvent::Info(format!(
+                        "{label}: {} refused INSERTs running at the same time into {table} (a table with an identity column takes one writer at a time); they were sent again, and the rest went one at a time",
+                        engine_name(p.dialect)
+                    )));
+                }
                 if let Some((refused, rows)) = split {
                     obs.event(LoadEvent::Info(format!(
                         "{label}: {} refused an INSERT of {refused} rows as too large; it was split, and the rest went in INSERTs of up to {rows} rows (lower the step's rows or KB per INSERT to start there)",
@@ -1883,7 +1912,12 @@ async fn run_plan(
                 });
                 let note = Some(format!("{n} rows in {statements} statement{}", if statements == 1 { "" } else { "s" }));
                 push(&mut record, label, &first, &r, if r.is_ok() { note } else { None });
-                r.map_err(|e| labelled(&format!("{label} (after {n} rows)"), e))?;
+                let after = if parallel {
+                    format!("{label} ({n} rows written by INSERTs that ran at the same time: not necessarily the first {n} rows)")
+                } else {
+                    format!("{label} (after {n} rows)")
+                };
+                r.map_err(|e| labelled(&after, e))?;
                 if *target {
                     inserted += n;
                 } else {
@@ -2036,6 +2070,8 @@ mod tests {
         /// INSERTs running now, and the most at once.
         now: std::sync::atomic::AtomicUsize,
         peak: std::sync::atomic::AtomicUsize,
+        /// Refuse an INSERT that runs beside another (a table with an identity column).
+        one_writer: bool,
     }
 
     impl Warehouse {
@@ -2066,7 +2102,13 @@ mod tests {
             let n = self.now.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(n, SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let beside = self.now.load(SeqCst) > 1;
             self.now.fetch_sub(1, SeqCst);
+            if self.one_writer && (n > 1 || beside) {
+                return Err(databrain_connector_core::ConnectorError::query(
+                    "[DELTA_METADATA_CHANGED] MetadataChangedException: The metadata of the Delta table has been changed by a concurrent update.",
+                ));
+            }
             if rows > self.limit {
                 return Err(databrain_connector_core::ConnectorError::query("Databricks (413 Payload Too Large): request too large"));
             }
@@ -2203,7 +2245,41 @@ mod tests {
         assert!(written.result.as_ref().is_err_and(|e| e.message.contains("bad row")));
         let taken = w.taken();
         assert_eq!(written.rows as usize, taken.iter().sum::<usize>(), "what was written is counted");
-        assert!(taken.len() < 100 && taken.len() >= 3, "no new INSERT after the failure: {}", taken.len());
+        // The 3 started with it, and at most a few that ended before it was seen: none started after.
+        assert!(taken.len() <= 3 + 4, "no new INSERT after the failure: {}", taken.len());
+        assert!(written.parallel, "the message says the rows written may not be the first ones");
+    }
+
+    /// A table that takes one writer at a time (an identity column) refuses
+    /// INSERTs running at once: theirs go again, the rest one at a time;
+    /// every row once, and the run log says so.
+    #[tokio::test]
+    async fn concurrent_insert_conflicts_go_one_at_a_time() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let w = Arc::new(Warehouse { limit: usize::MAX, one_writer: true, ..Default::default() });
+        let (schema, held) = batches(100, 2000);
+        let written =
+            insert_rows(&prepared(w.clone(), 10, None), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_ok(), "{:?}", written.result.err());
+        assert!(written.serialized);
+        assert_eq!(written.rows, 100);
+        assert_eq!(w.taken().iter().sum::<usize>(), 100, "every row once");
+        // A conflict when only one ran (another writer): it fails as before.
+        let alone = Arc::new(Warehouse { limit: usize::MAX, one_writer: true, ..Default::default() });
+        alone.now.store(1, SeqCst);
+        let tx = Tx { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK" };
+        let written =
+            insert_rows(&prepared(alone, 10, Some(tx)), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_err_and(|e| e.message.contains("MetadataChangedException")));
+    }
+
+    #[test]
+    fn delta_conflicts_are_recognised() {
+        let e = |m: &str| EngineError::new("query", m);
+        assert!(concurrent_write_conflict(&e("[DELTA_CONCURRENT_APPEND] ConcurrentAppendException: Files were added")));
+        assert!(concurrent_write_conflict(&e("MetadataChangedException: The metadata of the Delta table has been changed")));
+        assert!(!concurrent_write_conflict(&e("[TABLE_OR_VIEW_NOT_FOUND] t")));
+        assert!(!concurrent_write_conflict(&e("[CAST_INVALID_INPUT] 'x' cannot be cast to INT")));
     }
 
     /// An INSERT refused as too large is sent again as two of half its rows,

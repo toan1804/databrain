@@ -123,7 +123,16 @@ pub mod mock {
                     let (status, out) = if path.starts_with("/api/2.0/fs/") {
                         // Volume files ("volume" modes): uploads and deletes answer with no body.
                         raw = Some(Vec::new());
-                        if blob_mode == "volume_denied" && method == "PUT" {
+                        let first_put = method == "PUT" && {
+                            let mut g = lg.lock().unwrap();
+                            let h = g.hits.entry(path.clone()).or_insert(0);
+                            *h += 1;
+                            *h == 1
+                        };
+                        if blob_mode == "volume_flaky" && first_put {
+                            raw = None;
+                            (503, json!({"error_code": "TEMPORARILY_UNAVAILABLE", "message": "try again"}))
+                        } else if blob_mode == "volume_denied" && method == "PUT" {
                             raw = None;
                             (403, json!({"error_code": "PERMISSION_DENIED", "message": "User does not have WRITE VOLUME on Volume 'main.etl.stage'"}))
                         } else {
@@ -132,6 +141,9 @@ pub mod mock {
                     } else if method == "POST" && path == "/api/2.0/sql/statements" {
                         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
                         if blob_mode.starts_with("volume") && v["statement"].as_str().is_some_and(|s| s.starts_with("INSERT INTO")) {
+                            if blob_mode == "volume_slow" {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
                             let inserted =
                                 json!({"columns": [{"name": "num_affected_rows", "type_name": "LONG"}, {"name": "num_inserted_rows", "type_name": "LONG"}]});
                             (

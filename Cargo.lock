@@ -1931,6 +1931,7 @@ version = "0.4.3"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "databrain-auth",
  "databrain-connector-core",

@@ -295,6 +295,13 @@ pub trait Session: Send + Sync {
     async fn bulk_load(&self, _sql: &str, _cancel: CancellationToken) -> Result<Option<Box<dyn BulkWriter>>> {
         Ok(None)
     }
+
+    /// Whether [`Self::bulk_load`] may give a writer, so a load doesn't
+    /// prepare one (read the table's column types) for a session that has
+    /// none: Databricks only with a staging volume.
+    fn bulk_load_possible(&self) -> bool {
+        true
+    }
 }
 
 /// Data of a bulk load ([`Session::bulk_load`]), sent in chunks. Dropped

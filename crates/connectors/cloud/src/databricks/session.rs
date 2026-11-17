@@ -39,6 +39,10 @@ impl Session for DbxSession {
         self.0.run_small("SELECT 1").await.map(|_| ())
     }
 
+    fn bulk_load_possible(&self) -> bool {
+        self.0.staging.is_some()
+    }
+
     /// With a staging volume: the rows' Parquet files go there and `sql`
     /// reads them all into the table (see [`super::volume`]).
     async fn bulk_load(&self, sql: &str, cancel: databrain_connector_core::CancellationToken) -> Result<Option<Box<dyn databrain_connector_core::BulkWriter>>> {

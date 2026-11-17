@@ -1072,9 +1072,6 @@ mod tests {
         assert!(edit_literal(&Field::new("n", DataType::Int64, true), Some("inf"), K::Postgres).is_err());
     }
 
-    /// COPY text: NULL as `\N`, the escapes COPY reads (backslash, tab,
-    /// newline, carriage return), NaN/inf as the INSERT literal has them,
-    /// booleans and binary as their literals' text.
     /// A Databricks bulk load: one INSERT … SELECT casting each text column
     /// as its INSERT literal is, and Parquet files of the literals' text.
     #[test]
@@ -1166,6 +1163,9 @@ mod tests {
         }
     }
 
+    /// COPY text: NULL as `\N`, the escapes COPY reads (backslash, tab,
+    /// newline, carriage return), NaN/inf as the INSERT literal has them,
+    /// booleans and binary as their literals' text.
     #[test]
     fn pg_copy_text() {
         use databrain_connector_core::arrow::array::{BinaryArray, Decimal128Array, Float64Array};

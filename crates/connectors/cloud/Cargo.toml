@@ -18,6 +18,7 @@ bigquery = []
 [dependencies]
 async-trait = "0.1.92"
 base64 = "0.23.1"
+bytes = "1.12.1"
 databrain-auth = { version = "0.4.3", path = "../../auth" }
 databrain-connector-core = { version = "0.4.3", path = "../../connector-core" }
 flate2 = "1.1.10"
@@ -28,7 +29,7 @@ secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time"] }
-tracing = "0.1"
+tracing = "0.1.44"
 uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]

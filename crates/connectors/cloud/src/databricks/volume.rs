@@ -15,6 +15,9 @@ use crate::common::{json_body, net_err};
 /// files in, `/Volumes/<catalog>/<schema>/<volume>[/<folder>…]`.
 pub const STAGING_VOLUME_OPTION: &str = "staging_volume";
 
+/// Tries of one Files API request (see [`Inner::files`]).
+const FILES_TRIES: u32 = 4;
+
 /// The staging volume as set (trailing `/` dropped), or why it can't be one.
 /// Each part is a plain name: no `..`, quotes, backslashes or URL syntax,
 /// since it goes into a URL path and an SQL string.
@@ -42,23 +45,50 @@ fn url_path(path: &str) -> String {
 }
 
 impl Inner {
-    /// A Files API request on `path` (`files` or `directories`), its body if any.
-    async fn files(&self, method: reqwest::Method, api: &str, path: &str, body: Option<Vec<u8>>) -> Result<()> {
+    /// A Files API request on `path` (`files` or `directories`), its body if
+    /// any. Sent again (both are idempotent: an upload overwrites, a delete
+    /// of what is gone is done) after a refused sign-in once, and after a
+    /// busy or failing server (429, 5xx) or a dropped connection up to
+    /// [`FILES_TRIES`] times in all, waiting longer each time.
+    async fn files(&self, method: reqwest::Method, api: &str, path: &str, body: Option<bytes::Bytes>) -> Result<()> {
         let url = format!("{}/api/2.0/fs/{api}{}{}", self.origin, url_path(path), if body.is_some() { "?overwrite=true" } else { "" });
-        for attempt in 0..2 {
+        let mut signed_in_again = false;
+        let mut wait = std::time::Duration::from_millis(500);
+        for attempt in 1..=FILES_TRIES {
             let token = self.token().await?;
             let mut req = self.http.request(method.clone(), &url).bearer_auth(token);
             if let Some(b) = &body {
+                // A `Bytes` clone shares the buffer: no copy per try.
                 req = req.header(reqwest::header::CONTENT_TYPE, "application/octet-stream").body(b.clone());
             }
-            let resp = req.send().await.map_err(net_err)?;
-            if resp.status().as_u16() == 401 && attempt == 0 {
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) if attempt < FILES_TRIES => {
+                    tracing::info!(error = %e, attempt, "Databricks Files API request failed; trying again");
+                    tokio::time::sleep(wait).await;
+                    wait *= 2;
+                    continue;
+                }
+                Err(e) => return Err(net_err(e)),
+            };
+            let status = resp.status().as_u16();
+            if status == 401 && !signed_in_again {
+                signed_in_again = true;
                 self.creds.invalidate().await;
                 continue;
             }
+            if (status == 429 || resp.status().is_server_error()) && attempt < FILES_TRIES {
+                tokio::time::sleep(wait).await;
+                wait *= 2;
+                continue;
+            }
+            // Deleting what isn't there (a try whose answer was lost) is done.
+            if status == 404 && method == reqwest::Method::DELETE {
+                return Ok(());
+            }
             return json_body(resp, "Databricks Files API").await.map(|_| ());
         }
-        unreachable!()
+        Err(ConnectorError::connection("Databricks Files API: no answer after several tries"))
     }
 
     /// Delete the staged files and their folder, best effort.
@@ -125,15 +155,17 @@ impl BulkWriter for VolumeWriter {
         // Listed first: a file cut off half way is deleted too.
         self.files.push(path.clone());
         tokio::select! {
-            r = self.inner.files(reqwest::Method::PUT, "files", &path, Some(data)) => r,
+            r = self.inner.files(reqwest::Method::PUT, "files", &path, Some(bytes::Bytes::from(data))) => r,
             _ = self.cancel.cancelled() => Err(ConnectorError::cancelled()),
         }
     }
 
     async fn finish(mut self: Box<Self>) -> Result<Option<u64>> {
-        self.finished = true;
         let r = self.run().await;
         self.inner.delete_staged(&self.dir, &self.files).await;
+        // Only now: a finish dropped before this (a time limit, a stopped
+        // job) leaves the deleting to Drop.
+        self.finished = true;
         r
     }
 }
@@ -224,6 +256,36 @@ mod tests {
         // No staging volume: no bulk load (the rows go by INSERTs).
         let plain = crate::databricks::testutil::mock::session(&origin, false);
         assert!(plain.bulk_load(&sql, CancellationToken::new()).await.unwrap().is_none());
+    }
+
+    /// A busy server (503) on an upload: sent again, and the load goes on.
+    #[tokio::test]
+    async fn uploads_are_tried_again_when_the_server_is_busy() {
+        use databrain_connector_core::Session;
+        let (origin, log) = crate::databricks::testutil::mock::serve("volume_flaky").await;
+        let s = crate::databricks::testutil::mock::staging_session(&origin, "/Volumes/main/etl/stage");
+        let mut w = s.bulk_load("INSERT INTO t SELECT 1", CancellationToken::new()).await.unwrap().unwrap();
+        w.write(b"PAR1".to_vec()).await.unwrap();
+        assert_eq!(log.lock().unwrap().requests.iter().filter(|r| r.0 == "PUT").count(), 2, "refused once, then taken");
+    }
+
+    /// A finish stopped while its INSERT runs (a step's time limit, a
+    /// stopped job) still deletes the staged files.
+    #[tokio::test]
+    async fn a_finish_cut_short_still_deletes_the_files() {
+        use databrain_connector_core::Session;
+        let (origin, log) = crate::databricks::testutil::mock::serve("volume_slow").await;
+        let s = crate::databricks::testutil::mock::staging_session(&origin, "/Volumes/main/etl/stage");
+        let mut w = s.bulk_load("INSERT INTO t SELECT 1", CancellationToken::new()).await.unwrap().unwrap();
+        w.write(b"PAR1".to_vec()).await.unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), w.finish()).await.is_err(), "cut short");
+        for _ in 0..200 {
+            if log.lock().unwrap().requests.iter().filter(|r| r.0 == "DELETE").count() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(log.lock().unwrap().requests.iter().filter(|r| r.0 == "DELETE").count(), 2, "the file and its folder");
     }
 
     /// A volume the user can't write to: the upload fails and says why.
