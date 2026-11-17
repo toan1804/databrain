@@ -120,9 +120,25 @@ pub mod mock {
                     let link = |i: u32, next: bool, fmt: &str| link_at(i, next, fmt, true);
                     let first = |fmt: &str, next: bool| link_at(0, next, fmt, !stale);
                     let mut raw: Option<Vec<u8>> = None;
-                    let (status, out) = if method == "POST" && path == "/api/2.0/sql/statements" {
+                    let (status, out) = if path.starts_with("/api/2.0/fs/") {
+                        // Volume files ("volume" modes): uploads and deletes answer with no body.
+                        raw = Some(Vec::new());
+                        if blob_mode == "volume_denied" && method == "PUT" {
+                            raw = None;
+                            (403, json!({"error_code": "PERMISSION_DENIED", "message": "User does not have WRITE VOLUME on Volume 'main.etl.stage'"}))
+                        } else {
+                            (200, json!(null))
+                        }
+                    } else if method == "POST" && path == "/api/2.0/sql/statements" {
                         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                        if v["disposition"] == "INLINE" && blob_mode == "binary" {
+                        if blob_mode.starts_with("volume") && v["statement"].as_str().is_some_and(|s| s.starts_with("INSERT INTO")) {
+                            let inserted =
+                                json!({"columns": [{"name": "num_affected_rows", "type_name": "LONG"}, {"name": "num_inserted_rows", "type_name": "LONG"}]});
+                            (
+                                200,
+                                json!({"statement_id": "st3", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": inserted}, "result": {"data_array": [["3", "3"]]}}),
+                            )
+                        } else if v["disposition"] == "INLINE" && blob_mode == "binary" {
                             // BINARY in a JSON result: base64 text ("hi", and bytes that aren't UTF-8).
                             let bin = json!({"columns": [{"name": "b", "type_name": "BINARY", "type_text": "BINARY"}]});
                             (
@@ -199,6 +215,14 @@ pub mod mock {
         (origin, log)
     }
 
+    /// [`session`] with a staging volume for bulk loads.
+    pub fn staging_session(origin: &str, volume: &str) -> DbxSession {
+        let s = session(origin, false);
+        let Ok(mut inner) = Arc::try_unwrap(s.0) else { unreachable!() };
+        inner.staging = Some(volume.to_string());
+        DbxSession(Arc::new(inner))
+    }
+
     pub fn session(origin: &str, inline_only: bool) -> DbxSession {
         use databrain_auth::InlineCredentialSource;
         DbxSession(Arc::new(Inner {
@@ -212,6 +236,7 @@ pub mod mock {
             inline_only,
             fetch_parallel: 4,
             storage: crate::common::storage_http(),
+            staging: None,
         }))
     }
 }

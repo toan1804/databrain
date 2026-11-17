@@ -1291,6 +1291,29 @@ struct Pending<'f, 'a, 'b> {
 }
 
 impl Pending<'_, '_, '_> {
+    /// At least `rows` rows (all that are left at the end) in one batch, taken.
+    async fn gather(&mut self, rows: usize) -> Result<Option<RecordBatch>> {
+        let mut have: Vec<RecordBatch> = self.rows.take().map(|r| r.slice(self.at, r.num_rows() - self.at)).into_iter().filter(|r| r.num_rows() > 0).collect();
+        self.at = 0;
+        let mut n: usize = have.iter().map(RecordBatch::num_rows).sum();
+        while !self.ended && n < rows {
+            match self.feed.next().await? {
+                Some(batch) => {
+                    n += batch.num_rows();
+                    have.push(batch);
+                }
+                None => self.ended = true,
+            }
+        }
+        match have.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one.clone())),
+            many => databrain_connector_core::arrow::compute::concat_batches(&many[0].schema(), many)
+                .map(Some)
+                .map_err(|e| EngineError::new("internal", e.to_string())),
+        }
+    }
+
     /// The next statement for at most `size` rows: its SQL and its rows.
     async fn next(&mut self, b: &sqlgen::InsertSql, size: usize) -> Result<Option<(String, RecordBatch)>> {
         fn internal(e: impl std::fmt::Display) -> EngineError {
@@ -1448,8 +1471,76 @@ enum CopyCheck {
 /// ([`sqlgen::pg_copy_fits`]), and the table is a plain or partitioned table
 /// without rules (COPY doesn't apply rules) or row-level security (COPY
 /// refuses a table whose policies apply to the user).
+/// A bulk load instead of INSERTs: Postgres `COPY`, or Databricks files
+/// staged in a volume and read by one `INSERT … SELECT`.
+enum Bulk {
+    Copy(sqlgen::PgCopy),
+    Staged(sqlgen::DbxStage),
+}
+
+impl Bulk {
+    fn sql(&self) -> &str {
+        match self {
+            Bulk::Copy(c) => &c.sql,
+            Bulk::Staged(s) => &s.sql,
+        }
+    }
+}
+
+/// The bulk load these rows may use (`Ok(None)`: INSERTs), as [`bulk_copy`]
+/// and [`bulk_staged`] decide.
+async fn bulk_plan(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<Bulk>, CopyCheck> {
+    if p.insert_only {
+        return Ok(None);
+    }
+    match p.dialect {
+        ConnectorKind::Postgres => Ok(bulk_copy(p, table, schema, cancel).await?.map(Bulk::Copy)),
+        ConnectorKind::Databricks => Ok(bulk_staged(p, table, schema, cancel).await?.map(Bulk::Staged)),
+        _ => Ok(None),
+    }
+}
+
+/// A Databricks bulk load for these rows into `table`, when it writes what
+/// the INSERTs would: every column's rows go into its column's type with
+/// the same result ([`sqlgen::dbx_fits`]), read with `DESCRIBE TABLE`.
+/// Whether the connection has a staging volume is the session's to say.
+async fn bulk_staged(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<sqlgen::DbxStage>, CopyCheck> {
+    let sql = format!("DESCRIBE TABLE {}", databrain_connector_core::quote_path(p.dialect, table));
+    let opts = ExecOptions { cancel: cancel.clone(), ..Default::default() };
+    let got = match p.session.execute(Statement::internal(&sql), opts).await {
+        Ok(s) => s.collect().await,
+        Err(e) => Err(e),
+    };
+    let c = match got {
+        Ok(c) => c,
+        Err(e) if e.is_cancelled() => return Err(CopyCheck::Fatal(EngineError::new("cancelled", "Cancelled"))),
+        Err(e) => return Err(CopyCheck::Inserts(format!("the table's column types couldn't be read: {}", e.message))),
+    };
+    // `col_name, data_type, comment` rows; partition and other details after an empty or `#` row.
+    let mut columns: Vec<(String, String)> = Vec::new();
+    'rows: for b in &c.batches {
+        let cell = |col: usize, row: usize| databrain_connector_core::arrow::util::display::array_value_to_string(b.column(col), row).unwrap_or_default();
+        for r in 0..b.num_rows() {
+            let name = cell(0, r);
+            if name.trim().is_empty() || name.starts_with('#') {
+                break 'rows;
+            }
+            columns.push((name, cell(1, r)));
+        }
+    }
+    let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
+    let mut types = Vec::with_capacity(schema.fields().len());
+    for f in schema.fields() {
+        let Some(name) = match_column(f.name(), &names) else { return Err(CopyCheck::Inserts(format!("no column {}", f.name()))) };
+        let ty = columns.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone()).unwrap_or_default();
+        sqlgen::dbx_fits(f, &ty).map_err(CopyCheck::Inserts)?;
+        types.push(ty);
+    }
+    Ok(Some(sqlgen::DbxStage::new(table, schema, &types)))
+}
+
 async fn bulk_copy(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<sqlgen::PgCopy>, CopyCheck> {
-    if p.insert_only || p.dialect != ConnectorKind::Postgres {
+    if p.dialect != ConnectorKind::Postgres {
         return Ok(None);
     }
     let path = databrain_connector_core::quote_path(p.dialect, table);
@@ -1599,8 +1690,72 @@ async fn copy_rows(
     }
     let done = writer.finish().await.map_err(EngineError::from);
     match done {
-        Ok(n) => w.rows = n,
+        Ok(Some(n)) => w.rows = n,
+        Ok(None) => {}
         // A bad row is reported here, at the end: none of the COPY is kept.
+        Err(e) => {
+            w.rows = 0;
+            w.result = Err(e);
+        }
+    }
+    w
+}
+
+/// Rows per staged file (fewer when they pass [`STAGED_FILE_BYTES`]).
+const STAGED_FILE_ROWS: usize = 250_000;
+/// Text per staged file, before compression.
+const STAGED_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The rows as staged files for one statement ([`Bulk::Staged`]): files of
+/// up to [`STAGED_FILE_ROWS`] rows, then the statement that reads them all
+/// (one commit). Stopped or failed, nothing is inserted, and the files are
+/// deleted.
+async fn staged_rows(
+    stage: &sqlgen::DbxStage,
+    mut writer: Box<dyn databrain_connector_core::BulkWriter>,
+    mut feed: Feed<'_, '_>,
+    progress: &(dyn Fn(u64) + Sync),
+) -> Written {
+    let mut w = Written { rows: 0, statements: 1, sql: stage.sql.clone(), result: Ok(()), split: None };
+    let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
+    let failed = loop {
+        let batch = match rows.gather(STAGED_FILE_ROWS).await {
+            Ok(Some(b)) => b,
+            Ok(None) => break None,
+            Err(e) => break Some(e),
+        };
+        let mut at = 0;
+        let mut err = None;
+        while let Some(file) = stage.next(&batch, at, STAGED_FILE_BYTES).transpose() {
+            let (data, k) = match file {
+                Ok(x) => x,
+                Err(e) => {
+                    err = Some(EngineError::new("internal", e.to_string()));
+                    break;
+                }
+            };
+            if let Err(e) = writer.write(data).await {
+                err = Some(EngineError::from(e));
+                break;
+            }
+            at += k;
+            w.rows += k as u64;
+            progress(w.rows);
+        }
+        if err.is_some() {
+            break err;
+        }
+    };
+    if let Some(e) = failed {
+        // Dropped unfinished: its files are deleted, nothing is inserted.
+        drop(writer);
+        w.rows = 0;
+        w.result = Err(e);
+        return w;
+    }
+    match writer.finish().await.map_err(EngineError::from) {
+        Ok(Some(n)) => w.rows = n,
+        Ok(None) => {}
         Err(e) => {
             w.rows = 0;
             w.result = Err(e);
@@ -1659,7 +1814,7 @@ async fn run_plan(
                 let started = std::time::Instant::now();
                 let phase = if *target { "Inserting rows" } else { "Staging rows" };
                 let mut why_not = None;
-                let copy = match bulk_copy(p, table, &schema, cancel).await {
+                let copy = match bulk_plan(p, table, &schema, cancel).await {
                     Ok(c) => c,
                     Err(CopyCheck::Inserts(why)) => {
                         why_not = Some(why);
@@ -1673,23 +1828,28 @@ async fn run_plan(
                 // The COPY starts here (it waits for the table's lock); a
                 // session without one sends INSERTs.
                 let writer = match &copy {
-                    Some(c) => match p.session.bulk_load(&c.sql, cancel.clone()).await {
+                    Some(c) => match p.session.bulk_load(c.sql(), cancel.clone()).await {
                         Ok(Some(w)) => Some((c, w)),
                         Ok(None) => {
-                            why_not = Some("this connection has no COPY".into());
+                            why_not = Some(match c {
+                                Bulk::Copy(_) => "this connection has no COPY".into(),
+                                Bulk::Staged(_) => "no staging volume is set in the connection's settings".into(),
+                            });
                             None
                         }
                         Err(e) => {
                             let e = EngineError::from(e);
-                            push(&mut record, label, &c.sql, &Err(e.clone()), None);
+                            push(&mut record, label, c.sql(), &Err(e.clone()), None);
                             return Err(labelled(label, e));
                         }
                     },
                     None => None,
                 };
+                let bulk_word = if p.dialect == ConnectorKind::Databricks { "a bulk load" } else { "COPY" };
                 let how = match (&writer, &why_not) {
-                    (Some((c, _)), _) => format!("bulk load ({})", c.sql),
-                    (None, Some(why)) => format!("INSERTs, not COPY ({why})"),
+                    (Some((Bulk::Copy(c), _)), _) => format!("bulk load ({})", c.sql),
+                    (Some((Bulk::Staged(s), _)), _) => format!("bulk load: Parquet files in the staging volume, then {}", s.sql),
+                    (None, Some(why)) => format!("INSERTs, not {bulk_word} ({why})"),
                     (None, None) => String::new(),
                 };
                 if !how.is_empty() {
@@ -1701,7 +1861,8 @@ async fn run_plan(
                 let feed = Feed { held: rows.batches.iter(), rest: rest.as_deref_mut() };
                 let progress = |done: u64| obs.event(LoadEvent::Progress { phase: phase.into(), done, total });
                 let w = match writer {
-                    Some((c, writer)) => copy_rows(p, c, writer, feed, &progress).await,
+                    Some((Bulk::Copy(c), writer)) => copy_rows(p, c, writer, feed, &progress).await,
+                    Some((Bulk::Staged(s), writer)) => staged_rows(s, writer, feed, &progress).await,
                     None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
                 };
                 let Written { rows: n, statements, sql: first, result: r, split } = w;
@@ -2071,6 +2232,114 @@ mod tests {
             insert_rows(&prepared(in_tx.clone(), 10, Some(tx)), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
         assert!(written.result.is_err() && written.split.is_none());
         assert!(in_tx.taken.lock().is_empty());
+    }
+
+    /// A Databricks table as `DESCRIBE TABLE` shows it, for the bulk check.
+    struct Described(Vec<(&'static str, &'static str)>);
+
+    #[async_trait::async_trait]
+    impl Session for Described {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind::Databricks
+        }
+        async fn server_version(&self) -> databrain_connector_core::Result<String> {
+            Ok("test".into())
+        }
+        async fn ping(&self) -> databrain_connector_core::Result<()> {
+            Ok(())
+        }
+        async fn execute(&self, stmt: Statement<'_>, _: ExecOptions) -> databrain_connector_core::Result<QueryStream> {
+            use databrain_connector_core::arrow::array::StringArray;
+            use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+            assert!(stmt.sql().starts_with("DESCRIBE TABLE `main`.`s`.`t`"), "{}", stmt.sql());
+            let schema = Arc::new(Schema::new(vec![Field::new("col_name", DataType::Utf8, true), Field::new("data_type", DataType::Utf8, true)]));
+            let rows = self.0.iter().copied().chain([("", ""), ("# Partition Information", ""), ("id", "string")]);
+            let (n, t): (Vec<&str>, Vec<&str>) = rows.unzip();
+            let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(n)), Arc::new(StringArray::from(t))]).unwrap();
+            let (tx, stream) = QueryStream::channel(4);
+            tx.send(StreamEvent::Schema(schema)).await;
+            tx.send(StreamEvent::Batch(b)).await;
+            tx.send(StreamEvent::Done(Default::default())).await;
+            Ok(stream)
+        }
+        async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<databrain_connector_core::SchemaInfo>> {
+            Ok(vec![])
+        }
+        async fn list_objects(&self, _: &str) -> databrain_connector_core::Result<Vec<databrain_connector_core::DbObject>> {
+            Ok(vec![])
+        }
+        async fn describe(&self, _: &str, _: &str) -> databrain_connector_core::Result<databrain_connector_core::ObjectDetail> {
+            Err(databrain_connector_core::ConnectorError::query("no"))
+        }
+    }
+
+    /// Databricks takes the rows in bulk when every column goes into its
+    /// table's type as its INSERT literal would (names matched as INSERTs
+    /// match them; the partition section isn't a column); otherwise INSERTs, saying why.
+    #[tokio::test]
+    async fn databricks_bulk_needs_columns_that_cast_as_inserts_do() {
+        let (schema, _) = batches(1, 1);
+        let p = |cols| Prepared { session: Arc::new(Described(cols)), table: "main.s.t".into(), ..prepared(Warehouse::refusing_over(1), 10, None) };
+        let ok = bulk_plan(&p(vec![("ID", "bigint"), ("other", "string")]), "main.s.t", &schema, &CancellationToken::new()).await;
+        match ok {
+            Ok(Some(Bulk::Staged(s))) => assert!(s.sql.contains("CAST(CAST(c0 AS DECIMAL(38, 10)) AS bigint)"), "{}", s.sql),
+            _ => panic!("a bulk load"),
+        }
+        let no = bulk_plan(&p(vec![("id", "string")]), "main.s.t", &schema, &CancellationToken::new()).await;
+        assert!(matches!(no, Err(CopyCheck::Inserts(why)) if why.contains("into a string column")));
+        let missing = bulk_plan(&p(vec![("other", "bigint")]), "main.s.t", &schema, &CancellationToken::new()).await;
+        assert!(matches!(missing, Err(CopyCheck::Inserts(why)) if why.contains("no column id")));
+        // A step that asks for INSERTs gets them.
+        let only = Prepared { insert_only: true, ..p(vec![("id", "bigint")]) };
+        assert!(matches!(bulk_plan(&only, "main.s.t", &schema, &CancellationToken::new()).await, Ok(None)));
+    }
+
+    /// The files a bulk load stages, and what it finishes with.
+    #[derive(Default)]
+    struct Staging {
+        files: parking_lot::Mutex<Vec<usize>>,
+        finished: std::sync::atomic::AtomicBool,
+        fail_at: Option<usize>,
+    }
+
+    struct StagingWriter(Arc<Staging>);
+
+    #[async_trait::async_trait]
+    impl databrain_connector_core::BulkWriter for StagingWriter {
+        async fn write(&mut self, data: Vec<u8>) -> databrain_connector_core::Result<()> {
+            let mut f = self.0.files.lock();
+            if self.0.fail_at == Some(f.len()) {
+                return Err(databrain_connector_core::ConnectorError::query("Databricks Files API (403): no WRITE VOLUME"));
+            }
+            assert!(data.starts_with(b"PAR1"), "a Parquet file");
+            f.push(data.len());
+            Ok(())
+        }
+        async fn finish(self: Box<Self>) -> databrain_connector_core::Result<Option<u64>> {
+            self.0.finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    /// Rows arriving 2,000 at a time go into files of 250,000 rows, then one
+    /// statement; a failed upload inserts nothing (the writer is dropped,
+    /// which deletes its files).
+    #[tokio::test]
+    async fn staged_rows_go_in_large_files_then_one_statement() {
+        let (schema, held) = batches(600_000, 2000);
+        let stage = sqlgen::DbxStage::new("t", &schema, &["bigint".to_string()]);
+        let st = Arc::new(Staging::default());
+        let w = staged_rows(&stage, Box::new(StagingWriter(st.clone())), Feed { held: held.iter(), rest: None }, &|_| {}).await;
+        assert!(w.result.is_ok());
+        assert_eq!((w.rows, w.statements), (600_000, 1), "the rows sent, when the server doesn't say");
+        assert_eq!(st.files.lock().len(), 3, "250,000 + 250,000 + 100,000 rows");
+        assert!(st.finished.load(std::sync::atomic::Ordering::SeqCst));
+
+        let st = Arc::new(Staging { fail_at: Some(1), ..Default::default() });
+        let w = staged_rows(&stage, Box::new(StagingWriter(st.clone())), Feed { held: held.iter(), rest: None }, &|_| {}).await;
+        assert!(w.result.is_err_and(|e| e.message.contains("WRITE VOLUME")));
+        assert_eq!(w.rows, 0, "nothing inserted");
+        assert!(!st.finished.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// What counts as refused for its size (sent again smaller), and what doesn't.

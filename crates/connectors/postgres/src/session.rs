@@ -87,12 +87,12 @@ impl databrain_connector_core::BulkWriter for CopyWriter {
         cancellable(sink.send(std::io::Cursor::new(data)), cancel, cancel_token, tls).await
     }
 
-    async fn finish(mut self: Box<Self>) -> Result<u64> {
+    async fn finish(mut self: Box<Self>) -> Result<Option<u64>> {
         if self.cancel.is_cancelled() {
             return Err(ConnectorError::cancelled());
         }
         let CopyWriter { sink, cancel, cancel_token, tls } = &mut *self;
-        cancellable(sink.as_mut().finish(), cancel, cancel_token, tls).await
+        cancellable(sink.as_mut().finish(), cancel, cancel_token, tls).await.map(Some)
     }
 }
 

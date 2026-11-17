@@ -303,9 +303,14 @@ pub trait Session: Send + Sync {
 #[async_trait]
 pub trait BulkWriter: Send {
     async fn write(&mut self, data: Vec<u8>) -> Result<()>;
-    /// End the data; rows written.
-    async fn finish(self: Box<Self>) -> Result<u64>;
+    /// End the data; rows written, when the server says (`None`: the rows sent).
+    async fn finish(self: Box<Self>) -> Result<Option<u64>>;
 }
+
+/// Where a bulk load's SQL reads files a session staged (Databricks: a
+/// folder of a Unity Catalog volume); the session writes the folder there
+/// as a string literal.
+pub const BULK_FILES: &str = "{databrain_bulk_files}";
 
 /// Connectors available in this build (populated by the app based on
 /// enabled Cargo features).

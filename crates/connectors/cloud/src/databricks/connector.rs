@@ -67,6 +67,9 @@ impl Connector for DatabricksConnector {
                 FieldSpec::new("result_transfer", "Result transfer")
                     .placeholder("auto")
                     .help("auto: large results download from cloud storage (no 25 MiB limit). inline: only through the workspace API (25 MiB limit), for networks that block cloud storage."),
+                FieldSpec::new(super::STAGING_VOLUME_OPTION, "Staging volume (bulk loads)").placeholder("/Volumes/main/default/staging").help(
+                    "A Unity Catalog volume (or a folder in it) you can read and write (READ VOLUME and WRITE VOLUME): job loads and \"Load into…\" upload their rows there as Parquet and insert them with one statement, much faster than INSERTs. The files are deleted afterwards. Empty: INSERTs.",
+                ),
             ],
             note: Some("Browser sign-in uses the Databricks CLI OAuth app (redirect http://localhost:8020)."),
         }
@@ -118,6 +121,12 @@ impl Connector for DatabricksConnector {
             inline_only: cfg.opt("result_transfer").is_some_and(|v| v.eq_ignore_ascii_case("inline")),
             storage: crate::common::storage_http(),
             fetch_parallel: cfg.opt("fetch_parallel").and_then(|v| v.parse().ok()).filter(|n: &usize| (1..=32).contains(n)).unwrap_or(FETCH_PARALLEL),
+            staging: cfg
+                .opt(super::STAGING_VOLUME_OPTION)
+                .filter(|v| !v.trim().is_empty())
+                .map(super::volume::staging_dir)
+                .transpose()
+                .map_err(ConnectorError::config)?,
         }));
         // Validate credentials + warehouse up front.
         s.0.run_small("SELECT 1").await?;

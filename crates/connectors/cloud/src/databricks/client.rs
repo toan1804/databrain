@@ -35,6 +35,8 @@ pub(super) struct Inner {
     pub(super) fetch_parallel: usize,
     /// Client for presigned cloud-storage downloads.
     pub(super) storage: reqwest::Client,
+    /// Volume folder bulk loads stage their files in (none: loads use INSERTs).
+    pub(super) staging: Option<String>,
 }
 
 impl Inner {
