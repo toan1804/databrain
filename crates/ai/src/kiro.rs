@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentEvent, AgentSink};
+use crate::meter::Meter;
 use crate::providers::{KeySource, LlmProvider, ProviderAuth, ProviderConfig, ProviderKind};
 use crate::tools::{ToolContext, specs};
 use crate::types::*;
@@ -231,7 +232,8 @@ impl KiroProvider {
     /// the agent config DataBrain manages allows only `@databrain` tools):
     /// test data asks Kiro this way. Each call starts `kiro-cli`, so it is
     /// slower than a model API; dropping the future stops the child.
-    pub(crate) async fn complete(&self, prompt: String, model: Option<&str>) -> Result<String> {
+    /// One tool-less prompt; the credits it spends go to `meter`.
+    pub(crate) async fn complete(&self, prompt: String, model: Option<&str>, meter: &Meter) -> Result<String> {
         let st = self.status().await;
         if !st.signed_in {
             return Err(AiError::Auth(format!("Kiro: {}", st.message.unwrap_or_else(|| "not signed in".into()))));
@@ -243,12 +245,14 @@ impl KiroProvider {
         let r = acp.call(&mut incoming, "session/new", json!({"cwd": acp.cwd.to_string_lossy(), "mcpServers": []}), &cancel, |_| {}).await?;
         let sid = r.get("sessionId").and_then(|s| s.as_str()).ok_or_else(|| AiError::Provider("Kiro did not return a session id".into()))?.to_string();
         let text = Mutex::new(String::new());
-        let on_update = |u: &Value| {
-            if u.get("sessionUpdate").and_then(|k| k.as_str()) == Some("agent_message_chunk")
-                && let Some(s) = u.pointer("/content/text").and_then(|s| s.as_str())
-            {
-                text.lock().push_str(s);
+        let on_update = |u: &Value| match u.get("sessionUpdate").and_then(|k| k.as_str()) {
+            Some("agent_message_chunk") => {
+                if let Some(s) = u.pointer("/content/text").and_then(|s| s.as_str()) {
+                    text.lock().push_str(s);
+                }
             }
+            Some("_kiro_metadata") => meter.credit(credits_of(u)),
+            _ => {}
         };
         let prompt = json!({"sessionId": sid, "prompt": [{"type": "text", "text": prompt}]});
         let r = acp.call(&mut incoming, "session/prompt", prompt, &cancel, on_update).await?;
@@ -335,11 +339,8 @@ impl KiroProvider {
                     });
                 }
                 Some("_kiro_metadata") => {
-                    let credits: f64 = u
-                        .get("meteringUsage")
-                        .and_then(|m| m.as_array())
-                        .map(|a| a.iter().filter(|m| m["unit"].as_str() == Some("credit")).filter_map(|m| m["value"].as_f64()).sum())
-                        .unwrap_or(0.0);
+                    let credits = credits_of(u);
+                    t.meter.credit(credits);
                     let context = u.get("contextUsagePercentage").and_then(|c| c.as_f64());
                     if credits > 0.0 || context.is_some() {
                         sink.emit(AgentEvent::Metering { session_id: sid.clone(), run_id: rid.clone(), credits, context_percent: context });
@@ -404,6 +405,17 @@ pub(crate) struct KiroTurn {
     /// Earlier turns of this conversation as text, sent when Kiro can't
     /// continue its own session (so the question keeps its context).
     pub history: String,
+    /// The credits the turn spends, as Kiro reports them (also when it is
+    /// stopped or fails: they were billed).
+    pub meter: Meter,
+}
+
+/// Credits a `_kiro.dev/metadata` update reports.
+fn credits_of(u: &Value) -> f64 {
+    u.get("meteringUsage")
+        .and_then(|m| m.as_array())
+        .map(|a| a.iter().filter(|m| m["unit"].as_str() == Some("credit")).filter_map(|m| m["value"].as_f64()).sum())
+        .unwrap_or(0.0)
 }
 
 #[async_trait]

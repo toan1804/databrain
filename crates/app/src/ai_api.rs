@@ -206,6 +206,11 @@ pub struct ProviderUsage {
     pub tokens_today: (i64, i64),
     #[ts(as = "(f64, f64)")]
     pub tokens_month: (i64, i64),
+    /// The provider bills credits, not tokens (Kiro): shown instead of tokens.
+    pub bills_credits: bool,
+    /// Credits it reported for DataBrain's conversations and other calls.
+    pub credits_today: f64,
+    pub credits_month: f64,
 }
 
 /// `since_day` / `since_month`: local midnight of today and of the 1st (ms).
@@ -230,6 +235,9 @@ pub async fn provider_usage(state: &AppState, id: &str, since_day: i64, since_mo
         budget_supported,
         tokens_today: state.workspace.ai_token_totals(id, since_day)?,
         tokens_month: state.workspace.ai_token_totals(id, since_month)?,
+        bills_credits: kind == Some(ProviderKind::Kiro),
+        credits_today: state.workspace.ai_credit_total(id, since_day)?,
+        credits_month: state.workspace.ai_credit_total(id, since_month)?,
     })
 }
 

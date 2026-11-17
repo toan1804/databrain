@@ -20,6 +20,8 @@ struct State {
     reported: Option<(u32, u32)>,
     /// The stream ended (a call that ends without a report counts 0).
     finished: bool,
+    /// Credits the provider billed (Kiro reports these, not tokens).
+    credits: f64,
 }
 
 /// One call's tokens, shared between the call and whoever may cancel it.
@@ -51,6 +53,17 @@ impl Meter {
         self.state().finished = true;
     }
 
+    /// Credits billed so far (Kiro reports them as the turn goes).
+    pub fn credit(&self, credits: f64) {
+        if credits.is_finite() && credits > 0.0 {
+            self.state().credits += credits;
+        }
+    }
+
+    pub fn credits(&self) -> f64 {
+        self.state().credits
+    }
+
     /// Input and output tokens: as reported, else (for a call cut off after
     /// it was sent: cancelled or timed out, not one the provider ended with
     /// an error) estimated.
@@ -65,6 +78,11 @@ impl Meter {
             None => (0, 0),
         }
     }
+}
+
+/// The credits of several calls.
+pub fn total_credits<'a>(meters: impl IntoIterator<Item = &'a Meter>) -> f64 {
+    meters.into_iter().map(Meter::credits).sum()
 }
 
 /// The tokens of several calls.
@@ -107,5 +125,12 @@ mod tests {
         done.finished();
         assert_eq!(done.tokens(), (0, 0));
         assert_eq!(total([&m, &done, &Meter::default()]), (180, 9));
+        // Credits add up; none or nonsense adds nothing.
+        m.credit(0.25);
+        done.credit(0.5);
+        for bad in [0.0, -1.0, f64::NAN] {
+            m.credit(bad);
+        }
+        assert_eq!(total_credits([&m, &done]), 0.75);
     }
 }

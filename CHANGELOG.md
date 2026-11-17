@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- AI usage with Kiro: "today" and "this month" showed 0 tokens, since Kiro bills credits, not tokens. They now show the credits DataBrain's conversations and test data spent, including turns that were stopped.
+
 ## 0.4.3 - 2026-11-17
 
 ### Added
