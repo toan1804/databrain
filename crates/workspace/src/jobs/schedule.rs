@@ -516,6 +516,55 @@ impl JobSchedule {
         }
     }
 
+    /// The scheduled time a run started now is for, after [`Self::due`]
+    /// said `Due::Run { mark }` (or `Due::Skip { mark }` for a time a busy
+    /// run covered): with [`MissedRuns::Each`], the missed time it runs for
+    /// (`mark`); otherwise the latest time due by `now` (the runs missed
+    /// before it are counted in it). `None` when no time is due.
+    pub fn slot_for(&self, mark: i64, base: i64, now: i64) -> Option<i64> {
+        if self.missed == MissedRuns::Each && mark < now && self.next_after(mark - 1) == Some(mark) {
+            return Some(mark);
+        }
+        self.last_slot(base, now)
+    }
+
+    /// The latest run time after `base` and no later than `now`: looked for
+    /// in a window that grows back from `now`, so a 1-minute schedule
+    /// missed for months walks a few minutes, not every one since.
+    fn last_slot(&self, base: i64, now: i64) -> Option<i64> {
+        let mut span = 60 * 60_000i64;
+        loop {
+            let from = base.max(now.saturating_sub(span));
+            let (mut t, mut last) = (from, None);
+            while let Some(n) = self.next_after(t).filter(|n| *n <= now) {
+                last = Some(n);
+                t = n;
+            }
+            if last.is_some() || from == base {
+                return last;
+            }
+            span = span.saturating_mul(4);
+        }
+    }
+
+    /// `at_ms` (epoch ms) in this schedule's time zone (the computer's when
+    /// none or not a valid one): its date (`2026-11-16`) and date and time
+    /// (`2026-11-16 06:30:00`), what a run's `:run_date` / `:run_time` are.
+    pub fn local_date_time(&self, at_ms: i64) -> (String, String) {
+        fn fmt<Z: TimeZone>(z: &Z, ms: i64) -> (String, String)
+        where
+            Z::Offset: std::fmt::Display,
+        {
+            let t = z.timestamp_millis_opt(ms).single().unwrap_or_else(|| z.timestamp_millis_opt(0).unwrap());
+            (t.format("%Y-%m-%d").to_string(), t.format("%Y-%m-%d %H:%M:%S").to_string())
+        }
+        match Zone::parse(&self.time_zone).unwrap_or(Zone::Local) {
+            Zone::Local => fmt(&Local, at_ms),
+            Zone::Named(z) => fmt(&z, at_ms),
+            Zone::Fixed(z) => fmt(&z, at_ms),
+        }
+    }
+
     /// What to do now for a job whose next run is counted from `base`,
     /// following [`Self::missed`].
     pub fn due(&self, base: i64, now: i64) -> Due {
@@ -772,6 +821,42 @@ mod tests {
         let late = utc(2026, 3, 4, 0, 30);
         let Due::Run { mark: m } = each.due(base, late) else { panic!() };
         assert_eq!(m, utc(2026, 3, 3, 1, 0));
+    }
+
+    /// The time a run is for (its `:run_date`): each missed time its own
+    /// with Each, else the latest due one; in the schedule's time zone.
+    #[test]
+    fn a_run_is_for_its_scheduled_time() {
+        let daily = JobSchedule { at: "06:00".into(), ..sched(ScheduleMode::Daily) };
+        let base = utc(2026, 3, 1, 7, 0);
+        // Off for three days, back at 09:00 on the 4th: one run for the 4th (Once),
+        let now = utc(2026, 3, 4, 9, 0);
+        let Due::Run { mark } = daily.due(base, now) else { panic!() };
+        assert_eq!(daily.slot_for(mark, base, now), Some(utc(2026, 3, 4, 6, 0)));
+        // or one per missed day, each for its own (Each).
+        let each = JobSchedule { missed: MissedRuns::Each, ..daily.clone() };
+        let mut slots = Vec::new();
+        let mut from = base;
+        while let Due::Run { mark } = each.due(from, now) {
+            slots.push(each.local_date_time(each.slot_for(mark, from, now).unwrap()).0);
+            from = mark;
+        }
+        assert_eq!(slots, ["2026-03-02", "2026-03-03", "2026-03-04"]);
+        // On time, late by a minute: still that day's run.
+        assert_eq!(daily.slot_for(utc(2026, 3, 2, 6, 1), base, utc(2026, 3, 2, 6, 1)), Some(utc(2026, 3, 2, 6, 0)));
+        // Nothing due: none.
+        assert_eq!(daily.slot_for(utc(2026, 3, 1, 8, 0), base, utc(2026, 3, 1, 8, 0)), None);
+        // A monthly run missed for months is found without walking every day.
+        let monthly = JobSchedule { month_days: vec![-1], at: "23:00".into(), ..sched(ScheduleMode::Monthly) };
+        let t = std::time::Instant::now();
+        assert_eq!(monthly.slot_for(utc(2026, 9, 10, 0, 0), base, utc(2026, 9, 10, 0, 0)), Some(utc(2026, 8, 31, 23, 0)));
+        assert!(t.elapsed() < std::time::Duration::from_millis(200), "{:?}", t.elapsed());
+        // The date is the schedule's: 23:30 UTC on the 1st is the 2nd in Ho Chi Minh City.
+        let at = utc(2026, 3, 1, 23, 30);
+        assert_eq!(daily.local_date_time(at), ("2026-03-01".into(), "2026-03-01 23:30:00".into()));
+        let hcm = JobSchedule { time_zone: "Asia/Ho_Chi_Minh".into(), ..daily.clone() };
+        assert_eq!(hcm.local_date_time(at), ("2026-03-02".into(), "2026-03-02 06:30:00".into()));
+        assert_eq!(JobSchedule { time_zone: "+05:30".into(), ..daily }.local_date_time(at).1, "2026-03-02 05:00:00");
     }
 
     /// A 1-minute cron missed for 90 days is decided quickly (the scheduler

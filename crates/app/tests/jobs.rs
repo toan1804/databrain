@@ -1634,6 +1634,109 @@ async fn missed_runs_follow_the_jobs_policy() {
     .await;
 }
 
+/// `:run_date` is the date a run is for: today for a run by hand, the date
+/// given for "Run for date" (Resume keeps it), each missed daily run's own
+/// day when they are made up later, and for a run after another job that
+/// job's. A date literal, so `:run_date - 1` is the day before.
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_are_for_their_date() {
+    guarded(async {
+        use databrain_app::jobs::RunParams;
+        use databrain_connector_core::sql::ParamValue;
+        use databrain_workspace::{MissedRuns, ScheduleMode};
+        let st = state();
+        let duck = st.engine.results_connection().unwrap().id;
+        let utc_day = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%Y-%m-%d").to_string();
+        let for_date = |d: &str| RunParams { set: None, values: [("run_date".to_string(), ParamValue { value: d.into(), raw: false })].into() };
+        let mut job = plain_job(
+            "Daily sales",
+            vec![
+                node(
+                    "d",
+                    "day_rows",
+                    JobNodeKind::Query,
+                    None,
+                    "select cast(:run_date as varchar) as d, cast(:run_date - 1 as varchar) as prev, cast(:run_time as varchar) as t",
+                ),
+                node("c", "too_early", JobNodeKind::Query, None, "select case when :run_date < DATE '2026-11-12' then error('too early') end as x"),
+            ],
+        );
+        job.edges = vec![databrain_workspace::JobEdge { from: "d".into(), to: "c".into() }];
+        job.schedule.time_zone = "UTC".into();
+        let job = st.workspace.save_job(job).unwrap();
+        let read = || rows(&st, &duck, "select d, prev, t from results.day_rows");
+
+        // By hand: the day it started, in the job's time zone.
+        api::run_job(&st, &job.id, None).unwrap();
+        let run = finished(&st, &job.id).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        let today = utc_day(run.started_at);
+        assert_eq!(run.params["run_date"].value, today);
+        assert_eq!(read().await[0][0], today);
+
+        // For a date given: the day before is date arithmetic, the time midnight.
+        api::run_job_with(&st, &job.id, None, Some(for_date("2026-11-16"))).unwrap();
+        assert_eq!(finished(&st, &job.id).await.status, "success");
+        assert_eq!(read().await, vec![vec!["2026-11-16", "2026-11-15", "2026-11-16 00:00:00"]]);
+
+        // A run for an earlier day that fails: Resume is for that day too.
+        api::run_job_with(&st, &job.id, None, Some(for_date("2026-11-10"))).unwrap();
+        assert_eq!(finished(&st, &job.id).await.status, "error");
+        api::resume_job(&st, &job.id).unwrap();
+        let resumed = finished(&st, &job.id).await;
+        assert_eq!((resumed.trigger.as_str(), resumed.params["run_date"].value.as_str()), ("resume", "2026-11-10"), "{resumed:?}");
+
+        // Not a date: the steps fail and say why.
+        api::run_job_with(&st, &job.id, None, Some(for_date("yesterday"))).unwrap();
+        let run = finished(&st, &job.id).await;
+        assert!(run.nodes[0].summary.error.as_deref().is_some_and(|e| e.contains(":run_date must be a date")), "{run:?}");
+
+        // Three daily runs missed, made up one by one: each for its own day.
+        let hour = 3_600_000;
+        let now = databrain_workspace::now_ms();
+        let at = chrono::DateTime::from_timestamp_millis(now - 2 * hour).unwrap();
+        let mut j = st.workspace.get_job(&job.id).unwrap();
+        j.nodes.truncate(1);
+        j.edges.clear();
+        j.schedule = JobSchedule {
+            enabled: true,
+            mode: ScheduleMode::Daily,
+            at: at.format("%H:%M").to_string(),
+            time_zone: "UTC".into(),
+            missed: MissedRuns::Each,
+            ..Default::default()
+        };
+        st.workspace.save_job(j).unwrap();
+        st.workspace.backdate_job_for_tests(&job.id, now - 3 * 24 * hour - hour).unwrap();
+        let mut days = Vec::new();
+        let mut last = st.workspace.job_runs(&job.id, 1).unwrap().first().map(|r| r.id);
+        for _ in 0..5 {
+            if databrain_app::jobs::tick(&st.job_ctx()).is_empty() {
+                break;
+            }
+            let r = next_run(&st, &job.id, last).await;
+            assert_eq!((r.trigger.as_str(), r.status.as_str()), ("schedule", "success"), "{r:?}");
+            last = Some(r.id);
+            days.push(r.params["run_date"].value.clone());
+        }
+        let slot = |d: i64| utc_day(now - 2 * hour - d * 24 * hour);
+        assert_eq!(days, vec![slot(2), slot(1), slot(0)], "each made-up run is for the day it was missed");
+
+        // A job that runs after this one is for the same day.
+        let mut down = plain_job("Report", vec![node("r", "report_rows", JobNodeKind::Query, None, "select cast(:run_date as varchar) as d")]);
+        down.schedule.after_jobs = vec![job.id.clone()];
+        let down = st.workspace.save_job(down).unwrap();
+        let mut j = st.workspace.get_job(&job.id).unwrap();
+        j.schedule.enabled = false;
+        st.workspace.save_job(j).unwrap();
+        api::run_job_with(&st, &job.id, None, Some(for_date("2026-10-31"))).unwrap();
+        assert_eq!(finished(&st, &job.id).await.status, "success");
+        let after = next_run(&st, &down.id, None).await;
+        assert_eq!((after.status.as_str(), after.params["run_date"].value.as_str()), ("success", "2026-10-31"), "{after:?}");
+    })
+    .await;
+}
+
 /// A scheduled run that fails on a connection with browser sign-in says so
 /// in its log; a run by hand doesn't.
 #[tokio::test(flavor = "multi_thread")]

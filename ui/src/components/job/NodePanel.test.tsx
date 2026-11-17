@@ -56,6 +56,18 @@ describe("job step panel", () => {
     expect(screen.getByText("Deleted connection: choose one")).toBeTruthy();
   });
 
+  it("says when the SQL reads today's date, and what to use instead", () => {
+    useStore.setState({ connections: [conn("c1", "Sales")] });
+    const job = emptyJob();
+    const node = { ...newNode(job, { x: 0, y: 0, name: "orders" }), connection_id: "c1", sql: "select * from orders where day = current_date - 1" };
+    job.nodes = [node];
+    const { rerender } = render(<NodePanel job={job} taken={new Map()} node={node} status={null} running={false} onChange={() => {}} onRun={() => {}} onSelect={() => {}} onDelete={() => {}} />);
+    expect(screen.getByRole("note")).toHaveTextContent(/Uses current_date: .* Use :run_date/);
+    const fixed = { ...node, sql: "select * from orders where day = :run_date - 1" };
+    rerender(<NodePanel job={{ ...job, nodes: [fixed] }} taken={new Map()} node={fixed} status={null} running={false} onChange={() => {}} onRun={() => {}} onSelect={() => {}} onDelete={() => {}} />);
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
+  });
+
   it("shows the connection it runs on", () => {
     useStore.setState({ connections: [conn("c1", "Sales")] });
     panel("c1");

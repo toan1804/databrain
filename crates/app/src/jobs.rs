@@ -351,6 +351,7 @@ impl Tracer {
             };
             p.insert(WATERMARK.to_string(), v);
         }
+        type_run_moment(&mut p, kind);
         Ok(p)
     }
 
@@ -657,7 +658,10 @@ fn start_as(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>
     let _ = ctx.workspace.touch_job_run(run.id, &owner);
     // A missing set doesn't stop the start: the run's steps fail with why,
     // so a scheduled run reports it like any failure.
-    let params = effective_params(&ctx.workspace, &job, over.as_ref());
+    let params = effective_params(&ctx.workspace, &job, over.as_ref()).and_then(|(mut p, set)| {
+        fill_run_moment(&job, &mut p, run.started_at)?;
+        Ok((p, set))
+    });
     if let Ok((p, _)) = &params {
         let _ = ctx.workspace.set_job_run_params(run.id, p);
         run.params = p.clone();
@@ -727,7 +731,8 @@ pub const AFTER_TRIGGER: &str = "after:";
 fn start_after(ctx: &JobCtx, job_id: &str, job_name: &str, ai: bool) {
     for (id, _) in ctx.workspace.jobs_after(job_id).unwrap_or_default() {
         let trigger = format!("{AFTER_TRIGGER}{job_name}");
-        match start_as(ctx, &id, &trigger, None, None, ai) {
+        // For the date the run it follows was for.
+        match start_as(ctx, &id, &trigger, None, moment_of_last_success(ctx, job_id), ai) {
             Ok(_) => tracing::info!(job = %id, after = job_id, "job started after the job it follows succeeded"),
             // Running (here or elsewhere), or the workspace failed for a moment:
             // queued, so the start isn't lost.
@@ -759,7 +764,10 @@ fn start_queued_after(ctx: &JobCtx) -> Vec<String> {
         }
         // Taken first, so only one process starts it; put back if it can't start yet.
         let Ok(Some((trigger, ai))) = ctx.workspace.take_job_after(&id) else { continue };
-        match start_as(ctx, &id, &trigger, None, None, ai) {
+        // For the date the run it follows was for (that job's latest success).
+        let after = trigger.strip_prefix(AFTER_TRIGGER).unwrap_or_default();
+        let moment = ctx.workspace.list_jobs().unwrap_or_default().into_iter().find(|j| j.name == after).and_then(|j| moment_of_last_success(ctx, &j.id));
+        match start_as(ctx, &id, &trigger, None, moment, ai) {
             Ok(_) => started.push(id),
             Err(e) if transient(&e) => {
                 let _ = ctx.workspace.queue_job_after(&id, &trigger, ai);
@@ -1808,6 +1816,78 @@ fn load_spec_now(ctx: &JobCtx, node: &JobNode, target: &str, origin: Origin, t: 
 /// The parameter an incremental step's SQL reads its mark from.
 pub const WATERMARK: &str = "watermark";
 
+/// The date a run is for, in the job's time zone: a scheduled run's
+/// scheduled time (each missed one its own, with "run each"), the run it
+/// follows for "run after", the run it resumes for Resume, else when it
+/// started; or the date given ("Run for date", `--param run_date=…`).
+/// SQL that filters on it (`where day = :run_date - 1`) reads the same
+/// rows however late the run is, which `current_date` doesn't.
+pub const RUN_DATE: &str = "run_date";
+/// [`RUN_DATE`] with its time of day (the scheduled time; midnight of a
+/// date given without one).
+pub const RUN_TIME: &str = "run_time";
+
+/// `:run_date` and `:run_time` of a run for the time `at_ms` (epoch ms).
+pub fn run_moment(job: &Job, at_ms: i64) -> BTreeMap<String, ParamValue> {
+    let (date, time) = job.schedule.local_date_time(at_ms);
+    BTreeMap::from([(RUN_DATE.to_string(), ParamValue { value: date, raw: false }), (RUN_TIME.to_string(), ParamValue { value: time, raw: false })])
+}
+
+/// Gives a run's values the `:run_date` / `:run_time` they lack (the run
+/// is for `now`, or midnight of a `run_date` given alone), and checks the
+/// ones given: a date `2026-11-16`, a time `2026-11-16 06:30[:00]`. A value
+/// typed as an expression (`{}` in the box) is left as it is.
+fn fill_run_moment(job: &Job, values: &mut BTreeMap<String, ParamValue>, now: i64) -> std::result::Result<(), String> {
+    use chrono::{NaiveDate, NaiveDateTime};
+    let date = match values.get(RUN_DATE) {
+        None => {
+            for (k, v) in run_moment(job, now) {
+                values.entry(k).or_insert(v);
+            }
+            return Ok(());
+        }
+        Some(v) if v.raw => None,
+        Some(v) => Some(
+            NaiveDate::parse_from_str(v.value.trim(), "%Y-%m-%d")
+                .map_err(|_| format!(":{RUN_DATE} must be a date like 2026-11-16, not \"{}\"", v.value.trim()))?,
+        ),
+    };
+    match values.get(RUN_TIME) {
+        None => {
+            if let Some(d) = date {
+                values.insert(RUN_TIME.to_string(), ParamValue { value: format!("{d} 00:00:00"), raw: false });
+            }
+        }
+        Some(v) if v.raw => {}
+        Some(v) => {
+            let t = v.value.trim();
+            let parsed = NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S").or_else(|_| NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M"));
+            let t = parsed.map_err(|_| format!(":{RUN_TIME} must be a date and time like 2026-11-16 06:30:00, not \"{t}\""))?;
+            values.insert(RUN_TIME.to_string(), ParamValue { value: t.format("%Y-%m-%d %H:%M:%S").to_string(), raw: false });
+        }
+    }
+    Ok(())
+}
+
+/// `:run_date` / `:run_time` as date and timestamp literals of a `kind`
+/// connection (`DATE '2026-11-16'`), so `:run_date - 1` is date arithmetic
+/// there, not text.
+fn type_run_moment(params: &mut HashMap<String, ParamValue>, kind: ConnectorKind) {
+    for (name, ty) in [(RUN_DATE, MarkType::Date), (RUN_TIME, MarkType::Timestamp)] {
+        if let Some(v) = params.get_mut(name).filter(|v| !v.raw) {
+            *v = ParamValue { value: ty.literal(&v.value, kind), raw: true };
+        }
+    }
+}
+
+/// The `:run_date` / `:run_time` of `job_id`'s latest successful run, for
+/// a run that follows it ("run after").
+fn moment_of_last_success(ctx: &JobCtx, job_id: &str) -> Option<RunParams> {
+    let run = ctx.workspace.job_runs(job_id, 10).ok()?.into_iter().find(|r| r.status == "success")?;
+    let values: BTreeMap<String, ParamValue> = run.params.into_iter().filter(|(k, _)| k == RUN_DATE || k == RUN_TIME).collect();
+    (!values.is_empty()).then_some(RunParams { set: None, values })
+}
+
 /// An incremental step's column, if it has one.
 /// The incremental step whose rows step `id` gets (itself, or a step
 /// above it), if any.
@@ -2141,7 +2221,11 @@ pub const DRY_RUN_ROWS: usize = 1000;
 /// `:name` values a dry run selects its rows with: the job's, and an
 /// incremental step's `:watermark` as its next run would get it.
 fn dry_run_params(ctx: &JobCtx, job: &Job, node: &JobNode) -> HashMap<String, ParamValue> {
-    let mut params: HashMap<String, ParamValue> = effective_params(&ctx.workspace, job, None).map(|(p, _)| p.into_iter().collect()).unwrap_or_default();
+    let mut params: BTreeMap<String, ParamValue> = effective_params(&ctx.workspace, job, None).map(|(p, _)| p).unwrap_or_default();
+    // For today, as a run started now; the rows are selected on DuckDB.
+    let _ = fill_run_moment(job, &mut params, now_ms());
+    let mut params: HashMap<String, ParamValue> = params.into_iter().collect();
+    type_run_moment(&mut params, ConnectorKind::Duckdb);
     if let Some(col) = incremental_column(node) {
         // The rows are selected on DuckDB: the mark as a DuckDB literal of its type.
         let mark = ctx.workspace.job_watermark(&job.id, &node.id, &col).ok().flatten().map(|w| match w.value_type.as_deref().and_then(MarkType::parse) {
@@ -2252,9 +2336,10 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
         }
         let release = || let_go(ctx, &j.id);
         let fresh = ctx.workspace.get_job(&j.id).ok();
+        let base = fresh.as_ref().map(|f| f.schedule_base_at(now));
         // Missed runs: one for all (marked now), none, or one per missed time
         // (marked at that time, so the next pass finds the next one due).
-        let mark = match fresh.as_ref().map_or(Due::No, |f| f.schedule.due(f.schedule_base_at(now), now)) {
+        let mark = match fresh.as_ref().map_or(Due::No, |f| f.schedule.due(base.unwrap_or(now), now)) {
             Due::Run { mark } => mark,
             Due::No => {
                 release();
@@ -2271,6 +2356,11 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
                 continue;
             }
         };
+        // The run is for its scheduled time (`:run_date`), however late it starts.
+        let moment = fresh.as_ref().and_then(|f| {
+            let slot = f.schedule.slot_for(mark, base.unwrap_or(now), now)?;
+            Some(RunParams { set: None, values: run_moment(f, slot) })
+        });
         // Marked while the lease is held (a fast run could otherwise end and
         // release it before the mark, and another runner start it again)…
         let before = fresh.and_then(|f| f.last_scheduled_at);
@@ -2281,7 +2371,7 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
             release();
             continue;
         }
-        match start(ctx, &j.id, trigger, None) {
+        match start_with(ctx, &j.id, trigger, None, moment) {
             Ok(_) => started.push(j.id),
             Err(e) => give_back(ctx, &j.id, mark, before, &e),
         }
@@ -2396,6 +2486,63 @@ pub async fn wait_all(ctx: &JobCtx) -> Vec<String> {
 mod tests {
     use super::*;
     use databrain_connector_core::ConnectorKind::{Duckdb, Mongodb, Mysql, Postgres};
+
+    /// A run gets `:run_date` / `:run_time` when it has none; a date given
+    /// alone is for its midnight; values that aren't a date (or a date and
+    /// time) are refused; an expression is left as typed. Bound as a date
+    /// and timestamp literal of each database.
+    #[test]
+    fn run_dates_are_checked_and_typed() {
+        let job = Job {
+            id: String::new(),
+            name: "j".into(),
+            nodes: vec![],
+            edges: vec![],
+            schedule: databrain_workspace::JobSchedule { time_zone: "Asia/Ho_Chi_Minh".into(), ..Default::default() },
+            last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
+            limits: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let v = |s: &str| ParamValue { value: s.into(), raw: false };
+        let get = |p: &BTreeMap<String, ParamValue>| (p[RUN_DATE].value.clone(), p[RUN_TIME].value.clone());
+        // 2026-11-16 20:00 UTC is the 17th, 03:00, in Ho Chi Minh City.
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-16T20:00:00Z").unwrap().timestamp_millis();
+        let mut p = BTreeMap::new();
+        fill_run_moment(&job, &mut p, at).unwrap();
+        assert_eq!(get(&p), ("2026-11-17".into(), "2026-11-17 03:00:00".into()));
+        let mut p = BTreeMap::from([(RUN_DATE.to_string(), v(" 2026-11-01 "))]);
+        fill_run_moment(&job, &mut p, at).unwrap();
+        assert_eq!(p[RUN_TIME].value, "2026-11-01 00:00:00");
+        let mut p = BTreeMap::from([(RUN_DATE.to_string(), v("2026-11-01")), (RUN_TIME.to_string(), v("2026-11-01 06:30"))]);
+        fill_run_moment(&job, &mut p, at).unwrap();
+        assert_eq!(p[RUN_TIME].value, "2026-11-01 06:30:00");
+        for bad in ["yesterday", "2026-13-01", "16/11/2026", ""] {
+            let mut p = BTreeMap::from([(RUN_DATE.to_string(), v(bad))]);
+            assert!(fill_run_moment(&job, &mut p, at).is_err_and(|e| e.contains(":run_date must be a date")), "{bad:?}");
+        }
+        let mut p = BTreeMap::from([(RUN_DATE.to_string(), v("2026-11-01")), (RUN_TIME.to_string(), v("6:30"))]);
+        assert!(fill_run_moment(&job, &mut p, at).is_err_and(|e| e.contains(":run_time")));
+        let expr = ParamValue { value: "current_date - 1".into(), raw: true };
+        let mut p = BTreeMap::from([(RUN_DATE.to_string(), expr.clone())]);
+        fill_run_moment(&job, &mut p, at).unwrap();
+        assert_eq!(p[RUN_DATE], expr);
+
+        let typed = |kind| {
+            let mut p: HashMap<String, ParamValue> = [(RUN_DATE.to_string(), v("2026-11-16")), (RUN_TIME.to_string(), v("2026-11-16 06:30:00"))].into();
+            type_run_moment(&mut p, kind);
+            (p[RUN_DATE].value.clone(), p[RUN_TIME].value.clone(), p[RUN_DATE].raw)
+        };
+        assert_eq!(typed(Postgres), ("DATE '2026-11-16'".into(), "TIMESTAMP '2026-11-16 06:30:00'".into(), true));
+        assert_eq!(typed(ConnectorKind::Mssql).0, "CAST('2026-11-16' AS date)");
+        assert_eq!(typed(ConnectorKind::Sqlite).0, "'2026-11-16'");
+        // An expression stays as typed.
+        let mut p: HashMap<String, ParamValue> = [(RUN_DATE.to_string(), expr.clone())].into();
+        type_run_moment(&mut p, Postgres);
+        assert_eq!(p[RUN_DATE], expr);
+    }
 
     /// A load step's try runs again only when its load never started or said
     /// it kept nothing; a load that started and didn't say (or said it may
