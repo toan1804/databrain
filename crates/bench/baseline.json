@@ -15,6 +15,7 @@
     "export/xlsx_100k_rows": 328535250,
     "lineage/query": 87812,
     "lineage/script_100": 1294833,
+    "load/bq_json_100k_rows": 56685458,
     "load/dbx_stage_100k_rows": 65004333,
     "load/insert_sql_100k_rows": 88796584,
     "load/oracle_array_100k_rows": 43930542,
