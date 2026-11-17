@@ -41,6 +41,35 @@ pub(crate) enum Backend {
     Thin(Arc<agent::Agent>),
 }
 
+/// [`Session::insert_array`] on Instant Client: a batch the size of the
+/// rows, each column bound as text sized for its longest value in
+/// characters (rust-oracle's size; Instant Client sizes every row's slot
+/// for it, which `ArrayInsert` keeps bounded). A failed call is rolled
+/// back.
+fn thick_insert_array(c: &Connection, sql: &str, columns: &[Vec<Option<String>>]) -> Result<u64> {
+    let rows = columns.first().map_or(0, Vec::len);
+    let run = || -> std::result::Result<u64, oracle::Error> {
+        let mut batch = c.batch(sql, rows).build()?;
+        for (i, col) in columns.iter().enumerate() {
+            let longest = col.iter().map(|v| v.as_ref().map_or(0, |s| s.chars().count())).max().unwrap_or(0).max(1);
+            batch.set_type(i + 1, &oracle::sql_type::OracleType::Varchar2(longest as u32))?;
+        }
+        for r in 0..rows {
+            let values: Vec<&Option<String>> = columns.iter().map(|col| &col[r]).collect();
+            let row: Vec<&dyn oracle::sql_type::ToSql> = values.iter().map(|v| *v as &dyn oracle::sql_type::ToSql).collect();
+            batch.append_row(&row)?;
+        }
+        batch.execute()?;
+        Ok(rows as u64)
+    };
+    // Without batch-error mode Oracle doesn't say which row failed (the
+    // error's offset is in the SQL): the load names the call's rows.
+    run().map_err(|e| {
+        let _ = c.rollback();
+        map_err(e)
+    })
+}
+
 pub struct OracleSession {
     pub(crate) backend: Backend,
 }
@@ -148,6 +177,59 @@ impl Session for OracleSession {
             return a.call(serde_json::json!({"op": "ping"})).await.map(|_| ());
         }
         self.with_conn(|c| c.ping().map_err(map_err)).await
+    }
+
+    /// Array DML: one prepared INSERT run with every row's values bound at
+    /// once (a batch on Instant Client, `execmany` on the thin helper). The
+    /// values are text as the session reads it (numbers with its decimal
+    /// separator, see `ArrayInsert::next`); a failed call is rolled back, so
+    /// it keeps none of its rows (rows before the failing one would
+    /// otherwise stay in the transaction and commit with the next statement).
+    async fn insert_array(&self, sql: &str, columns: Vec<Vec<Option<String>>>, cancel: databrain_connector_core::CancellationToken) -> Result<Option<u64>> {
+        if columns.first().is_none_or(Vec::is_empty) {
+            return Ok(Some(0));
+        }
+        if cancel.is_cancelled() {
+            return Err(ConnectorError::cancelled());
+        }
+        match &self.backend {
+            Backend::Thin(a) => {
+                let req = serde_json::json!({"op": "execmany", "sql": sql, "columns": columns});
+                // The helper reads requests up to 64 MB: a larger one is refused here, not sent.
+                let size = serde_json::to_vec(&req).map_or(usize::MAX, |b| b.len());
+                if size > agent::MAX_REQUEST {
+                    return Err(ConnectorError::query(format!(
+                        "An array INSERT of {} MB is larger than the Oracle driver takes ({} MB)",
+                        size >> 20,
+                        agent::MAX_REQUEST >> 20
+                    )));
+                }
+                let reply = tokio::select! {
+                    // Dropping the call asks the helper to cancel it.
+                    r = a.call(req) => r,
+                    _ = cancel.cancelled() => return Err(ConnectorError::cancelled()),
+                };
+                match reply {
+                    Ok(j) => Ok(Some(j["rows_affected"].as_u64().unwrap_or(0))),
+                    // A helper older than array binding: INSERTs instead.
+                    Err(e) if e.message.contains("unknown op") => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+            Backend::Thick { read_only: true, .. } => Err(ConnectorError::query("This connection is read-only")),
+            Backend::Thick { .. } => {
+                let sql = sql.to_string();
+                tokio::select! {
+                    // Dropping the call breaks the statement (see `with_conn`).
+                    r = self.with_conn(move |c| thick_insert_array(c, &sql, &columns)) => r.map(Some),
+                    _ = cancel.cancelled() => Err(ConnectorError::cancelled()),
+                }
+            }
+        }
+    }
+
+    fn insert_array_possible(&self) -> bool {
+        !matches!(self.backend, Backend::Thick { read_only: true, .. })
     }
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
@@ -964,6 +1046,81 @@ mod tests {
             assert!(e.is_err() || e2.is_err(), "write refused on a read-only connection");
         }
         let _ = s.execute(databrain_connector_core::Statement::internal("drop table kb_ro purge"), ExecOptions::default()).await.unwrap().collect().await;
+    }
+
+    /// Live: an array INSERT on each driver (DATABRAIN_ORACLE_DRIVER: thin
+    /// or instant_client, with DATABRAIN_ORACLE_LIB_DIR). In a session whose
+    /// decimal separator is `,`, numbers written with it (as the load writes
+    /// them) go into a NUMBER and a VARCHAR2 column as literals would, the
+    /// session's settings stay as they were, every type goes in through its
+    /// format, and a failed call keeps none of its rows.
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_array_insert() {
+        use databrain_connector_core::{CancellationToken, Statement};
+        if let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") {
+            init_client(Some(&d)).unwrap();
+        }
+        let driver = std::env::var("DATABRAIN_ORACLE_DRIVER").unwrap_or_else(|_| "thin".into());
+        let Some(s) = live(&driver).await else {
+            panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
+        };
+        let s = &s;
+        let run = |sql: &'static str| async move { databrain_connector_core::query_text(s.as_ref(), sql).await };
+        let _ = run("drop table kb_arr purge").await;
+        run("create table kb_arr (n number(12,3), s varchar2(50), d date, ts timestamp(6), tz timestamp(6) with time zone, b raw(10), f binary_double, v varchar2(20))")
+            .await
+            .unwrap();
+        // A German session: ',' is its decimal separator.
+        s.execute(Statement::internal("alter session set nls_numeric_characters = ',.'"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let sql = "INSERT INTO kb_arr (n, s, d, ts, tz, b, f, v) VALUES (:1, :2, TO_DATE(:3, 'YYYY-MM-DD'), \
+                   TO_TIMESTAMP(:4, 'YYYY-MM-DD HH24:MI:SS.FF'), TO_TIMESTAMP_TZ(:5, 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), HEXTORAW(:6), :7, :8)";
+        let v = |x: &str| Some(x.to_string());
+        let columns = vec![
+            vec![v("1234,5"), None, v("-0,125")],
+            vec![v("ünï 'q'"), None, v("x")],
+            vec![v("2026-11-17"), None, v("2000-02-29")],
+            vec![v("2026-11-17 10:20:30.123456"), None, v("2026-01-01 00:00:00")],
+            vec![v("2026-11-17 10:20:30 +02:00"), None, v("2026-11-17 23:59:59.5 -05:30")],
+            vec![v("00ff"), None, v("41")],
+            vec![v("1e-7"), None, v("2,5")],
+            // A number into a VARCHAR2 column, as the load writes it.
+            vec![v("1234,5"), None, v("-0,125")],
+        ];
+        assert_eq!(s.insert_array(sql, columns, CancellationToken::new()).await.unwrap(), Some(3));
+        let rows = run("select to_char(n, 'FM999999990.000', 'NLS_NUMERIC_CHARACTERS=''.,'''), s, to_char(d, 'YYYY-MM-DD HH24:MI:SS'), \
+             to_char(ts, 'YYYY-MM-DD HH24:MI:SS.FF6'), to_char(tz, 'YYYY-MM-DD HH24:MI:SS.FF1 TZH:TZM'), rawtohex(b), \
+             to_char(f, 'FM0.0000000EEEE', 'NLS_NUMERIC_CHARACTERS=''.,'''), v from kb_arr order by n nulls last")
+        .await
+        .unwrap();
+        let t = |r: usize, c: usize| rows[r][c].clone();
+        assert_eq!(t(0, 0).as_deref(), Some("-0.125"));
+        assert_eq!(t(1, 0).as_deref(), Some("1234.500"), "read with the session's ','");
+        assert_eq!(t(1, 1).as_deref(), Some("ünï 'q'"));
+        assert_eq!(t(1, 2).as_deref(), Some("2026-11-17 00:00:00"));
+        assert_eq!(t(1, 3).as_deref(), Some("2026-11-17 10:20:30.123456"));
+        assert_eq!(t(1, 4).as_deref(), Some("2026-11-17 10:20:30.0 +02:00"));
+        assert_eq!(t(0, 4).as_deref(), Some("2026-11-17 23:59:59.5 -05:30"));
+        assert_eq!(t(1, 5).as_deref(), Some("00FF"));
+        assert_eq!(t(1, 6).as_deref(), Some("1.0000000E-07"));
+        assert_eq!(t(0, 3).as_deref(), Some("2026-01-01 00:00:00.000000"), "a time without a fraction");
+        assert!(rows[2].iter().all(Option::is_none), "the NULL row: {:?}", rows[2]);
+        // Into VARCHAR2: the text a literal 1234.5 becomes in this session.
+        let literal = run("select to_char(1234.5) from dual").await.unwrap();
+        assert_eq!(t(1, 7), literal[0][0]);
+        assert_eq!(t(1, 7).as_deref(), Some("1234,5"));
+        // The session's settings weren't touched.
+        let nls = run("select value from nls_session_parameters where parameter = 'NLS_NUMERIC_CHARACTERS'").await.unwrap();
+        assert_eq!(nls[0][0].as_deref(), Some(",."));
+        // A call that fails at its second row keeps none of its rows, also
+        // after the next statement commits.
+        let mut bad = vec![vec![None, None]; 8];
+        bad[0] = vec![v("7"), v("not a number")];
+        let e = s.insert_array(sql, bad, CancellationToken::new()).await.unwrap_err();
+        assert!(e.message.contains("ORA-01722") || e.message.to_ascii_lowercase().contains("invalid number"), "{}", e.message);
+        s.execute(Statement::internal("commit"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        assert_eq!(run("select count(*) from kb_arr").await.unwrap()[0][0].as_deref(), Some("3"), "the failed call's first row isn't kept");
+        run("drop table kb_arr purge").await.unwrap();
     }
 
     /// Live: DATABRAIN_ORACLE_HOST, _USER, _PASSWORD, _SERVICE (e.g. gvenzl/oracle-free).

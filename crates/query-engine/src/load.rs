@@ -284,6 +284,8 @@ struct Prepared {
     may_commit: bool,
     /// [`LoadSpec::insert_only`].
     insert_only: bool,
+    /// The step set its own rows or KB per INSERT: they cap array calls too.
+    batch_from_step: bool,
 }
 
 /// The step's own before/after SQL, checked once: transaction control is
@@ -1224,6 +1226,7 @@ impl QueryEngine {
             notices,
             may_commit,
             insert_only,
+            batch_from_step: spec.batch_rows.is_some_and(|r| r > 0) || spec.batch_kb.is_some_and(|k| k > 0),
         })
     }
 }
@@ -1371,6 +1374,121 @@ impl Pending<'_, '_, '_> {
     }
 }
 
+/// Rows per array INSERT call ([`array_rows`]), fewer past [`ARRAY_BYTES`].
+const ARRAY_ROWS: usize = 10_000;
+/// Text per array INSERT call.
+const ARRAY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The rows by array INSERTs (Oracle array DML): one prepared INSERT run
+/// with up to [`ARRAY_ROWS`] rows bound at once, each call all or nothing.
+/// A session that turns the first call down (a thin helper older than
+/// array binding) gets INSERTs instead, the rows it held put back.
+#[allow(clippy::too_many_arguments)]
+async fn array_rows(
+    p: &Prepared,
+    table: &str,
+    schema: &SchemaRef,
+    ai: &sqlgen::ArrayInsert,
+    mut feed: Feed<'_, '_>,
+    cancel: &CancellationToken,
+    progress: &(dyn Fn(u64) + Sync),
+    note: &(dyn Fn(String) + Sync),
+) -> Written {
+    let mut w = Written { rows: 0, statements: 0, sql: ai.sql.clone(), result: Ok(()), split: None, parallel: false, serialized: false };
+    let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
+    // A step's own rows and KB per INSERT cap the calls too.
+    let (per_call, max_bytes) =
+        if p.batch_from_step { (ARRAY_ROWS.min(p.batch.rows.max(1)), ARRAY_BYTES.min(p.batch.bytes.max(1))) } else { (ARRAY_ROWS, ARRAY_BYTES) };
+    // Numbers are written with the session's decimal separator, so they
+    // convert as the INSERT's literals do; unknown, INSERTs.
+    let decimal = match decimal_separator(p).await {
+        Some(d) => d,
+        None => {
+            note("INSERT ALLs: the session's decimal separator couldn't be read for array INSERTs".into());
+            return insert_rows(p, table, schema, feed, cancel, progress).await;
+        }
+    };
+    loop {
+        let batch = match rows.gather(per_call).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return w,
+            Err(e) => {
+                w.result = Err(e);
+                return w;
+            }
+        };
+        let mut at = 0;
+        while at < batch.num_rows() {
+            let (columns, k) = match ai.next(&batch, at, per_call, max_bytes, decimal) {
+                Ok(Some(x)) => x,
+                Ok(None) => break,
+                Err(e) => {
+                    w.result = Err(EngineError::new("internal", e.to_string()));
+                    return w;
+                }
+            };
+            match p.session.insert_array(&ai.sql, columns, cancel.clone()).await {
+                Ok(Some(_)) => {
+                    if w.statements == 0 {
+                        note(format!("array INSERTs, up to {} rows bound to one statement a call ({})", grouped(per_call), ai.sql));
+                    }
+                    at += k;
+                    w.rows += k as u64;
+                    w.statements += 1;
+                    progress(w.rows);
+                }
+                Ok(None) if w.statements == 0 => {
+                    note("INSERT ALLs: this Oracle driver doesn't take array INSERTs (a helper older than 0.1.5)".into());
+                    rows.retry.push_front(batch.slice(at, batch.num_rows() - at));
+                    return insert_pending(p, table, schema, rows, cancel, progress).await;
+                }
+                Ok(None) => {
+                    w.result = Err(EngineError::new("internal", "the session stopped taking array INSERTs part way"));
+                    return w;
+                }
+                Err(e) => {
+                    let mut e = EngineError::from(e);
+                    e.message = name_failing_row(&e.message, w.rows, k);
+                    w.result = Err(e);
+                    return w;
+                }
+            }
+        }
+    }
+}
+
+/// The session's decimal separator (Oracle's `NLS_NUMERIC_CHARACTERS`);
+/// `.` where numbers don't depend on it. `None`: it couldn't be read.
+async fn decimal_separator(p: &Prepared) -> Option<char> {
+    if p.dialect != ConnectorKind::Oracle {
+        return Some('.');
+    }
+    let r =
+        databrain_connector_core::query_text(&*p.session, "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_NUMERIC_CHARACTERS'").await.ok()?;
+    r.first().and_then(|row| row.first().cloned().flatten()).and_then(|v| v.chars().next())
+}
+
+/// An array call's error with the rows it held among the step's rows
+/// (neither driver says which row failed without batch-error mode, whose
+/// call fails anyway past too many bad rows).
+fn name_failing_row(message: &str, written: u64, k: usize) -> String {
+    let at = |n: u64| grouped(written as usize + n as usize);
+    format!("{message} (in rows {} to {} of the step's rows)", at(1), at(k as u64))
+}
+
+/// `12345` as `12,345`.
+fn grouped(n: usize) -> String {
+    let d = n.to_string();
+    let mut out = String::new();
+    for (i, c) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// One INSERT that ended: its SQL, rows and result, whether another was
 /// running when it started, and how many had started before it.
 type Ran = (String, RecordBatch, Result<Option<u64>>, bool, usize);
@@ -1392,10 +1510,23 @@ async fn insert_rows(
     cancel: &CancellationToken,
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
+    let rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
+    insert_pending(p, table, schema, rows, cancel, progress).await
+}
+
+/// [`insert_rows`] for rows partly read already (an array INSERT the
+/// session turned down put its rows back).
+async fn insert_pending(
+    p: &Prepared,
+    table: &str,
+    schema: &SchemaRef,
+    mut rows: Pending<'_, '_, '_>,
+    cancel: &CancellationToken,
+    progress: &(dyn Fn(u64) + Sync),
+) -> Written {
     let b = sqlgen::InsertSql::new(p.dialect, table, schema, p.batch);
     let mut at_once = if p.tx.is_none() { p.dialect.traits().load.map_or(1, |l| l.parallel_inserts).max(1) } else { 1 };
     let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None, parallel: false, serialized: false };
-    let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     let mut size = p.batch.rows.max(1);
     let mut running: tokio::task::JoinSet<Ran> = tokio::task::JoinSet::new();
     let mut started = 0usize;
@@ -1910,8 +2041,14 @@ async fn run_plan(
                     },
                     None => None,
                 };
+                // No bulk load: array INSERTs where the session binds arrays (Oracle).
+                let array_insert = (writer.is_none() && !p.insert_only && p.session.insert_array_possible())
+                    .then(|| sqlgen::ArrayInsert::new(p.dialect, table, &schema))
+                    .flatten();
                 let bulk_word = if p.dialect == ConnectorKind::Databricks { "a bulk load" } else { "COPY" };
                 let how = match (&writer, &why_not) {
+                    // Array INSERTs say so once a call went in (`array_rows`).
+                    (None, _) if array_insert.is_some() => String::new(),
                     (Some((Bulk::Copy(c), _)), _) => format!("bulk load ({})", c.sql),
                     (Some((Bulk::Staged(s), _)), _) => format!("bulk load: Parquet files in the staging volume, then {}", s.sql),
                     (None, Some(why)) => format!("INSERTs, not {bulk_word} ({why})"),
@@ -1928,7 +2065,14 @@ async fn run_plan(
                 let w = match writer {
                     Some((Bulk::Copy(c), writer)) => copy_rows(p, c, writer, feed, &progress).await,
                     Some((Bulk::Staged(s), writer)) => staged_rows(s, writer, feed, &progress).await,
-                    None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
+                    None => match array_insert.as_ref() {
+                        Some(ai) => {
+                            // Said once a call went in (or why not), not before.
+                            let note = |m: String| obs.event(LoadEvent::Info(format!("{label}: {m}")));
+                            array_rows(p, table, &schema, ai, feed, cancel, &progress, &note).await
+                        }
+                        None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
+                    },
                 };
                 let Written { rows: n, statements, sql: first, result: r, split, parallel, serialized } = w;
                 if serialized {
@@ -2221,6 +2365,7 @@ mod tests {
             notices: vec![],
             may_commit: false,
             insert_only: false,
+            batch_from_step: false,
         }
     }
 
@@ -2499,6 +2644,164 @@ mod tests {
         let mut b = size(8 * MB);
         fit_packet(&mut b, None, true);
         assert_eq!(b.bytes, 8 * MB);
+    }
+
+    /// An Oracle session: array INSERTs (unless `arrays` is off, as an old
+    /// thin helper), and INSERT ALLs; records the rows of each, and fails
+    /// the array call `fail_at` (1-based).
+    #[derive(Default)]
+    struct OracleLike {
+        /// `NLS_NUMERIC_CHARACTERS` (None: the query fails).
+        nls: Option<&'static str>,
+        /// Each array call's columns.
+        calls: parking_lot::Mutex<Vec<Vec<Vec<Option<String>>>>>,
+        no_arrays: bool,
+        fail_at: Option<usize>,
+        arrays: parking_lot::Mutex<Vec<usize>>,
+        inserts: parking_lot::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for OracleLike {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind::Oracle
+        }
+        async fn server_version(&self) -> databrain_connector_core::Result<String> {
+            Ok("test".into())
+        }
+        async fn ping(&self) -> databrain_connector_core::Result<()> {
+            Ok(())
+        }
+        async fn execute(&self, stmt: Statement<'_>, _: ExecOptions) -> databrain_connector_core::Result<QueryStream> {
+            if stmt.sql().contains("nls_session_parameters") {
+                use databrain_connector_core::arrow::array::StringArray;
+                use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+                let Some(v) = self.nls else { return Err(databrain_connector_core::ConnectorError::query("ORA-00942")) };
+                let schema = Arc::new(Schema::new(vec![Field::new("VALUE", DataType::Utf8, true)]));
+                let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec![v]))]).unwrap();
+                let (tx, stream) = QueryStream::channel(4);
+                tx.send(StreamEvent::Schema(schema)).await;
+                tx.send(StreamEvent::Batch(b)).await;
+                tx.send(StreamEvent::Done(Default::default())).await;
+                return Ok(stream);
+            }
+            assert!(stmt.sql().starts_with("INSERT ALL"), "{}", stmt.sql());
+            self.inserts.lock().push(stmt.sql().matches(" INTO ").count());
+            let (tx, stream) = QueryStream::channel(1);
+            tx.send(StreamEvent::Done(Default::default())).await;
+            Ok(stream)
+        }
+        async fn insert_array(&self, sql: &str, columns: Vec<Vec<Option<String>>>, _: CancellationToken) -> databrain_connector_core::Result<Option<u64>> {
+            if self.no_arrays {
+                return Ok(None);
+            }
+            assert!(sql.starts_with("INSERT INTO") && sql.contains("VALUES (:1)"), "{sql}");
+            let mut a = self.arrays.lock();
+            if self.fail_at == Some(a.len() + 1) {
+                return Err(databrain_connector_core::ConnectorError::query("ORA-01722: invalid number"));
+            }
+            a.push(columns[0].len());
+            let n = columns[0].len();
+            self.calls.lock().push(columns);
+            Ok(Some(n as u64))
+        }
+        fn insert_array_possible(&self) -> bool {
+            true
+        }
+        async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<databrain_connector_core::SchemaInfo>> {
+            Ok(vec![])
+        }
+        async fn list_objects(&self, _: &str) -> databrain_connector_core::Result<Vec<databrain_connector_core::DbObject>> {
+            Ok(vec![])
+        }
+        async fn describe(&self, _: &str, _: &str) -> databrain_connector_core::Result<databrain_connector_core::ObjectDetail> {
+            Err(databrain_connector_core::ConnectorError::query("no"))
+        }
+    }
+
+    fn oracle(s: Arc<OracleLike>) -> Prepared {
+        Prepared { dialect: ConnectorKind::Oracle, session: s, ..prepared(Warehouse::refusing_over(1), 100, None) }
+    }
+
+    /// Oracle loads go in array INSERTs of up to 10,000 rows, taken from as
+    /// many incoming batches as that needs; every row once.
+    #[tokio::test]
+    async fn oracle_loads_bind_arrays_of_rows() {
+        let s = Arc::new(OracleLike { nls: Some(".,"), ..Default::default() });
+        let (schema, held) = batches(25_000, 2000);
+        let ai = sqlgen::ArrayInsert::new(ConnectorKind::Oracle, "t", &schema).unwrap();
+        let w = array_rows(&oracle(s.clone()), "t", &schema, &ai, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}, &|_| {}).await;
+        assert!(w.result.is_ok(), "{:?}", w.result.err());
+        assert_eq!((w.rows, w.statements), (25_000, 3));
+        assert_eq!(*s.arrays.lock(), vec![10_000, 10_000, 5_000]);
+        assert!(s.inserts.lock().is_empty());
+    }
+
+    /// A session that turns array INSERTs down (a thin helper older than
+    /// them) gets INSERT ALLs instead, every row once.
+    #[tokio::test]
+    async fn oracle_without_arrays_gets_inserts() {
+        let s = Arc::new(OracleLike { nls: Some(".,"), no_arrays: true, ..Default::default() });
+        let (schema, held) = batches(2_500, 2000);
+        let ai = sqlgen::ArrayInsert::new(ConnectorKind::Oracle, "t", &schema).unwrap();
+        let w = array_rows(&oracle(s.clone()), "t", &schema, &ai, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}, &|_| {}).await;
+        assert!(w.result.is_ok(), "{:?}", w.result.err());
+        assert_eq!(w.rows, 2_500);
+        assert_eq!(s.inserts.lock().iter().sum::<usize>(), 2_500);
+        assert!(s.arrays.lock().is_empty());
+    }
+
+    /// A failed array INSERT ends the load with its error; the calls before
+    /// it count as written.
+    #[tokio::test]
+    async fn a_failed_array_insert_stops_the_load() {
+        let s = Arc::new(OracleLike { nls: Some(".,"), fail_at: Some(2), ..Default::default() });
+        let (schema, held) = batches(25_000, 2000);
+        let ai = sqlgen::ArrayInsert::new(ConnectorKind::Oracle, "t", &schema).unwrap();
+        let w = array_rows(&oracle(s.clone()), "t", &schema, &ai, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}, &|_| {}).await;
+        assert!(w.result.is_err_and(|e| e.message.contains("ORA-01722") && e.message.contains("(in rows 10,001 to 20,000 of the step's rows)")));
+        assert_eq!(w.rows, 10_000);
+        assert_eq!(*s.arrays.lock(), vec![10_000]);
+    }
+
+    /// Numbers go with the session's decimal separator; a step's own size
+    /// caps the calls; the run log says "array INSERTs" once one went in, or
+    /// why not; a separator that can't be read gets INSERT ALLs.
+    #[tokio::test]
+    async fn oracle_array_calls_follow_the_session_and_the_step() {
+        use databrain_connector_core::arrow::array::Float64Array;
+        use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(vec![2.5, 1.0, 0.125]))]).unwrap();
+        let ai = sqlgen::ArrayInsert::new(ConnectorKind::Oracle, "t", &schema).unwrap();
+        let notes = parking_lot::Mutex::new(Vec::<String>::new());
+        let note = |m: String| notes.lock().push(m);
+        // A German session.
+        let s = Arc::new(OracleLike { nls: Some(",."), ..Default::default() });
+        let w = array_rows(&oracle(s.clone()), "t", &schema, &ai, Feed { held: [batch.clone()].iter(), rest: None }, &CancellationToken::new(), &|_| {}, &note)
+            .await;
+        assert!(w.result.is_ok());
+        assert_eq!(s.calls.lock()[0][0], vec![Some("2,5".into()), Some("1,0".into()), Some("0,125".into())]);
+        assert!(notes.lock()[0].starts_with("array INSERTs, up to 10,000 rows"), "{:?}", notes.lock());
+        // The step's own 2 rows per INSERT: calls of 2 rows.
+        let s = Arc::new(OracleLike { nls: Some(".,"), ..Default::default() });
+        let p = Prepared { batch_from_step: true, batch: sqlgen::BatchSize { rows: 2, bytes: 1 << 20 }, ..oracle(s.clone()) };
+        array_rows(&p, "t", &schema, &ai, Feed { held: [batch.clone()].iter(), rest: None }, &CancellationToken::new(), &|_| {}, &|_| {}).await;
+        assert_eq!(*s.arrays.lock(), vec![2, 1]);
+        // The separator can't be read: INSERT ALLs, and the log says why.
+        notes.lock().clear();
+        let s = Arc::new(OracleLike::default());
+        let w = array_rows(&oracle(s.clone()), "t", &schema, &ai, Feed { held: [batch].iter(), rest: None }, &CancellationToken::new(), &|_| {}, &note).await;
+        assert_eq!(w.rows, 3);
+        assert!(s.arrays.lock().is_empty() && s.inserts.lock().iter().sum::<usize>() == 3);
+        assert!(notes.lock()[0].contains("decimal separator couldn't be read"), "{:?}", notes.lock());
+    }
+
+    #[test]
+    fn failing_rows_are_named_among_the_steps_rows() {
+        assert_eq!(name_failing_row("ORA-01722: invalid number", 20_000, 10_000), "ORA-01722: invalid number (in rows 20,001 to 30,000 of the step's rows)");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+        assert_eq!(grouped(999), "999");
     }
 
     /// What counts as refused for its size (sent again smaller), and what doesn't.

@@ -26,7 +26,9 @@ pub const PROTOCOL: &str = "1";
 ///        statement on a context of its own (it was rolled back after each
 ///        request, so every statement reconnected), and DBMS_OUTPUT is read
 ///        after a block or CALL (`output` in the exec reply).
-pub const RELEASE: &str = "0.1.4";
+/// 0.1.5: `execmany`, one INSERT with every row's values bound as arrays
+///        (array DML) for loads.
+pub const RELEASE: &str = "0.1.5";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].
@@ -52,6 +54,8 @@ pub fn set_dir(dir: Option<PathBuf>) {
 /// The largest frame the helper sends (`maxFrame` in agent/main.go): it
 /// refuses a row larger than this rather than wrap the 32-bit length.
 const MAX_FRAME: usize = 1 << 30;
+/// Largest request the helper reads (`maxRequest` in main.go).
+pub const MAX_REQUEST: usize = 64 << 20;
 
 /// Override the download location (setting / `DATABRAIN_ORACLE_AGENT_URL`).
 pub fn set_base_url(url: Option<String>) {

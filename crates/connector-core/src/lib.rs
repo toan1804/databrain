@@ -296,6 +296,22 @@ pub trait Session: Send + Sync {
         Ok(None)
     }
 
+    /// Rows inserted by one prepared INSERT with arrays of bound values
+    /// (array DML), when the session can: `sql` has one placeholder per
+    /// column in the session's style (Oracle `:1`), `columns[i]` holds all
+    /// of column `i`'s values as text (`None`: NULL). Rows inserted;
+    /// `Ok(None)` when the session has no array binding. A call that fails
+    /// keeps none of its rows.
+    async fn insert_array(&self, _sql: &str, _columns: Vec<Vec<Option<String>>>, _cancel: CancellationToken) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Whether [`Self::insert_array`] may insert, so a load doesn't prepare
+    /// its rows for a session that can't.
+    fn insert_array_possible(&self) -> bool {
+        false
+    }
+
     /// Whether [`Self::bulk_load`] may give a writer, so a load doesn't
     /// prepare one (read the table's column types) for a session that has
     /// none: Databricks only with a staging volume.

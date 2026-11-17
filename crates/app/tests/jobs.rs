@@ -354,6 +354,104 @@ async fn load_into_server_databases() {
     .await;
 }
 
+/// Live (DATABRAIN_ORACLE_HOST, _PASSWORD; thin driver): a load into Oracle
+/// goes in array INSERTs, and the table ends up exactly as with INSERT ALLs:
+/// the same rows of every type, loaded both ways and compared.
+#[tokio::test(flavor = "multi_thread")]
+async fn oracle_array_loads_write_what_inserts_do() {
+    guarded(async {
+        let Ok(host) = std::env::var("DATABRAIN_ORACLE_HOST") else { return };
+        let st = state();
+        let mut c =
+            ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: std::env::var("DATABRAIN_ORACLE_USER").unwrap_or("system".into()) });
+        c.host = Some(host);
+        c.port = std::env::var("DATABRAIN_ORACLE_PORT").ok().and_then(|p| p.parse().ok());
+        c.options.insert("service_name".into(), std::env::var("DATABRAIN_ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".into()));
+        let id = api::save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "ora".into(),
+                    config: c,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: true,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: std::env::var("DATABRAIN_ORACLE_PASSWORD").ok(),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+        .id;
+        let src = "select i::bigint as id, \
+                   case when i % 7 = 0 then null else 'n' || i || ' it''s ünï' end as name, \
+                   i % 2 = 0 as ok, \
+                   case when i = 5 then 'nan'::double when i = 6 then 'inf'::double else i / 7.0 end as f, \
+                   (i / 3)::decimal(12, 3) as amount, \
+                   date '2026-01-01' + (i % 400)::int as d, \
+                   timestamp '2026-01-01 10:00:00.123456' + to_microseconds(i::bigint * 1000) as ts, \
+                   to_timestamp(1767254400 + i) as tz, \
+                   case when i % 5 = 0 then null else from_hex(printf('%04x', i)) end as b \
+                   from range(25000) t(i)";
+        let drop = |t: &str| {
+            let (st, id, sql) = (&st, id.clone(), format!(r#"drop table "{t}" purge"#));
+            async move {
+                let s = st.engine.session_for_tests(&id).await.unwrap();
+                if let Ok(r) = s.execute(databrain_connector_core::Statement::internal(&sql), Default::default()).await {
+                    let _ = r.collect().await;
+                }
+            }
+        };
+        for (table, insert_only) in [("dbr_arr_a", false), ("dbr_arr_i", true)] {
+            drop(table).await;
+            let job = load_job(&st, &id, table, src, |n| {
+                n.load_mode = LoadMode::Append;
+                n.load_insert_only = insert_only;
+            });
+            let run = run_all(&st, &job).await;
+            assert_eq!(run.status, "success", "{table}: {run:?}");
+            assert_eq!(step(&run, "loaded").rows, Some(25_000), "{table}");
+            let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+            assert_eq!(
+                log.iter().any(|l| l.message.contains("array INSERTs")),
+                !insert_only,
+                "{table}: {:#?}",
+                log.iter().map(|l| &l.message).collect::<Vec<_>>()
+            );
+        }
+        // The load created the tables with the names as written: quoted lowercase.
+        let dump = |t: &str| {
+            format!(
+                r#"select "id", dbms_lob.substr("name", 200, 1) as name, "ok", to_char("f", 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,'''),
+                   to_char("amount", 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,'''), to_char("d", 'YYYY-MM-DD HH24:MI:SS'),
+                   to_char("ts", 'YYYY-MM-DD HH24:MI:SS.FF6'), to_char("tz", 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM'),
+                   rawtohex(dbms_lob.substr("b", 100, 1)) as b from "{t}""#
+            )
+        };
+        // Every row, compared in Oracle: none in one table and not the other.
+        let (a, i) = (dump("dbr_arr_a"), dump("dbr_arr_i"));
+        let differ = rows(&st, &id, &format!("select count(*) from (({a} minus {i}) union all ({i} minus {a}))")).await;
+        assert_eq!(differ[0][0], "0", "array INSERTs and INSERT ALLs wrote different rows");
+        let count = rows(&st, &id, &format!("select count(*) from ({a})")).await;
+        assert_eq!(count[0][0], "25000");
+        // And a few rows look as they should (NaN and inf: NULL, as the INSERTs write them).
+        let some = rows(&st, &id, &format!(r#"select * from ({a}) where "id" in (5, 6, 7) order by "id""#)).await;
+        assert_eq!(some.len(), 3);
+        assert_eq!((some[0][3].as_str(), some[1][3].as_str()), ("", ""), "{some:?}");
+        assert_eq!(some[2][1], "", "id 7: a NULL name");
+        for t in ["dbr_arr_a", "dbr_arr_i"] {
+            drop(t).await;
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn export_steps_write_files_with_duckdb() {
     guarded(async {

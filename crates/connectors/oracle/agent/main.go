@@ -12,6 +12,9 @@
 //	          6 timestamp µs (UTC instant), 7 bool
 //	  i64/f64/µs: 8 bytes little-endian; text/bytes: u32 LE length + bytes; bool: 1 byte
 //
+// {"op":"execmany","sql":…,"columns":[[…],…]} runs one INSERT with every
+// column's values (null: NULL) bound as arrays (array DML), all or nothing.
+//
 // Requests run one at a time, except {"op":"cancel","target":id}, which
 // cancels the running request (go-ora sends a break to the server).
 // The password arrives over stdin, never on the command line.
@@ -67,6 +70,9 @@ type request struct {
 	// exec: read DBMS_OUTPUT afterwards ("output" in the reply).
 	Output bool `json:"output,omitempty"`
 
+	// execmany: every column's values (nil: NULL), bound as arrays to SQL.
+	Columns [][]*string `json:"columns,omitempty"`
+
 	// db_type shown for columns converted to text by a retry (by position).
 	labels map[int]string
 }
@@ -118,13 +124,18 @@ func (w *writer) json(v any) error {
 	return w.frame('J', b)
 }
 
+// maxRequest is the largest request handled (MAX_REQUEST in src/agent.rs):
+// a larger one is read up to maxFrame and answered with an error, so the
+// helper goes on instead of losing its place in the stream.
+var maxRequest = 64 << 20
+
 func readFrame(r *bufio.Reader) (byte, []byte, error) {
 	var h [5]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
 		return 0, nil, err
 	}
 	n := binary.BigEndian.Uint32(h[:4])
-	if n > 64<<20 {
+	if int64(n) > int64(maxFrame) {
 		return 0, nil, fmt.Errorf("frame too large: %d", n)
 	}
 	b := make([]byte, n)
@@ -1066,6 +1077,39 @@ func (s *session) exec(ctx context.Context, w *writer, r *request) error {
 	return w.json(reply)
 }
 
+// execMany runs r.SQL once with every row's values bound as arrays (array
+// DML: one round trip for all of them), as text the session reads (DataBrain
+// writes numbers with its decimal separator). A failed call is rolled back,
+// so it keeps none of its rows: the rows before the failing one would
+// otherwise commit with the next statement.
+func (s *session) execMany(ctx context.Context, w *writer, r *request) error {
+	if s.ro {
+		return errors.New("This connection is read-only")
+	}
+	args := make([]any, len(r.Columns))
+	for i, col := range r.Columns {
+		values := make([]sql.NullString, len(col))
+		for j, v := range col {
+			if v != nil {
+				values[j] = sql.NullString{String: *v, Valid: true}
+			}
+		}
+		args[i] = values
+	}
+	res, err := s.conn.ExecContext(ctx, r.SQL, args...)
+	if err != nil {
+		if !lostConn(err) {
+			_, _ = s.conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+		return err
+	}
+	reply := map[string]any{"id": r.ID, "type": "done"}
+	if n, err := res.RowsAffected(); err == nil {
+		reply["rows_affected"] = n
+	}
+	return w.json(reply)
+}
+
 func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 	switch r.Op {
 	case "hello":
@@ -1099,6 +1143,8 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		return s.withReconnect(ctx, w, r, func() error { return s.textQuery(ctx, w, r) })
 	case "exec":
 		return s.withReconnect(ctx, w, r, func() error { return s.exec(ctx, w, r) })
+	case "execmany":
+		return s.execMany(ctx, w, r)
 	}
 	return fmt.Errorf("unknown op %q", r.Op)
 }
@@ -1169,6 +1215,15 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 				return
 			}
 			if kind != 'J' {
+				continue
+			}
+			if len(b) > maxRequest {
+				// Only its id is read, to answer it.
+				var head struct {
+					ID uint64 `json:"id"`
+				}
+				_ = json.Unmarshal(b, &head)
+				_ = w.json(map[string]any{"id": head.ID, "type": "error", "message": fmt.Sprintf("a request of %d MB is larger than the %d MB the Oracle driver takes", len(b)>>20, maxRequest>>20)})
 				continue
 			}
 			r := new(request)
