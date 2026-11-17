@@ -699,8 +699,14 @@ pub const DATABRICKS: SourceTraits = SourceTraits {
     syntax: SqlSyntax { backslash_escapes: true, backslash_in_double_quotes: true, backtick: true, raw_strings: true, ..STANDARD_SYNTAX },
     load: Some(LoadTraits {
         types: TypeNames { decimal: "DECIMAL(38, 10)", binary: "BINARY", text: "STRING", ..STANDARD_TYPES },
+        // Each INSERT is a Delta commit taking seconds whatever its size:
+        // few large ones load far faster than many small ones.
+        default_rows: 10_000,
+        max_rows: 100_000,
+        rows_note: "each INSERT is one Delta commit; an INSERT the warehouse refuses as too large is split in two",
+        default_bytes: 8 * MB,
         max_bytes: 16 * MB,
-        bytes_note: "the warehouse rejects requests past its message size; lower this if large inserts fail",
+        bytes_note: "the SQL Statement Execution API takes statements up to 16 MB",
         binary_literal: "unhex('{}')",
         text_literal: TextLiteral::BackslashEscaped,
         stage: StageTable::Regular,
