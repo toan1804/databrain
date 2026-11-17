@@ -12,6 +12,9 @@
 //	          6 timestamp µs (UTC instant), 7 bool
 //	  i64/f64/µs: 8 bytes little-endian; text/bytes: u32 LE length + bytes; bool: 1 byte
 //
+// {"op":"execmany","sql":…,"columns":[[…],…]} runs one INSERT with every
+// column's values (null: NULL) bound as arrays (array DML), all or nothing.
+//
 // Requests run one at a time, except {"op":"cancel","target":id}, which
 // cancels the running request (go-ora sends a break to the server).
 // The password arrives over stdin, never on the command line.
@@ -66,6 +69,9 @@ type request struct {
 	MaxRows   int                `json:"max_rows,omitempty"`
 	// exec: read DBMS_OUTPUT afterwards ("output" in the reply).
 	Output bool `json:"output,omitempty"`
+
+	// execmany: every column's values (nil: NULL), bound as arrays to SQL.
+	Columns [][]*string `json:"columns,omitempty"`
 
 	// db_type shown for columns converted to text by a retry (by position).
 	labels map[int]string
@@ -1066,6 +1072,50 @@ func (s *session) exec(ctx context.Context, w *writer, r *request) error {
 	return w.json(reply)
 }
 
+// execMany runs r.SQL once with every row's values bound as arrays (array
+// DML: one round trip for all of them). Numbers are text read with "." as
+// the decimal separator, whatever the session's NLS settings (put back
+// afterwards). A failed call is rolled back, so it keeps none of its rows:
+// the rows before the failing one would otherwise commit with the next
+// statement.
+func (s *session) execMany(ctx context.Context, w *writer, r *request) error {
+	if s.ro {
+		return errors.New("This connection is read-only")
+	}
+	var previous string
+	_ = s.conn.QueryRowContext(ctx, "SELECT value FROM nls_session_parameters WHERE parameter = 'NLS_NUMERIC_CHARACTERS'").Scan(&previous)
+	if _, err := s.conn.ExecContext(ctx, "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'"); err != nil {
+		return err
+	}
+	defer func() {
+		if len([]rune(previous)) == 2 && !strings.ContainsRune(previous, '\'') {
+			_, _ = s.conn.ExecContext(context.Background(), "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '"+previous+"'")
+		}
+	}()
+	args := make([]any, len(r.Columns))
+	for i, col := range r.Columns {
+		values := make([]sql.NullString, len(col))
+		for j, v := range col {
+			if v != nil {
+				values[j] = sql.NullString{String: *v, Valid: true}
+			}
+		}
+		args[i] = values
+	}
+	res, err := s.conn.ExecContext(ctx, r.SQL, args...)
+	if err != nil {
+		if !lostConn(err) {
+			_, _ = s.conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+		return err
+	}
+	reply := map[string]any{"id": r.ID, "type": "done"}
+	if n, err := res.RowsAffected(); err == nil {
+		reply["rows_affected"] = n
+	}
+	return w.json(reply)
+}
+
 func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 	switch r.Op {
 	case "hello":
@@ -1099,6 +1149,8 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		return s.withReconnect(ctx, w, r, func() error { return s.textQuery(ctx, w, r) })
 	case "exec":
 		return s.withReconnect(ctx, w, r, func() error { return s.exec(ctx, w, r) })
+	case "execmany":
+		return s.execMany(ctx, w, r)
 	}
 	return fmt.Errorf("unknown op %q", r.Op)
 }

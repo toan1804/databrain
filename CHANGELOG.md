@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Changed
+
+- **Faster loads into Oracle:** job loads, "Load into…" and "Generate and load" send the rows as arrays bound to one INSERT (array DML, up to 10,000 rows a round trip) instead of `INSERT ALL`s of 100 rows: about 8× faster on a local server, more over a network. The table ends up the same (dates and times through explicit formats, numbers read with `.` whatever the session's NLS settings); a failed call keeps none of its rows, as a failed `INSERT ALL` doesn't; a step set to INSERTs only still gets `INSERT ALL`s. The thin driver needs its helper 0.1.5 (downloaded on first use, as before).
+
 ## 0.4.4 - 2026-11-18
 
 ### Added

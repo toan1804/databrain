@@ -308,6 +308,7 @@ fn export_and_load(s: &mut Suite) {
         databrain_export::load::insert_statements(ConnectorKind::Postgres, "app.orders", &schema, &data).map(|v| v.len()).expect("inserts")
     });
     let (stage_schema, stage_data) = (copy_schema.clone(), copy_data.clone());
+    let (array_schema, array_data) = (copy_schema.clone(), copy_data.clone());
     s.add("pg_copy_100k_rows", "a Postgres load writes its COPY data", 1500, rows, move || {
         let c = databrain_export::load::PgCopy::new("app.orders", &copy_schema);
         let mut bytes = 0;
@@ -319,6 +320,18 @@ fn export_and_load(s: &mut Suite) {
             }
         }
         bytes
+    });
+    s.add("oracle_array_100k_rows", "an Oracle load writes its bound arrays", 1500, rows, move || {
+        let ai = databrain_export::load::ArrayInsert::new(ConnectorKind::Oracle, "app.orders", &array_schema).expect("oracle");
+        let mut values = 0;
+        for b in &array_data {
+            let mut at = 0;
+            while let Some((cols, n)) = ai.next(b, at, 10_000, 32 << 20).expect("array") {
+                values += cols.iter().map(Vec::len).sum::<usize>();
+                at += n;
+            }
+        }
+        values
     });
     s.add("dbx_stage_100k_rows", "a Databricks bulk load writes its Parquet files", 1500, rows, move || {
         let types: Vec<String> = stage_schema.fields().iter().map(|f| databrain_export::load::column_type(ConnectorKind::Databricks, f).to_string()).collect();

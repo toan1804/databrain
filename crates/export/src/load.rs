@@ -714,6 +714,95 @@ fn pg_copy_value(out: &mut Vec<u8>, cell: Option<&str>, kind: Lit) {
     }
 }
 
+/// Each column's values as text (`None`: NULL), for an [`ArrayInsert`].
+pub type Columns = Vec<Vec<Option<String>>>;
+
+/// One INSERT with a placeholder per column, run with arrays of values
+/// (Oracle array DML), and the rows as those arrays: each value as the
+/// text its INSERT literal stands for, turned into its type in the SQL
+/// with explicit formats, so the table ends up as with the INSERTs
+/// whatever the session's language settings (the session fixes the
+/// decimal separator while it runs, see `Session::insert_array`).
+pub struct ArrayInsert {
+    kinds: Vec<Lit>,
+    /// `INSERT INTO table (cols) VALUES (:1, TO_DATE(:2, …), …)`.
+    pub sql: String,
+}
+
+impl ArrayInsert {
+    /// For a dialect with array binding (Oracle); `None` otherwise.
+    pub fn new(dialect: ConnectorKind, table: &str, schema: &SchemaRef) -> Option<Self> {
+        if dialect != ConnectorKind::Oracle {
+            return None;
+        }
+        let values: Vec<String> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let p = format!(":{}", i + 1);
+                match (lit_kind(f), f.data_type()) {
+                    (Lit::Date, DataType::Date32) => format!("TO_DATE({p}, 'YYYY-MM-DD')"),
+                    // A Date64 shows its time: a timestamp, as its literal is.
+                    (Lit::Date | Lit::Timestamp, _) => format!("TO_TIMESTAMP({p}, 'YYYY-MM-DD HH24:MI:SS.FF')"),
+                    (Lit::TimestampTz, _) => format!("TO_TIMESTAMP_TZ({p}, 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')"),
+                    (Lit::Binary, _) => format!("HEXTORAW({p})"),
+                    _ => p,
+                }
+            })
+            .collect();
+        Some(Self {
+            kinds: schema.fields().iter().map(|f| lit_kind(f)).collect(),
+            sql: format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                quote_path(dialect, table),
+                schema.fields().iter().map(|f| quote_ident(dialect, f.name())).collect::<Vec<_>>().join(", "),
+                values.join(", ")
+            ),
+        })
+    }
+
+    /// Rows `start..` of `batch` as one array per column, at most `max_rows`
+    /// rows and about `max_bytes` of text (at least one row), and how many
+    /// rows they hold. `None` past the end.
+    pub fn next(&self, batch: &RecordBatch, start: usize, max_rows: usize, max_bytes: usize) -> Result<Option<(Columns, usize)>> {
+        if start >= batch.num_rows() {
+            return Ok(None);
+        }
+        let fopts = format_options();
+        let fmts: Vec<ArrayFormatter<'_>> =
+            batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
+        let mut cols: Vec<Vec<Option<String>>> = vec![Vec::new(); batch.num_columns()];
+        let (mut bytes, mut n) = (0usize, 0usize);
+        for r in start..batch.num_rows() {
+            if n > 0 && (n >= max_rows || bytes >= max_bytes) {
+                break;
+            }
+            for ((col, (a, f)), k) in cols.iter_mut().zip(batch.columns().iter().zip(&fmts)).zip(&self.kinds) {
+                let cell = (!a.is_null(r)).then(|| f.value(r).to_string());
+                let v = oracle_text(cell.as_deref(), *k);
+                bytes += v.as_ref().map_or(0, String::len);
+                col.push(v);
+            }
+            n += 1;
+        }
+        Ok(Some((cols, n)))
+    }
+}
+
+/// A value as the text its Oracle INSERT literal stands for (`None`: NULL):
+/// NaN/±inf NULL (as the INSERT writes them), booleans `1`/`0`, binary as
+/// hex, a time zone's offset after a space (as `TO_TIMESTAMP_TZ` reads it).
+fn oracle_text(cell: Option<&str>, kind: Lit) -> Option<String> {
+    let s = cell?;
+    match kind {
+        Lit::Number | Lit::Float if non_finite(s).is_some() => None,
+        Lit::Bool => Some(if s.eq_ignore_ascii_case("true") { "1" } else { "0" }.to_string()),
+        Lit::TimestampTz => Some(spaced_offset(s)),
+        _ => Some(s.to_string()),
+    }
+}
+
 /// Rows for a Databricks bulk load: Parquet files of text columns `c0`,
 /// `c1`, … holding each value as the text its INSERT literal stands for
 /// (NULL for NaN/±inf, which the INSERT writes as NULL, booleans as
@@ -1070,6 +1159,63 @@ mod tests {
         assert_eq!(edit_literal(&f, Some(" -inf "), K::Postgres).unwrap(), "'-Infinity'::float8");
         assert_eq!(edit_literal(&f, Some(" 2.5 "), K::Mssql).unwrap(), "2.5");
         assert!(edit_literal(&Field::new("n", DataType::Int64, true), Some("inf"), K::Postgres).is_err());
+    }
+
+    /// Oracle array INSERTs: each value as its INSERT literal's text, turned
+    /// into its type with explicit formats in the SQL.
+    #[test]
+    fn oracle_array_insert_binds_the_literals_text() {
+        use databrain_connector_core::arrow::array::{BinaryArray, Date32Array, Date64Array, Float64Array, TimestampMicrosecondArray};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ok", DataType::Boolean, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("d", DataType::Date32, true),
+            Field::new("d64", DataType::Date64, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+            Field::new("tz", DataType::Timestamp(TimeUnit::Microsecond, Some("+02:00".into())), true),
+            Field::new("b", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("it's"), None])),
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+                Arc::new(Float64Array::from(vec![Some(2.5), Some(f64::NAN)])),
+                Arc::new(Date32Array::from(vec![Some(20_000), None])),
+                Arc::new(Date64Array::from(vec![Some(1_700_000_000_000), None])),
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(1_700_000_000_123_456), None])),
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(1_700_000_000_000_000), None]).with_timezone("+02:00")),
+                Arc::new(BinaryArray::from(vec![Some(&b"\x00\xff"[..]), None])),
+            ],
+        )
+        .unwrap();
+        assert!(ArrayInsert::new(ConnectorKind::Postgres, "t", &schema).is_none(), "Oracle only");
+        let ai = ArrayInsert::new(ConnectorKind::Oracle, "app.t", &schema).unwrap();
+        assert_eq!(
+            ai.sql,
+            "INSERT INTO \"app\".\"t\" (\"id\", \"name\", \"ok\", \"f\", \"d\", \"d64\", \"ts\", \"tz\", \"b\") VALUES (:1, :2, :3, :4, \
+             TO_DATE(:5, 'YYYY-MM-DD'), TO_TIMESTAMP(:6, 'YYYY-MM-DD HH24:MI:SS.FF'), TO_TIMESTAMP(:7, 'YYYY-MM-DD HH24:MI:SS.FF'), \
+             TO_TIMESTAMP_TZ(:8, 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), HEXTORAW(:9))"
+        );
+        let (cols, n) = ai.next(&batch, 0, 10, MB).unwrap().unwrap();
+        assert_eq!(n, 2);
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(cols[0], vec![s("1"), s("2")]);
+        assert_eq!(cols[1], vec![s("it's"), None], "text as it is: no SQL quoting");
+        assert_eq!(cols[2], vec![s("1"), s("0")], "booleans as Oracle's INSERT writes them");
+        assert_eq!(cols[3], vec![s("2.5"), None], "NaN: NULL, as the INSERT writes it");
+        assert_eq!(cols[4], vec![s("2024-10-04"), None]);
+        assert!(cols[5][0].as_deref().is_some_and(|v| v.starts_with("2023-11-14 ")), "{:?}", cols[5]);
+        assert_eq!(cols[6][0].as_deref(), Some("2023-11-14 22:13:20.123456"));
+        assert!(cols[7][0].as_deref().is_some_and(|v| v.ends_with(" +02:00")), "the offset after a space: {:?}", cols[7]);
+        assert_eq!(cols[8], vec![s("00ff"), None]);
+        // At most `max_rows`, or about `max_bytes` (at least one row).
+        assert_eq!(ai.next(&batch, 0, 1, MB).unwrap().unwrap().1, 1);
+        assert_eq!(ai.next(&batch, 0, 10, 1).unwrap().unwrap().1, 1);
+        assert!(ai.next(&batch, 2, 10, MB).unwrap().is_none());
     }
 
     /// A Databricks bulk load: one INSERT … SELECT casting each text column
