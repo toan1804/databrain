@@ -10,7 +10,7 @@
 
 ## Releasing the app
 
-Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release, whose description is the version's section of `CHANGELOG.md` (`scripts/release-notes.mjs`; the same text goes into `latest.json`). Add the `## X.Y.Z - date` heading over the Unreleased entries in the release commit, or the release has no description. Publish the draft; running apps then see it in their update check (and, with an updater key, `latest.json` for in-app updates). The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
+Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release, whose description is the version's section of `CHANGELOG.md` (`scripts/release-notes.mjs`; the same text goes into `latest.json`). Add the `## X.Y.Z - date` heading over the Unreleased entries in the release commit, or the release has no description. Publish the draft; running apps then see it in their update check (and, with an updater key, `latest.json` for in-app updates). The CI workflow builds and tests every push to main on macOS, Linux and Windows (pull requests run the other checks: cargo deny, MSRV, speed budgets, UI smoke tests and live databases; run the tests on a branch with "Run workflow"). Before tagging, check that main's last CI run passed.
 
 ## Speed check before a release
 
