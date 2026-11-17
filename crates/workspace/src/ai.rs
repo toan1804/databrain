@@ -222,6 +222,29 @@ impl Workspace {
         )?)
     }
 
+    /// Credits (Kiro bills credits, not tokens) reported for a provider
+    /// since `since_ms`, conversations and other calls alike
+    /// ([`Self::record_ai_credits`]). Kept when the conversation is deleted:
+    /// they were spent.
+    pub fn ai_credit_total(&self, provider_id: &str, since_ms: i64) -> Result<f64> {
+        let c = self.conn.lock();
+        Ok(c.query_row("SELECT COALESCE(SUM(credits), 0) FROM ai_usage WHERE provider_id = ?1 AND created_at >= ?2", params![provider_id, since_ms], |r| {
+            r.get(0)
+        })?)
+    }
+
+    /// Credits a turn or call spent (`feature`: `chat`, `test_data`).
+    pub fn record_ai_credits(&self, provider_id: &str, feature: &str, credits: f64) -> Result<()> {
+        if !(credits.is_finite() && credits > 0.0) {
+            return Ok(());
+        }
+        self.conn.lock().execute(
+            "INSERT INTO ai_usage (provider_id, feature, tokens_in, tokens_out, credits, created_at) VALUES (?1, ?2, 0, 0, ?3, ?4)",
+            params![provider_id, feature, credits, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Tokens of an AI call outside a conversation (`feature`: `inline`,
     /// `test_data`), so the provider's usage counts it.
     pub fn record_ai_usage(&self, provider_id: &str, feature: &str, tokens_in: u32, tokens_out: u32) -> Result<()> {
@@ -350,6 +373,17 @@ mod tests {
         assert_eq!(ws.ai_token_totals("p1", i64::MAX).unwrap(), (0, 0));
         let n: i64 = ws.conn.lock().query_row("SELECT COUNT(*) FROM ai_usage", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2, "nothing recorded for a call without tokens");
+        // Credits (Kiro): per provider and since a time; none or nonsense isn't kept.
+        assert_eq!(ws.ai_credit_total("p1", 0).unwrap(), 0.0);
+        ws.record_ai_credits("p1", "chat", 0.25).unwrap();
+        ws.record_ai_credits("p1", "test_data", 0.5).unwrap();
+        ws.record_ai_credits("p2", "chat", 1.0).unwrap();
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            ws.record_ai_credits("p1", "chat", bad).unwrap();
+        }
+        assert_eq!(ws.ai_credit_total("p1", 0).unwrap(), 0.75);
+        assert_eq!(ws.ai_credit_total("p1", i64::MAX).unwrap(), 0.0);
+        assert_eq!(ws.ai_token_totals("p1", 0).unwrap(), (140, 920), "credits add no tokens");
         // Retention: conversations idle for longer than the setting are deleted with their messages.
         assert_eq!(ws.ai_history_retention_days(), Some(30));
         ws.conn.lock().execute("UPDATE ai_sessions SET updated_at = ?1 WHERE id = ?2", rusqlite::params![crate::now_ms() - 31 * 86_400_000, a.id]).unwrap();

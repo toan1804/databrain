@@ -541,6 +541,9 @@ async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
     let msgs = f.ws.list_ai_messages(&sid).unwrap();
     assert_eq!(msgs.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(), vec!["user", "assistant"]);
     assert_eq!(f.ws.get_setting(&format!("kiro_session:{sid}")).unwrap(), Some(json!("kiro-sess-1")));
+    // Kiro bills credits, not tokens: the turn's credits count in the provider's usage.
+    assert_eq!(f.ws.ai_credit_total(&rec.id, 0).unwrap(), 0.25);
+    assert_eq!(f.ws.ai_token_totals(&rec.id, 0).unwrap(), (0, 0));
 
     // Models come from the ACP session.
     let (p, _, _) = databrain_ai::provider_for(&rec, f.secrets.clone()).unwrap();
@@ -601,6 +604,8 @@ async fn kiro_writes_test_data_without_tools() {
     assert_eq!(lines.iter().find(|l| l.get("argv").is_some()).unwrap()["argv"], json!(["acp", "--agent", "databrain-sql"]));
     let plain = lines.iter().find(|l| l.get("plain").is_some()).expect("a plain prompt");
     assert!(plain["prompt"].as_str().unwrap().contains("email"), "{plain}");
+    // Its credits count in the provider's usage.
+    assert_eq!(f.ws.ai_credit_total(&rec.id, 0).unwrap(), 0.5);
 }
 
 /// Live: `KIRO_API_KEY=ksk_… cargo test -p databrain-ai --test agent_e2e kiro_live -- --ignored --nocapture`

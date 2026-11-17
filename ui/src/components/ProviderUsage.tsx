@@ -27,6 +27,12 @@ const resetText = (d: string) => {
   return Number.isNaN(t.getTime()) ? d : t.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 };
 
+/** Credits as Kiro shows them: two decimals, no trailing zeros. */
+export const creditText = (c: number) => {
+  const n = Number(c.toFixed(2));
+  return `${n} ${n === 1 ? "credit" : "credits"}`;
+};
+
 /** Budget, token totals and links, for Settings and the panel popover. */
 export function UsageDetails({ providerId, usage, error, loading }: { providerId: string; usage?: ProviderUsage; error?: string; loading: boolean }) {
   const load = useAi((s) => s.loadUsage);
@@ -54,15 +60,26 @@ export function UsageDetails({ providerId, usage, error, loading }: { providerId
       {(usage?.budget_error || error) && <p className="text-[11px] text-danger">Couldn't read the budget: {usage?.budget_error ?? error}</p>}
       {usage && (
         <div className="space-y-0.5 border-t border-line pt-1.5 text-[11.5px]">
-          <div className="flex justify-between">
-            <span className="text-muted">Tokens today</span>
-            <span className="font-mono">{tok(usage.tokens_today)}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-muted">Tokens this month</span>
-            <span className="font-mono">{tok(usage.tokens_month)}</span>
-          </div>
-          <p className="text-[10.5px] text-muted">Counted from DataBrain's conversations, as the provider reports them (Kiro reports credits, not tokens).</p>
+          {(usage.bills_credits
+            ? [
+                ["Credits today", creditText(usage.credits_today)],
+                ["Credits this month", creditText(usage.credits_month)],
+              ]
+            : [
+                ["Tokens today", tok(usage.tokens_today)],
+                ["Tokens this month", tok(usage.tokens_month)],
+              ]
+          ).map(([k, v]) => (
+            <div key={k} className="flex justify-between">
+              <span className="text-muted">{k}</span>
+              <span className="font-mono">{v}</span>
+            </div>
+          ))}
+          <p className="text-[10.5px] text-muted">
+            {usage.bills_credits
+              ? "Counted from DataBrain's conversations and test data, as Kiro reports them (it bills credits, not tokens)."
+              : "Counted from DataBrain's conversations, as the provider reports them."}
+          </p>
         </div>
       )}
       {b?.manage_url && (

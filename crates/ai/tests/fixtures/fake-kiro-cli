@@ -64,6 +64,7 @@ while True:
             # A plain prompt (test data): no tools offered; answer FAKE_KIRO_REPLY.
             log.write(json.dumps({"plain": True, "prompt": prompt}) + "\n"); log.flush()
             out({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": os.environ.get("FAKE_KIRO_REPLY", "ok")}}}})
+            out({"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {"sessionId": sid, "meteringUsage": [{"unit": "credit", "value": 0.5}]}})
             out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
             continue
         facts = {"context_block": "[DataBrain context]" in prompt}
@@ -85,6 +86,8 @@ while True:
         log.write(json.dumps(facts) + "\n"); log.flush()
         for chunk in ["Tables: ", facts["list_tables"].replace("\n", ", ")]:
             out({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": chunk}}}})
+            # Credits come as the turn goes, each update what it spent (other units aren't credits).
+            out({"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": {"sessionId": sid, "meteringUsage": [{"unit": "credit", "value": 0.125}, {"unit": "other", "value": 9}], "contextUsagePercentage": 3}})
         out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
     elif method == "session/cancel":
         pass

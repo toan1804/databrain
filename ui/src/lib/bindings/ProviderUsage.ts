@@ -20,4 +20,12 @@ budget_supported: boolean,
 /**
  * Tokens (input, output) of DataBrain's conversations with it.
  */
-tokens_today: [number, number], tokens_month: [number, number], };
+tokens_today: [number, number], tokens_month: [number, number], 
+/**
+ * The provider bills credits, not tokens (Kiro): shown instead of tokens.
+ */
+bills_credits: boolean, 
+/**
+ * Credits it reported for DataBrain's conversations and other calls.
+ */
+credits_today: number, credits_month: number, };

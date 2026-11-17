@@ -685,7 +685,8 @@ impl Agent {
             let previous = ws.get_setting(&key).ok().flatten().and_then(|v| v.as_str().map(str::to_string));
             let ws2 = ws.clone();
             let prompt = format!("[DataBrain context]\n{system}\n[/DataBrain context]\n\n{}", messages.last().map(|m| m.text.clone()).unwrap_or_default());
-            let text = kiro
+            let meter = crate::meter::Meter::default();
+            let turn = kiro
                 .run_turn(crate::kiro::KiroTurn {
                     session_id: sid.clone(),
                     run_id: run_id.clone(),
@@ -699,8 +700,15 @@ impl Agent {
                     save_session: Some(Box::new(move |k: &str| {
                         let _ = ws2.set_setting(&key, &json!(k));
                     })),
+                    meter: meter.clone(),
                 })
-                .await?;
+                .await;
+            // Kiro bills credits, not tokens: counted in the provider's
+            // usage, also for a turn stopped or failed (they were spent).
+            if let Err(e) = ws.record_ai_credits(&rec.id, "chat", meter.credits()) {
+                tracing::warn!("couldn't record AI usage: {e}");
+            }
+            let text = turn?;
             let assistant = Message::assistant(text.clone(), vec![]);
             // An empty turn would break the conversation on other providers.
             if !providers::is_empty_turn(&assistant) {

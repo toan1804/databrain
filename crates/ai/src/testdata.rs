@@ -100,12 +100,11 @@ fn target(ws: &Workspace, secrets: Arc<dyn SecretStore>, connection_id: &str, ai
 /// stopped half way is counted too.
 async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: ChatRequest, meter: &Meter) -> Result<String> {
     // Kiro has no model API: one tool-less prompt through kiro-cli. It is
-    // billed in credits, which the provider page reads from Kiro itself, so
-    // no tokens are counted here.
+    // billed in credits, not tokens: they go to `meter`.
     if let Some(kiro) = provider.as_kiro() {
         let prompt = format!("{}\n\n{}", chat.system, chat.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n\n"));
         let model = Some(chat.model.as_str()).filter(|m| !m.is_empty());
-        return tokio::time::timeout(TIMEOUT, kiro.complete(prompt, model)).await.map_err(|_| AiError::Network("Kiro took too long".into()))?;
+        return tokio::time::timeout(TIMEOUT, kiro.complete(prompt, model, meter)).await.map_err(|_| AiError::Network("Kiro took too long".into()))?;
     }
     let run = async {
         let mut stream = provider.chat_stream(chat.clone()).await?;
@@ -134,8 +133,12 @@ async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: Chat
     tokio::time::timeout(TIMEOUT, run).await.map_err(|_| AiError::Network("the model took too long".into()))?
 }
 
-fn record(ws: &Workspace, provider_id: &str, used: (u32, u32)) {
-    if let Err(e) = ws.record_ai_usage(provider_id, "test_data", used.0, used.1) {
+fn record<'a>(ws: &Workspace, provider_id: &str, meters: impl IntoIterator<Item = &'a Meter> + Clone) {
+    let used = crate::meter::total(meters.clone());
+    if let Err(e) = ws
+        .record_ai_usage(provider_id, "test_data", used.0, used.1)
+        .and_then(|()| ws.record_ai_credits(provider_id, "test_data", crate::meter::total_credits(meters)))
+    {
         tracing::warn!("couldn't record AI usage: {e}");
     }
 }
@@ -160,7 +163,7 @@ pub async fn suggest_patterns(
         r = ask_model(&t.provider, chat, &meter) => r,
         _ = cancel.cancelled() => Err(AiError::Cancelled),
     };
-    record(ws, &t.provider_id, meter.tokens());
+    record(ws, &t.provider_id, [&meter]);
     let text = r?;
     parse_patterns(&text, ask).ok_or_else(|| AiError::Provider("the model's answer wasn't the JSON object of patterns asked for".into()))
 }
@@ -252,7 +255,7 @@ pub async fn sample(
     let mut stream = futures::stream::iter(calls).buffer_unordered(PARALLEL);
     let mut rows = Vec::new();
     let mut last_error = None;
-    let record = || record(ws, &provider_id, crate::meter::total(&meters));
+    let record = || record(ws, &provider_id, &meters);
     loop {
         let next = tokio::select! {
             n = stream.next() => n,

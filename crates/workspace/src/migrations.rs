@@ -490,6 +490,11 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (job_id, node_id)
     );
     "#,
+    // v24: credits a provider bills instead of tokens (Kiro), per turn or
+    // call, counted in the provider's usage like tokens
+    r#"
+    ALTER TABLE ai_usage ADD COLUMN credits REAL NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Workspace {

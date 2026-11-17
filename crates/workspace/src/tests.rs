@@ -153,13 +153,13 @@ fn schema_version_guard_and_backup() {
     assert!(e.to_string().contains("newer DataBrain"), "{e}");
     let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(v as usize, MIGRATIONS.len() + 3);
-    // Older (two migrations behind: before v20's AI tables and v21's view
+    // Older (at v19: before v20's AI tables and v21's view
     // definitions): backed up as it was, then updated.
     {
         let c = Connection::open(&path).unwrap();
-        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 4) as i64).unwrap();
-        // Undo v23, v22 and v21.
-        c.execute_batch("DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
+        c.pragma_update(None, "user_version", 19i64).unwrap();
+        // Undo v24, v23, v22 and v21.
+        c.execute_batch("ALTER TABLE ai_usage DROP COLUMN credits; DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
         // Undo v20, as an older version left it: schema `s`
         // indexed in full (index scope `*`), `hr.teams` indexed on its own,
         // and `hr.salaries` only seen in the explorer.
@@ -197,7 +197,7 @@ fn schema_version_guard_and_backup() {
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(bv as usize, MIGRATIONS.len() - 4, "the backup is the workspace before the update");
+    assert_eq!(bv, 19, "the backup is the workspace before the update");
     drop((ws, b));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -539,7 +539,9 @@ fn an_earlier_draft_of_v22_is_repaired() {
     {
         let c = Connection::open(&path).unwrap();
         // At v22, which then held v23's tables too: v23 runs over them.
-        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
+        // Later migrations are taken back too, so they can run again.
+        c.pragma_update(None, "user_version", 22i64).unwrap();
+        c.execute_batch("ALTER TABLE ai_usage DROP COLUMN credits;").unwrap();
         c.execute_batch(
             "DROP TABLE job_after_pending; \
              CREATE TABLE job_after_pending (job_id TEXT PRIMARY KEY, after TEXT NOT NULL, added_at INTEGER NOT NULL); \
