@@ -1468,6 +1468,92 @@ async fn array_rows(
     }
 }
 
+/// Rows per appender call ([`appended_rows`]).
+const APPEND_ROWS: usize = 100_000;
+
+/// Whether the rows' columns go through DuckDB's appender as they are:
+/// the types it takes without converting them (a `Date64` would lose its
+/// time, a nanosecond time zone timestamp its last digits, a decimal over
+/// 38 digits its exactness); `Err` says which column goes by INSERTs.
+fn appender_fits(schema: &SchemaRef) -> std::result::Result<(), String> {
+    use databrain_connector_core::arrow::datatypes::{DataType as D, TimeUnit};
+    for f in schema.fields() {
+        let ok = match f.data_type() {
+            D::Boolean | D::Int8 | D::Int16 | D::Int32 | D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => true,
+            D::Float32 | D::Float64 | D::Utf8 | D::LargeUtf8 | D::Utf8View | D::Binary | D::LargeBinary | D::Date32 => true,
+            D::Timestamp(_, None) => true,
+            D::Timestamp(u, Some(_)) => *u != TimeUnit::Nanosecond,
+            D::Decimal128(p, _) => *p <= 38,
+            _ => false,
+        };
+        if !ok {
+            return Err(format!("{} ({}) goes by INSERTs", f.name(), f.data_type()));
+        }
+    }
+    Ok(())
+}
+
+/// The rows by the database's appender (DuckDB): up to [`APPEND_ROWS`] a
+/// call, each through a temporary table and one `INSERT … SELECT` that
+/// converts the values as INSERTs do (see `Session::append_rows`). A session
+/// that turns the first call down gets INSERTs, the rows put back.
+async fn appended_rows(
+    p: &Prepared,
+    table: &str,
+    schema: &SchemaRef,
+    mut feed: Feed<'_, '_>,
+    cancel: &CancellationToken,
+    progress: &(dyn Fn(u64) + Sync),
+    note: &(dyn Fn(String) + Sync),
+) -> Written {
+    let mut w = Written {
+        rows: 0,
+        statements: 0,
+        sql: format!("INSERT INTO {table} SELECT … (appender)"),
+        result: Ok(()),
+        split: None,
+        parallel: false,
+        serialized: false,
+    };
+    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
+    loop {
+        let batch = match rows.gather(APPEND_ROWS).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return w,
+            Err(e) => {
+                w.result = Err(e);
+                return w;
+            }
+        };
+        let k = batch.num_rows();
+        match p.session.append_rows(table, &columns, batch.clone(), cancel.clone()).await {
+            Ok(Some(n)) => {
+                if w.statements == 0 {
+                    note(format!("the appender, up to {} rows a call through a temporary table", grouped(APPEND_ROWS)));
+                }
+                w.rows += n;
+                w.statements += 1;
+                progress(w.rows);
+            }
+            Ok(None) if w.statements == 0 => {
+                rows.retry.push_front(batch);
+                return insert_pending(p, table, schema, rows, cancel, progress).await;
+            }
+            Ok(None) => {
+                w.result = Err(EngineError::new("internal", "the session stopped taking appended rows part way"));
+                return w;
+            }
+            Err(e) => {
+                let mut e = EngineError::from(e);
+                e.message = name_failing_row(&e.message, w.rows, k);
+                w.result = Err(e);
+                return w;
+            }
+        }
+    }
+}
+
 /// The session's decimal separator (Oracle's `NLS_NUMERIC_CHARACTERS`);
 /// `.` where numbers don't depend on it. `None`: it couldn't be read.
 async fn decimal_separator(p: &Prepared) -> Option<char> {
@@ -2056,6 +2142,16 @@ async fn run_plan(
                 let array_insert = (writer.is_none() && !p.insert_only && p.session.insert_array_possible())
                     .then(|| sqlgen::ArrayInsert::new(p.dialect, table, &schema))
                     .flatten();
+                // No bulk load or array INSERTs: the appender where the session has one (DuckDB).
+                let appender = (writer.is_none() && array_insert.is_none() && !p.insert_only && p.session.append_rows_possible())
+                    .then(|| appender_fits(&schema))
+                    .and_then(|fits| match fits {
+                        Ok(()) => Some(()),
+                        Err(why) => {
+                            obs.event(LoadEvent::Info(format!("{label}: INSERTs, not the appender ({why})")));
+                            None
+                        }
+                    });
                 let bulk_word = if p.dialect == ConnectorKind::Databricks { "a bulk load" } else { "COPY" };
                 let how = match (&writer, &why_not) {
                     // Array INSERTs say so once a call went in (`array_rows`).
@@ -2081,6 +2177,10 @@ async fn run_plan(
                             // Said once a call went in (or why not), not before.
                             let note = |m: String| obs.event(LoadEvent::Info(format!("{label}: {m}")));
                             array_rows(p, table, &schema, ai, feed, cancel, &progress, &note).await
+                        }
+                        None if appender.is_some() => {
+                            let note = |m: String| obs.event(LoadEvent::Info(format!("{label}: {m}")));
+                            appended_rows(p, table, &schema, feed, cancel, &progress, &note).await
                         }
                         None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
                     },
@@ -2845,6 +2945,32 @@ mod tests {
                 .await;
         assert_eq!(w.rows, 7, "the server's count");
         assert!(notes.lock().iter().any(|n| n.contains("said it inserted 7 rows of the 10")), "{:?}", notes.lock());
+    }
+
+    /// The appender takes columns whose types it keeps as they are; others
+    /// (a time it would drop, digits it would cut) send the rows by INSERTs.
+    #[test]
+    fn the_appender_takes_types_it_keeps() {
+        use databrain_connector_core::arrow::datatypes::{DataType as D, Field, Schema, TimeUnit};
+        let schema = |t: D| Arc::new(Schema::new(vec![Field::new("c", t, true)]));
+        for t in [
+            D::Int64,
+            D::UInt8,
+            D::Float64,
+            D::Utf8,
+            D::LargeUtf8,
+            D::Binary,
+            D::Boolean,
+            D::Date32,
+            D::Timestamp(TimeUnit::Nanosecond, None),
+            D::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            D::Decimal128(38, 10),
+        ] {
+            assert!(appender_fits(&schema(t.clone())).is_ok(), "{t:?}");
+        }
+        for t in [D::Date64, D::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), D::Decimal256(50, 2), D::Time32(TimeUnit::Second), D::Float16] {
+            assert!(appender_fits(&schema(t.clone())).is_err_and(|w| w.contains("goes by INSERTs")), "{t:?}");
+        }
     }
 
     #[test]

@@ -540,6 +540,65 @@ async fn snowflake_array_loads_write_what_inserts_do() {
     .await;
 }
 
+/// A load into a DuckDB file goes through the appender, and the table ends
+/// up exactly as with INSERTs: the same rows of every kind loaded both ways
+/// and compared, into tables the load creates and into existing ones whose
+/// column types differ from the rows' (DuckDB converts each value the same
+/// way for both).
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_appended_loads_write_what_inserts_do() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let dst = duckdb(&st, "dst", &dir.path().join("dst.duckdb"));
+        let src = "select i::bigint as id, \
+                   case when i % 7 = 0 then null else 'n' || i || ' it''s \"ünï\"' end as name, \
+                   i % 2 = 0 as ok, \
+                   case when i = 5 then 'nan'::double when i = 6 then 'inf'::double else i / 7.0 end as f, \
+                   (i / 3)::decimal(12, 3) as amount, \
+                   date '2026-01-01' + (i % 400)::int as d, \
+                   timestamp '2026-01-01 10:00:00.123456' + to_microseconds(i::bigint * 1000) as ts, \
+                   to_timestamp(1767254400 + i) as tz, \
+                   case when i % 5 = 0 then null else from_hex(printf('%04x', i)) end as b, \
+                   (i * 1.5)::varchar as num_text \
+                   from range(250000) t(i)";
+        // Existing tables whose types differ from the rows': a number into
+        // text, a timestamp into a date, text into a decimal.
+        let existing = "(id bigint, name varchar, ok boolean, f double, amount varchar, d varchar, ts date, tz timestamptz, b blob, num_text decimal(18, 2))";
+        for (pre, label) in [(false, "created"), (true, "existing")] {
+            for (table, insert_only) in [("app_a", false), ("app_i", true)] {
+                rows(&st, &dst, &format!("drop table if exists {table}; select 1")).await;
+                if pre {
+                    rows(&st, &dst, &format!("create table {table} {existing}; select 1")).await;
+                }
+                let job = load_job(&st, &dst, table, src, |n| {
+                    n.load_mode = LoadMode::Append;
+                    n.load_insert_only = insert_only;
+                });
+                let run = run_all(&st, &job).await;
+                assert_eq!(run.status, "success", "{label} {table}: {run:?}");
+                assert_eq!(step(&run, "loaded").rows, Some(250_000), "{label} {table}");
+                let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+                assert_eq!(
+                    log.iter().any(|l| l.message.contains("the appender")),
+                    !insert_only,
+                    "{label} {table}: {:#?}",
+                    log.iter().map(|l| &l.message).collect::<Vec<_>>()
+                );
+            }
+            let differ = rows(
+                &st,
+                &dst,
+                "select count(*) from ((select * from app_a except all select * from app_i) union all (select * from app_i except all select * from app_a))",
+            )
+            .await;
+            assert_eq!(differ[0][0], "0", "{label}: the appender and INSERTs wrote different rows");
+            assert_eq!(rows(&st, &dst, "select count(*) from app_a").await[0][0], "250000", "{label}");
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn export_steps_write_files_with_duckdb() {
     guarded(async {

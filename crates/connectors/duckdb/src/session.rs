@@ -133,6 +133,73 @@ impl Session for DuckSession {
         self.strings("select 1".into(), vec![]).await.map(|_| ())
     }
 
+    /// The appender: the rows go into a temporary table of their own types
+    /// (the appender converts nothing, so its types must match), then one
+    /// `INSERT INTO table (columns) SELECT …` converts each value with
+    /// DuckDB's casts, as an INSERT's literals are; the temporary table is
+    /// dropped. In the load's transaction when it has one.
+    async fn append_rows(
+        &self,
+        table: &str,
+        columns: &[String],
+        batch: databrain_connector_core::arrow::array::RecordBatch,
+        cancel: databrain_connector_core::CancellationToken,
+    ) -> Result<Option<u64>> {
+        use databrain_connector_core::arrow::datatypes::{Field, Schema};
+        if batch.num_rows() == 0 {
+            return Ok(Some(0));
+        }
+        let n = batch.num_rows() as u64;
+        // Columns `c0`, `c1`, …: the rows' own names may clash or need quoting.
+        let normal = crate::outputs::normalize_for_duckdb(&batch)?;
+        let renamed = Arc::new(Schema::new(
+            normal.schema().fields().iter().enumerate().map(|(i, f)| Field::new(format!("c{i}"), f.data_type().clone(), true)).collect::<Vec<_>>(),
+        ));
+        let rows = databrain_connector_core::arrow::array::RecordBatch::try_new(renamed.clone(), normal.columns().to_vec())
+            .map_err(|e| ConnectorError::internal(e.to_string()))?;
+        let rows = crate::outputs::to_arrow58(&rows)?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = format!("databrain_append_{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let defs = renamed.fields().iter().map(|f| format!("{} {}", f.name(), crate::outputs::duck_type(f.data_type()))).collect::<Vec<_>>().join(", ");
+        let target_cols = columns.iter().map(|c| databrain_connector_core::quote_ident(ConnectorKind::Duckdb, c)).collect::<Vec<_>>().join(", ");
+        let source_cols = (0..columns.len()).map(|i| format!("c{i}")).collect::<Vec<_>>().join(", ");
+        let insert = format!(
+            "INSERT INTO {} ({target_cols}) SELECT {source_cols} FROM temp.main.{temp}",
+            databrain_connector_core::quote_path(ConnectorKind::Duckdb, table)
+        );
+        let interrupt = self.interrupt.clone();
+        let watch = cancel.clone();
+        let stop = tokio::spawn(async move {
+            watch.cancelled().await;
+            interrupt.interrupt();
+        });
+        let r = self
+            .with_conn(move |c| {
+                c.execute_batch(&format!("CREATE TEMP TABLE {temp} ({defs})")).map_err(map_err)?;
+                let run = || -> Result<()> {
+                    {
+                        let mut app = c.appender_to_catalog_and_db(&temp, "temp", "main").map_err(map_err)?;
+                        app.append_record_batch(rows).map_err(map_err)?;
+                        app.flush().map_err(map_err)?;
+                    }
+                    c.execute_batch(&insert).map_err(map_err)
+                };
+                let r = run();
+                let _ = c.execute_batch(&format!("DROP TABLE IF EXISTS temp.main.{temp}"));
+                r
+            })
+            .await;
+        stop.abort();
+        if cancel.is_cancelled() {
+            return Err(ConnectorError::cancelled());
+        }
+        r.map(|()| Some(n))
+    }
+
+    fn append_rows_possible(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
         let sql = stmt.sql();
         let state = self.state.clone();
