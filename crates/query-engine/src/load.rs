@@ -1374,13 +1374,9 @@ impl Pending<'_, '_, '_> {
     }
 }
 
-/// Rows per array INSERT call ([`array_rows`]), fewer past [`ARRAY_BYTES`].
-const ARRAY_ROWS: usize = 10_000;
-/// Text per array INSERT call.
-const ARRAY_BYTES: usize = 32 * 1024 * 1024;
-
-/// The rows by array INSERTs (Oracle array DML): one prepared INSERT run
-/// with up to [`ARRAY_ROWS`] rows bound at once, each call all or nothing.
+/// The rows by array INSERTs (Oracle array DML, Snowflake array binds):
+/// one INSERT run with up to `ai.rows_per_call()` rows bound at once,
+/// fewer past `ai.bytes_per_call()`, each call all or nothing.
 /// A session that turns the first call down (a thin helper older than
 /// array binding) gets INSERTs instead, the rows it held put back.
 #[allow(clippy::too_many_arguments)]
@@ -1397,8 +1393,9 @@ async fn array_rows(
     let mut w = Written { rows: 0, statements: 0, sql: ai.sql.clone(), result: Ok(()), split: None, parallel: false, serialized: false };
     let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     // A step's own rows and KB per INSERT cap the calls too.
+    let (rows_cap, bytes_cap) = (ai.rows_per_call(), ai.bytes_per_call());
     let (per_call, max_bytes) =
-        if p.batch_from_step { (ARRAY_ROWS.min(p.batch.rows.max(1)), ARRAY_BYTES.min(p.batch.bytes.max(1))) } else { (ARRAY_ROWS, ARRAY_BYTES) };
+        if p.batch_from_step { (rows_cap.min(p.batch.rows.max(1)), bytes_cap.min(p.batch.bytes.max(1))) } else { (rows_cap, bytes_cap) };
     // Numbers are written with the session's decimal separator, so they
     // convert as the INSERT's literals do; unknown, INSERTs.
     let decimal = match decimal_separator(p).await {

@@ -299,6 +299,12 @@ async fn external_browser(http: &reqwest::Client, base: &str, acct: &str, user: 
 
 pub struct SfSession(Arc<Inner>);
 
+/// Rows an INSERT says it inserted (`number of rows inserted`).
+fn inserted_rows(data: &serde_json::Value) -> Option<u64> {
+    let v = data.pointer("/rowset/0/0")?;
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
 struct Inner {
     base: String,
     http: reqwest::Client,
@@ -459,8 +465,25 @@ impl Inner {
         cancel: &databrain_connector_core::CancellationToken,
         tx: Option<&StreamSender>,
     ) -> Result<serde_json::Value> {
+        self.query_bound(sql, None, request_id, cancel, tx).await
+    }
+
+    /// [`Self::query`] with bind variables (`{"1": {"type": …, "value": …}}`;
+    /// an array `value` binds one row per element, as the official drivers
+    /// send `executemany`).
+    async fn query_bound(
+        &self,
+        sql: &str,
+        bindings: Option<serde_json::Value>,
+        request_id: &str,
+        cancel: &databrain_connector_core::CancellationToken,
+        tx: Option<&StreamSender>,
+    ) -> Result<serde_json::Value> {
         let seq = self.request_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let body = json!({ "sqlText": sql, "asyncExec": false, "sequenceId": seq, "querySubmissionTime": now_secs() * 1000 });
+        let mut body = json!({ "sqlText": sql, "asyncExec": false, "sequenceId": seq, "querySubmissionTime": now_secs() * 1000 });
+        if let Some(b) = bindings {
+            body["bindings"] = b;
+        }
         let submit = self.post_as("/queries/v1/query-request", request_id, body);
         tokio::pin!(submit);
         let mut v = tokio::select! {
@@ -636,6 +659,30 @@ impl Session for SfSession {
 
     async fn ping(&self) -> Result<()> {
         self.0.run_small("select 1").await.map(|_| ())
+    }
+
+    /// Array binding: one INSERT, each column's values bound as a TEXT
+    /// array (a row per element), as the official drivers send
+    /// `executemany`; the text is what the INSERT literal holds, cast to
+    /// the column's type as the literal is. An INSERT is all or nothing.
+    /// A server that refuses array binds for it: `Ok(None)` (INSERTs).
+    async fn insert_array(&self, sql: &str, columns: Vec<Vec<Option<String>>>, cancel: databrain_connector_core::CancellationToken) -> Result<Option<u64>> {
+        let rows = columns.first().map_or(0, Vec::len);
+        if rows == 0 {
+            return Ok(Some(0));
+        }
+        let bindings: serde_json::Map<String, serde_json::Value> =
+            columns.into_iter().enumerate().map(|(i, values)| ((i + 1).to_string(), json!({"type": "TEXT", "value": values}))).collect();
+        let rid = uuid::Uuid::new_v4().to_string();
+        match self.0.query_bound(sql, Some(serde_json::Value::Object(bindings)), &rid, &cancel, None).await {
+            Ok(data) => Ok(Some(inserted_rows(&data).unwrap_or(rows as u64))),
+            Err(e) if e.message.to_ascii_lowercase().contains("array bind") && e.message.to_ascii_lowercase().contains("not supported") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn insert_array_possible(&self) -> bool {
+        true
     }
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
@@ -1278,6 +1325,45 @@ mod literal_tests {
 
     fn aborts(log: &crate::mock_http::Log) -> Vec<String> {
         log.lock().unwrap().iter().filter(|(_, p, _)| p.starts_with("/queries/v1/abort-request")).map(|(_, _, b)| b.clone()).collect()
+    }
+
+    /// An INSERT with array binds: one TEXT array per column (a row per
+    /// element, nulls kept), the rows Snowflake says it inserted; a server
+    /// that refuses array binds for it gets INSERTs instead.
+    #[tokio::test]
+    async fn array_inserts_bind_a_text_array_per_column() {
+        use databrain_connector_core::{CancellationToken, Session};
+        let (origin, log) = crate::mock_http::serve(move |m, p, body| {
+            if m == "POST" && p.starts_with("/queries/v1/query-request?") {
+                if body.contains("INSERT INTO refused") {
+                    (
+                        200,
+                        json!({"success": false, "code": "002014", "message": "Array bind currently not supported for this query type", "data": {}})
+                            .to_string(),
+                    )
+                } else if body.contains("INSERT INTO bad") {
+                    (200, json!({"success": false, "code": "100038", "message": "Numeric value 'x' is not recognized", "data": {}}).to_string())
+                } else {
+                    (200, json!({"success": true, "code": null, "data": {"rowtype": [{"name": "number of rows inserted"}], "rowset": [["3"]]}}).to_string())
+                }
+            } else {
+                (404, "{}".into())
+            }
+        })
+        .await;
+        let s = SfSession(Arc::new(inner(&origin)));
+        let v = |x: &str| Some(x.to_string());
+        let cols = vec![vec![v("1"), v("2"), v("3")], vec![v("a"), None, v("c")]];
+        assert!(s.insert_array_possible());
+        assert_eq!(s.insert_array("INSERT INTO t (a, b) VALUES (?, ?)", cols.clone(), CancellationToken::new()).await.unwrap(), Some(3));
+        let sent = log.lock().unwrap().last().unwrap().2.clone();
+        let body: serde_json::Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(body["bindings"]["1"], json!({"type": "TEXT", "value": ["1", "2", "3"]}));
+        assert_eq!(body["bindings"]["2"], json!({"type": "TEXT", "value": ["a", null, "c"]}));
+        assert_eq!(body["sqlText"], "INSERT INTO t (a, b) VALUES (?, ?)");
+        assert_eq!(s.insert_array("INSERT INTO refused (a, b) VALUES (?, ?)", cols.clone(), CancellationToken::new()).await.unwrap(), None);
+        let e = s.insert_array("INSERT INTO bad (a, b) VALUES (?, ?)", cols, CancellationToken::new()).await.unwrap_err();
+        assert!(e.message.contains("not recognized"), "{}", e.message);
     }
 
     /// The submit carries one requestId, and an abort names that one.
