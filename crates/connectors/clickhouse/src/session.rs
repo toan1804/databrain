@@ -24,6 +24,25 @@ use std::sync::Arc;
 
 pub struct ChSession(pub(crate) Arc<Inner>);
 
+/// [`Session::bulk_load`]: each chunk one INSERT with the rows as its body.
+struct TsvWriter {
+    inner: Arc<Inner>,
+    sql: String,
+    cancel: databrain_connector_core::CancellationToken,
+}
+
+#[async_trait]
+impl databrain_connector_core::BulkWriter for TsvWriter {
+    async fn write(&mut self, data: Vec<u8>) -> Result<()> {
+        self.inner.insert_data(&self.sql, data, &self.cancel).await
+    }
+
+    /// Each chunk was its own INSERT: nothing left to end; the rows sent count.
+    async fn finish(self: Box<Self>) -> Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
 #[async_trait]
 impl Session for ChSession {
     fn kind(&self) -> ConnectorKind {
@@ -42,6 +61,15 @@ impl Session for ChSession {
 
     async fn ping(&self) -> Result<()> {
         self.0.rows("SELECT 1", false).await.map(|_| ())
+    }
+
+    /// Rows sent as the body of `INSERT … FORMAT TabSeparated` (`sql`), one
+    /// INSERT per chunk written (each a part, as each INSERT of VALUES is).
+    async fn bulk_load(&self, sql: &str, cancel: databrain_connector_core::CancellationToken) -> Result<Option<Box<dyn databrain_connector_core::BulkWriter>>> {
+        if self.0.read_only {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(TsvWriter { inner: self.0.clone(), sql: sql.to_string(), cancel })))
     }
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {

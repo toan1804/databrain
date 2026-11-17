@@ -540,6 +540,92 @@ async fn snowflake_array_loads_write_what_inserts_do() {
     .await;
 }
 
+/// Live (DATABRAIN_CLICKHOUSE_HOST, _PASSWORD): a load into ClickHouse sends
+/// its rows as TabSeparated, and the table ends up exactly as with VALUES
+/// INSERTs: the same rows of every kind loaded both ways and compared, into
+/// tables the load creates and into existing ones with other column types
+/// (Nullable, LowCardinality, Decimal, DateTime).
+#[ignore = "live: needs DATABRAIN_CLICKHOUSE_HOST (cargo test -- --ignored)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn clickhouse_tsv_loads_write_what_inserts_do() {
+    guarded(async {
+        let Ok(host) = std::env::var("DATABRAIN_CLICKHOUSE_HOST") else {
+            panic!("live test: DATABRAIN_CLICKHOUSE_HOST not set (run with --ignored)");
+        };
+        let st = state();
+        let mut c = ConnectionConfig::new(
+            ConnectorKind::Clickhouse,
+            AuthMethod::Password { user: std::env::var("DATABRAIN_CLICKHOUSE_USER").unwrap_or("default".into()) },
+        );
+        c.host = Some(host);
+        c.port = std::env::var("DATABRAIN_CLICKHOUSE_PORT").ok().and_then(|p| p.parse().ok());
+        let id = api::save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "ch".into(),
+                    config: c,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: true,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: std::env::var("DATABRAIN_CLICKHOUSE_PASSWORD").ok(),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+        .id;
+        let src = "select i::bigint as id, \
+                   case when i % 7 = 0 then null else 'n' || i || ' it''s \"ünï\" a\\tb' end as name, \
+                   i % 2 = 0 as ok, \
+                   case when i = 5 then 'nan'::double when i = 6 then 'inf'::double when i = 8 then '-inf'::double else i / 7.0 end as f, \
+                   (i / 3)::decimal(12, 3) as amount, \
+                   date '2026-01-01' + (i % 400)::int as d, \
+                   timestamp '2026-01-01 10:00:00.123456' + to_microseconds(i::bigint * 1000) as ts, \
+                   to_timestamp(1767254400 + i) as tz, \
+                   case when i % 5 = 0 then null else from_hex(printf('%04x', i)) end as b \
+                   from range(250000) t(i)";
+        let existing = "(id Int64, name LowCardinality(Nullable(String)), ok Nullable(Bool), f Nullable(Float64), amount Nullable(Decimal(18, 3)), \
+                        d Nullable(Date), ts Nullable(DateTime64(6)), tz Nullable(DateTime64(3, 'UTC')), b Nullable(String)) ENGINE = MergeTree ORDER BY id";
+        for (pre, label) in [(false, "created"), (true, "existing")] {
+            for (table, insert_only) in [("dbr_ch_tsv", false), ("dbr_ch_ins", true)] {
+                rows(&st, &id, &format!("DROP TABLE IF EXISTS {table}; SELECT 1")).await;
+                if pre {
+                    rows(&st, &id, &format!("CREATE TABLE {table} {existing}; SELECT 1")).await;
+                }
+                let job = load_job(&st, &id, table, src, |n| {
+                    n.load_mode = LoadMode::Append;
+                    n.load_insert_only = insert_only;
+                });
+                let run = run_all(&st, &job).await;
+                assert_eq!(run.status, "success", "{label} {table}: {run:?}");
+                assert_eq!(step(&run, "loaded").rows, Some(250_000), "{label} {table}");
+                let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+                assert_eq!(
+                    log.iter().any(|l| l.message.contains("TabSeparated, up to")),
+                    !insert_only,
+                    "{label} {table}: {:#?}",
+                    log.iter().map(|l| &l.message).collect::<Vec<_>>()
+                );
+            }
+            let (a, i) = ("SELECT * FROM dbr_ch_tsv", "SELECT * FROM dbr_ch_ins");
+            let differ = rows(&st, &id, &format!("SELECT count() FROM (({a} EXCEPT {i}) UNION ALL ({i} EXCEPT {a}))")).await;
+            assert_eq!(differ[0][0], "0", "{label}: TabSeparated and VALUES wrote different rows");
+            assert_eq!(rows(&st, &id, "SELECT count() FROM dbr_ch_tsv").await[0][0], "250000", "{label}");
+        }
+        for t in ["dbr_ch_tsv", "dbr_ch_ins"] {
+            rows(&st, &id, &format!("DROP TABLE IF EXISTS {t}; SELECT 1")).await;
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn export_steps_write_files_with_duckdb() {
     guarded(async {
