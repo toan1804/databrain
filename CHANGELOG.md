@@ -11,6 +11,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Changed
 
+- **Loads, larger INSERTs by default** (a step's own rows and KB per INSERT still win): ClickHouse 100,000 rows / 16 MB (was 500 / 1 MB: each INSERT writes a new part, and small ones lead to "too many parts"), Snowflake and BigQuery 10,000 rows within their 1 MB of SQL text, DuckDB 10,000 / 8 MB, PostgreSQL (when COPY can't be used) 5,000 / 8 MB, MySQL 5,000 / 3 MB, and a load keeps its INSERTs under the server's own `max_allowed_packet` (a larger statement closes the connection; read when the load starts, 1 MB when the server doesn't say), SQLite 5,000 rows, SQL Server 500 rows / 8 MB. Oracle stays at 100 rows: its `INSERT ALL` parses more slowly the more rows it has.
 - **Faster loads into Databricks:** INSERTs default to 10,000 rows and 8 MB each (were 500 rows and 1 MB; each INSERT is one Delta commit, taking seconds whatever its size), up to 100,000 rows, and up to 4 run at once (one at a time again for a table that refuses concurrent writers, such as one with an identity column). An INSERT the database refuses for its size is split in two and sent again, outside a transaction, on any database; the run log says so.
 
 ### Security

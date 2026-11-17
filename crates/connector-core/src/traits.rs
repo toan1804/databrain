@@ -500,6 +500,8 @@ pub const SQLITE: SourceTraits = SourceTraits {
     syntax: SqlSyntax { backtick: true, brackets: true, block_end: BlockEnd::EndWord, block_objects: &["TRIGGER"], ..STANDARD_SYNTAX },
     load: Some(LoadTraits {
         types: TypeNames { integer: "INTEGER", float: "REAL", ..STANDARD_TYPES },
+        // Local, in one transaction: the byte limit ends a statement first.
+        default_rows: 5_000,
         default_bytes: 1_000_000,
         max_bytes: 1_000_000,
         bytes_note: "SQLite's default SQLITE_MAX_SQL_LENGTH is 1,000,000 bytes",
@@ -528,6 +530,9 @@ pub const POSTGRES: SourceTraits = SourceTraits {
     load: Some(LoadTraits {
         types: TypeNames { float: "DOUBLE PRECISION", timestamp_tz: "TIMESTAMPTZ", binary: "BYTEA", ..STANDARD_TYPES },
         binary_literal: "'\\x{}'::bytea",
+        // When COPY can't be used: no packet limit (1 GB), fewer statements to parse.
+        default_rows: 5_000,
+        default_bytes: 8 * MB,
         ..STANDARD_LOAD
     }),
     transactions: Some(STANDARD_TX),
@@ -555,8 +560,12 @@ pub const MYSQL: SourceTraits = SourceTraits {
     },
     load: Some(LoadTraits {
         types: TypeNames { timestamp: "DATETIME(6)", timestamp_tz: "DATETIME(6)", ..STANDARD_TYPES },
+        // Under max_allowed_packet's smallest default (4 MB on 5.7; 64 MB on
+        // 8.0): a statement past it closes the connection.
+        default_rows: 5_000,
+        default_bytes: 3 * MB,
         max_bytes: 16 * MB,
-        bytes_note: "must also stay under the server's max_allowed_packet",
+        bytes_note: "must also stay under the server's max_allowed_packet (4 MB by default on MySQL 5.7, 64 MB on 8.0); a larger statement closes the connection",
         text_literal: TextLiteral::BackslashEscaped,
         stage: StageTable::TemporaryDropTemporary,
         merge: MergeStyle::UpdateJoin,
@@ -591,8 +600,11 @@ pub const MSSQL: SourceTraits = SourceTraits {
             text: "NVARCHAR(MAX)",
             ..STANDARD_TYPES
         },
+        // 500, not the 1,000 maximum, until compile times of 1,000-row
+        // VALUES lists on wide tables are measured (docs/TODO.md).
         max_rows: 1000,
         rows_note: "SQL Server allows at most 1,000 rows in one VALUES list",
+        default_bytes: 8 * MB,
         bool_words: false,
         binary_literal: "0x{}",
         text_literal: TextLiteral::NPrefix,
@@ -678,6 +690,8 @@ pub const SNOWFLAKE: SourceTraits = SourceTraits {
     },
     load: Some(LoadTraits {
         types: TypeNames { decimal: "DECIMAL(38, 10)", timestamp_tz: "TIMESTAMP_TZ", binary: "BINARY", text: "VARCHAR", ..STANDARD_TYPES },
+        // Each INSERT is a commit: as many rows as 1 MB of SQL holds.
+        default_rows: 10_000,
         default_bytes: 1_000_000,
         max_bytes: 1_000_000,
         bytes_note: "kept under 1 MB of SQL text for Snowflake",
@@ -759,6 +773,8 @@ pub const BIGQUERY: SourceTraits = SourceTraits {
             text: "STRING",
             ..STANDARD_TYPES
         },
+        // Each INSERT is a query job of seconds: as many rows as the text holds.
+        default_rows: 10_000,
         default_bytes: 1_000_000,
         max_bytes: 1_000_000,
         bytes_note: "BigQuery limits the query text to 1,024 KB",
@@ -782,7 +798,8 @@ pub const DUCKDB: SourceTraits = SourceTraits {
     local: true,
     formatter: "duckdb",
     syntax: SqlSyntax { dollar: DollarQuotes::Tagged, escape_strings: true, ..STANDARD_SYNTAX },
-    load: Some(LoadTraits { types: TypeNames { timestamp_tz: "TIMESTAMPTZ", ..STANDARD_TYPES }, ..STANDARD_LOAD }),
+    // Local, in one transaction: fewer, larger statements to parse.
+    load: Some(LoadTraits { types: TypeNames { timestamp_tz: "TIMESTAMPTZ", ..STANDARD_TYPES }, default_rows: 10_000, default_bytes: 8 * MB, ..STANDARD_LOAD }),
     transactions: Some(TxDialect { savepoint: None, ..STANDARD_TX }),
     ..STANDARD
 };
@@ -821,9 +838,12 @@ pub const CLICKHOUSE_LOAD: LoadTraits = LoadTraits {
         binary: "String",
         text: "String",
     },
+    // Each INSERT writes a new part: small ones are slow and lead to "too
+    // many parts". max_query_size bounds the SQL text, not the streamed rows.
+    default_rows: 100_000,
     max_rows: 100_000,
     rows_note: "ClickHouse parses VALUES as a stream; DataBrain's limit",
-    default_bytes: MB,
+    default_bytes: 16 * MB,
     max_bytes: 16 * MB,
     bytes_note: "DataBrain's limit for one HTTP request",
     binary_literal: "unhex('{}')",
