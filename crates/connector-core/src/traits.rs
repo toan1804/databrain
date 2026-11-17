@@ -317,6 +317,10 @@ pub struct LoadTraits {
     pub delete_all: &'static str,
     /// Written between an INSERT's column list and `VALUES`.
     pub insert_settings: &'static str,
+    /// INSERTs a load outside a transaction may have running at once (1:
+    /// one after the other). For a database where each INSERT waits seconds
+    /// for its commit and concurrent appends don't conflict (Databricks).
+    pub parallel_inserts: usize,
 }
 
 /// How "first rows of a table" is written (explorer preview, AI samples).
@@ -452,6 +456,7 @@ pub const STANDARD_LOAD: LoadTraits = LoadTraits {
     explicit_null: false,
     delete_all: "DELETE FROM {}",
     insert_settings: "",
+    parallel_inserts: 1,
 };
 
 /// Starting point for a new source: standard SQL, two name levels,
@@ -704,6 +709,8 @@ pub const DATABRICKS: SourceTraits = SourceTraits {
         default_rows: 10_000,
         max_rows: 100_000,
         rows_note: "each INSERT is one Delta commit; an INSERT the warehouse refuses as too large is split in two",
+        // Appends to a Delta table don't conflict with each other.
+        parallel_inserts: 4,
         default_bytes: 8 * MB,
         max_bytes: 16 * MB,
         bytes_note: "the SQL Statement Execution API takes statements up to 16 MB",
