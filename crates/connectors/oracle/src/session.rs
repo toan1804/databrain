@@ -185,7 +185,13 @@ impl Session for OracleSession {
     /// separator, see `ArrayInsert::next`); a failed call is rolled back, so
     /// it keeps none of its rows (rows before the failing one would
     /// otherwise stay in the transaction and commit with the next statement).
-    async fn insert_array(&self, sql: &str, columns: Vec<Vec<Option<String>>>, cancel: databrain_connector_core::CancellationToken) -> Result<Option<u64>> {
+    async fn insert_array(
+        &self,
+        sql: &str,
+        columns: Vec<Vec<Option<String>>>,
+        _types: &[&str],
+        cancel: databrain_connector_core::CancellationToken,
+    ) -> Result<Option<u64>> {
         if columns.first().is_none_or(Vec::is_empty) {
             return Ok(Some(0));
         }
@@ -1087,7 +1093,7 @@ mod tests {
             // A number into a VARCHAR2 column, as the load writes it.
             vec![v("1234,5"), None, v("-0,125")],
         ];
-        assert_eq!(s.insert_array(sql, columns, CancellationToken::new()).await.unwrap(), Some(3));
+        assert_eq!(s.insert_array(sql, columns, &[], CancellationToken::new()).await.unwrap(), Some(3));
         let rows = run("select to_char(n, 'FM999999990.000', 'NLS_NUMERIC_CHARACTERS=''.,'''), s, to_char(d, 'YYYY-MM-DD HH24:MI:SS'), \
              to_char(ts, 'YYYY-MM-DD HH24:MI:SS.FF6'), to_char(tz, 'YYYY-MM-DD HH24:MI:SS.FF1 TZH:TZM'), rawtohex(b), \
              to_char(f, 'FM0.0000000EEEE', 'NLS_NUMERIC_CHARACTERS=''.,'''), v from kb_arr order by n nulls last")
@@ -1116,7 +1122,7 @@ mod tests {
         // after the next statement commits.
         let mut bad = vec![vec![None, None]; 8];
         bad[0] = vec![v("7"), v("not a number")];
-        let e = s.insert_array(sql, bad, CancellationToken::new()).await.unwrap_err();
+        let e = s.insert_array(sql, bad, &[], CancellationToken::new()).await.unwrap_err();
         assert!(e.message.contains("ORA-01722") || e.message.to_ascii_lowercase().contains("invalid number"), "{}", e.message);
         s.execute(Statement::internal("commit"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(run("select count(*) from kb_arr").await.unwrap()[0][0].as_deref(), Some("3"), "the failed call's first row isn't kept");

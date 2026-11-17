@@ -299,11 +299,20 @@ pub trait Session: Send + Sync {
     /// Rows inserted by one prepared INSERT with arrays of bound values
     /// (array DML), when the session can: `sql` has one placeholder per
     /// column in the session's style (Oracle `:1`), `columns[i]` holds all
-    /// of column `i`'s values as text (`None`: NULL). Rows inserted;
-    /// `Ok(None)` when the session has no array binding. A call that fails
-    /// keeps none of its rows.
-    async fn insert_array(&self, _sql: &str, _columns: Vec<Vec<Option<String>>>, _cancel: CancellationToken) -> Result<Option<u64>> {
+    /// of column `i`'s values as text (`None`: NULL), bound with the type
+    /// `types[i]` names where the session takes one (Snowflake: `FIXED`,
+    /// `REAL`, `BOOLEAN`, `BINARY` as hex, `TEXT`). Rows inserted, as the
+    /// server counts them; `Ok(None)` when the session has no array binding.
+    /// A call that fails keeps none of its rows.
+    async fn insert_array(&self, _sql: &str, _columns: Vec<Vec<Option<String>>>, _types: &[&str], _cancel: CancellationToken) -> Result<Option<u64>> {
         Ok(None)
+    }
+
+    /// Most values (rows × columns) one [`Self::insert_array`] call may
+    /// bind, when the server sets it (Snowflake's drivers stage the binds in
+    /// files past `CLIENT_STAGE_ARRAY_BINDING_THRESHOLD`).
+    fn insert_array_values(&self) -> Option<usize> {
+        None
     }
 
     /// Whether [`Self::insert_array`] may insert, so a load doesn't prepare

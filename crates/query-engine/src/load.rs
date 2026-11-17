@@ -1375,7 +1375,7 @@ impl Pending<'_, '_, '_> {
 }
 
 /// The rows by array INSERTs (Oracle array DML, Snowflake array binds):
-/// one INSERT run with up to `ai.rows_per_call()` rows bound at once,
+/// one INSERT run with up to `ai.rows_per_call(..)` rows bound at once,
 /// fewer past `ai.bytes_per_call()`, each call all or nothing.
 /// A session that turns the first call down (a thin helper older than
 /// array binding) gets INSERTs instead, the rows it held put back.
@@ -1393,8 +1393,9 @@ async fn array_rows(
     let mut w = Written { rows: 0, statements: 0, sql: ai.sql.clone(), result: Ok(()), split: None, parallel: false, serialized: false };
     let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     // A step's own rows and KB per INSERT cap the calls too.
-    let (rows_cap, bytes_cap) = (ai.rows_per_call(), ai.bytes_per_call());
-    let (per_call, max_bytes) =
+    let (rows_cap, bytes_cap) = (ai.rows_per_call(p.session.insert_array_values()), ai.bytes_per_call());
+    let types = ai.bind_types();
+    let (mut per_call, max_bytes) =
         if p.batch_from_step { (rows_cap.min(p.batch.rows.max(1)), bytes_cap.min(p.batch.bytes.max(1))) } else { (rows_cap, bytes_cap) };
     // Numbers are written with the session's decimal separator, so they
     // convert as the INSERT's literals do; unknown, INSERTs.
@@ -1424,18 +1425,31 @@ async fn array_rows(
                     return w;
                 }
             };
-            match p.session.insert_array(&ai.sql, columns, cancel.clone()).await {
-                Ok(Some(_)) => {
+            match p.session.insert_array(&ai.sql, columns, &types, cancel.clone()).await {
+                Ok(Some(n)) => {
                     if w.statements == 0 {
                         note(format!("array INSERTs, up to {} rows bound to one statement a call ({})", grouped(per_call), ai.sql));
                     }
+                    // The rows the server says it inserted (said when they differ from those sent).
+                    if n != k as u64 {
+                        note(format!("{} said it inserted {} rows of the {} rows of a call", engine_name(p.dialect), grouped(n as usize), grouped(k)));
+                    }
                     at += k;
-                    w.rows += k as u64;
+                    w.rows += n;
                     w.statements += 1;
                     progress(w.rows);
                 }
+                // Refused for its size: the call wrote nothing; half its rows go
+                // again, and the rest of the load uses that size.
+                Err(e) if k > 1 && rejected_as_too_large(&EngineError::from(e.clone())) => {
+                    per_call = k / 2;
+                    w.split.get_or_insert((k, per_call)).1 = per_call;
+                }
                 Ok(None) if w.statements == 0 => {
-                    note("INSERT ALLs: this Oracle driver doesn't take array INSERTs (a helper older than 0.1.5)".into());
+                    note(match p.dialect {
+                        ConnectorKind::Oracle => "INSERT ALLs: this Oracle driver doesn't take array INSERTs (a helper older than 0.1.5)".into(),
+                        _ => format!("INSERTs: {} doesn't take array binds for this statement", engine_name(p.dialect)),
+                    });
                     rows.retry.push_front(batch.slice(at, batch.num_rows() - at));
                     return insert_pending(p, table, schema, rows, cancel, progress).await;
                 }
@@ -2654,6 +2668,10 @@ mod tests {
         calls: parking_lot::Mutex<Vec<Vec<Vec<Option<String>>>>>,
         no_arrays: bool,
         fail_at: Option<usize>,
+        /// Refuse a call of more rows as too large (as an HTTP 413).
+        too_large_over: Option<usize>,
+        /// The rows the server says each call inserted (else the rows sent).
+        says: Option<u64>,
         arrays: parking_lot::Mutex<Vec<usize>>,
         inserts: parking_lot::Mutex<Vec<usize>>,
     }
@@ -2688,11 +2706,20 @@ mod tests {
             tx.send(StreamEvent::Done(Default::default())).await;
             Ok(stream)
         }
-        async fn insert_array(&self, sql: &str, columns: Vec<Vec<Option<String>>>, _: CancellationToken) -> databrain_connector_core::Result<Option<u64>> {
+        async fn insert_array(
+            &self,
+            sql: &str,
+            columns: Vec<Vec<Option<String>>>,
+            _: &[&str],
+            _: CancellationToken,
+        ) -> databrain_connector_core::Result<Option<u64>> {
             if self.no_arrays {
                 return Ok(None);
             }
             assert!(sql.starts_with("INSERT INTO") && sql.contains("VALUES (:1)"), "{sql}");
+            if self.too_large_over.is_some_and(|m| columns[0].len() > m) {
+                return Err(databrain_connector_core::ConnectorError::query("Snowflake (413 Payload Too Large): request too large"));
+            }
             let mut a = self.arrays.lock();
             if self.fail_at == Some(a.len() + 1) {
                 return Err(databrain_connector_core::ConnectorError::query("ORA-01722: invalid number"));
@@ -2700,7 +2727,7 @@ mod tests {
             a.push(columns[0].len());
             let n = columns[0].len();
             self.calls.lock().push(columns);
-            Ok(Some(n as u64))
+            Ok(Some(self.says.unwrap_or(n as u64)))
         }
         fn insert_array_possible(&self) -> bool {
             true
@@ -2792,6 +2819,32 @@ mod tests {
         assert_eq!(w.rows, 3);
         assert!(s.arrays.lock().is_empty() && s.inserts.lock().iter().sum::<usize>() == 3);
         assert!(notes.lock()[0].contains("decimal separator couldn't be read"), "{:?}", notes.lock());
+    }
+
+    /// A call refused as too large wrote nothing: half its rows go again
+    /// and the rest of the load uses that size; every row once. The rows
+    /// the server says it inserted count, and the run log says when they
+    /// differ from those sent.
+    #[tokio::test]
+    async fn array_calls_refused_as_too_large_are_halved() {
+        let s = Arc::new(OracleLike { nls: Some(".,"), too_large_over: Some(3_000), ..Default::default() });
+        let (schema, held) = batches(25_000, 2000);
+        let ai = sqlgen::ArrayInsert::new(ConnectorKind::Oracle, "t", &schema).unwrap();
+        let w = array_rows(&oracle(s.clone()), "t", &schema, &ai, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}, &|_| {}).await;
+        assert!(w.result.is_ok(), "{:?}", w.result.err());
+        assert_eq!(w.rows, 25_000);
+        assert_eq!(s.arrays.lock().iter().sum::<usize>(), 25_000, "every row once");
+        assert!(s.arrays.lock().iter().all(|n| *n <= 3_000));
+        assert_eq!(w.split.map(|x| x.1), Some(2_500));
+
+        let notes = parking_lot::Mutex::new(Vec::<String>::new());
+        let s = Arc::new(OracleLike { nls: Some(".,"), says: Some(7), ..Default::default() });
+        let (schema, held) = batches(10, 2000);
+        let w =
+            array_rows(&oracle(s), "t", &schema, &ai, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}, &|m| notes.lock().push(m))
+                .await;
+        assert_eq!(w.rows, 7, "the server's count");
+        assert!(notes.lock().iter().any(|n| n.contains("said it inserted 7 rows of the 10")), "{:?}", notes.lock());
     }
 
     #[test]

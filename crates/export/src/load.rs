@@ -753,13 +753,32 @@ impl ArrayInsert {
         })
     }
 
-    /// Rows per call: Oracle 10,000; Snowflake as many as stay under 60,000
-    /// bound values (past about 65,000 its drivers stage the binds in files).
-    pub fn rows_per_call(&self) -> usize {
+    /// Rows per call: at most 10,000, and on Snowflake as many as stay
+    /// under `values` bound values (the session's limit, else 60,000: past
+    /// about 65,000 its drivers stage the binds in files).
+    pub fn rows_per_call(&self, values: Option<usize>) -> usize {
         match self.dialect {
-            ConnectorKind::Snowflake => (60_000 / self.kinds.len().max(1)).clamp(1, 10_000),
+            ConnectorKind::Snowflake => (values.unwrap_or(60_000) / self.kinds.len().max(1)).clamp(1, 10_000),
             _ => 10_000,
         }
+    }
+
+    /// Each column's bind type, as the official Snowflake drivers name them:
+    /// numbers `FIXED` and floats `REAL` (a TEXT bind into a number column
+    /// may be cast as NUMBER(18,5) and lose digits), `BOOLEAN`, `BINARY` with
+    /// the hex (text doesn't convert to binary), the rest `TEXT` as their
+    /// literals are quoted text. Oracle binds text throughout (`TEXT`).
+    pub fn bind_types(&self) -> Vec<&'static str> {
+        self.kinds
+            .iter()
+            .map(|k| match (self.dialect, k) {
+                (ConnectorKind::Snowflake, Lit::Number) => "FIXED",
+                (ConnectorKind::Snowflake, Lit::Float) => "REAL",
+                (ConnectorKind::Snowflake, Lit::Bool) => "BOOLEAN",
+                (ConnectorKind::Snowflake, Lit::Binary) => "BINARY",
+                _ => "TEXT",
+            })
+            .collect()
     }
 
     /// Bytes of values per call, counted as the request sends them (JSON):
@@ -866,14 +885,14 @@ fn json_len(s: &str) -> usize {
             .sum::<usize>()
 }
 
-/// A value as the text its Snowflake INSERT literal stands for (`None`:
-/// NULL): NaN/±inf NULL (as the INSERT writes them), booleans `TRUE` /
-/// `FALSE`, binary as hex (read as hex by default, `BINARY_INPUT_FORMAT`).
+/// A value as its Snowflake bind (see [`ArrayInsert::bind_types`]) holds
+/// it (`None`: NULL): NaN/±inf NULL (as the INSERT writes them), booleans
+/// `true` / `false`, binary as hex, the rest the text of its literal.
 fn snowflake_text(cell: Option<&str>, kind: Lit) -> Option<String> {
     let s = cell?;
     match kind {
         Lit::Number | Lit::Float if non_finite(s).is_some() => None,
-        Lit::Bool => Some(s.to_ascii_uppercase()),
+        Lit::Bool => Some(s.to_ascii_lowercase()),
         _ => Some(s.to_string()),
     }
 }
@@ -1356,14 +1375,16 @@ mod tests {
         .unwrap();
         let ai = ArrayInsert::new(ConnectorKind::Snowflake, "db.s.t", &schema).unwrap();
         assert_eq!(ai.sql, r#"INSERT INTO "db"."s"."t" ("id", "name", "ok", "f") VALUES (?, ?, ?, ?)"#);
-        assert_eq!(ai.rows_per_call(), 10_000, "4 columns: 15,000 rows would pass 60,000 values; 10,000 at most");
+        assert_eq!(ai.rows_per_call(None), 10_000, "4 columns: 15,000 rows would pass 60,000 values; 10,000 at most");
+        assert_eq!(ai.rows_per_call(Some(4_000)), 1_000, "the session's limit");
+        assert_eq!(ai.bind_types(), vec!["FIXED", "TEXT", "BOOLEAN", "REAL"]);
         let wide: SchemaRef = Arc::new(Schema::new((0..30).map(|i| Field::new(format!("c{i}"), DataType::Utf8, true)).collect::<Vec<_>>()));
-        assert_eq!(ArrayInsert::new(ConnectorKind::Snowflake, "t", &wide).unwrap().rows_per_call(), 2_000);
-        let (cols, n) = ai.next(&batch, 0, ai.rows_per_call(), MB).unwrap().unwrap();
+        assert_eq!(ArrayInsert::new(ConnectorKind::Snowflake, "t", &wide).unwrap().rows_per_call(None), 2_000);
+        let (cols, n) = ai.next(&batch, 0, ai.rows_per_call(None), MB, '.').unwrap().unwrap();
         assert_eq!(n, 2);
         let s = |v: &str| Some(v.to_string());
         assert_eq!(cols[1], vec![s("it's \\ x"), None], "text as it is: no SQL quoting or escapes");
-        assert_eq!(cols[2], vec![s("TRUE"), s("FALSE")]);
+        assert_eq!(cols[2], vec![s("true"), s("false")]);
         assert_eq!(cols[3], vec![s("2.5"), None], "inf: NULL, as Snowflake's INSERT writes it");
     }
 

@@ -452,6 +452,94 @@ async fn oracle_array_loads_write_what_inserts_do() {
     .await;
 }
 
+/// Live (DATABRAIN_SNOWFLAKE_ACCOUNT, _USER, _PASSWORD, _WAREHOUSE,
+/// _DATABASE, _SCHEMA): a load with array binds turned on writes exactly
+/// what INSERTs write, for rows of every kind (19-digit and high-scale
+/// numbers, binary, booleans, NaN/inf, timestamps with offsets), loaded
+/// both ways and compared in Snowflake.
+#[tokio::test(flavor = "multi_thread")]
+async fn snowflake_array_loads_write_what_inserts_do() {
+    guarded(async {
+        let Ok(account) = std::env::var("DATABRAIN_SNOWFLAKE_ACCOUNT") else { return };
+        let env = |k: &str| std::env::var(format!("DATABRAIN_SNOWFLAKE_{k}")).ok();
+        let st = state();
+        let mut c = ConnectionConfig::new(ConnectorKind::Snowflake, AuthMethod::Password { user: env("USER").unwrap_or_default() });
+        c.options.insert("account".into(), account);
+        for (k, opt) in [("WAREHOUSE", "warehouse"), ("DATABASE", "database"), ("SCHEMA", "schema")] {
+            if let Some(v) = env(k) {
+                c.options.insert(opt.into(), v);
+            }
+        }
+        c.options.insert("array_binds".into(), "on".into());
+        let id = api::save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "sf".into(),
+                    config: c,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: true,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: env("PASSWORD"),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+        .id;
+        let src = "select i::bigint as id, (1234567890123456000 + i)::bigint as big, (i / 7.0)::decimal(38, 10) as amount, \
+                   case when i = 5 then 'nan'::double when i = 6 then 'inf'::double else i / 3.0 end as f, \
+                   case when i % 7 = 0 then null else 'n' || i || ' it''s ünï' end as name, i % 2 = 0 as ok, \
+                   date '2026-01-01' + (i % 400)::int as d, timestamp '2026-01-01 10:00:00.123456' + to_microseconds(i::bigint * 1000) as ts, \
+                   to_timestamp(1767254400 + i) as tz, case when i % 5 = 0 then null else from_hex(printf('%04x', i)) end as b \
+                   from range(5000) t(i)";
+        let drop = |t: &str| {
+            let (st, id, sql) = (&st, id.clone(), format!(r#"drop table if exists "{t}""#));
+            async move {
+                let s = st.engine.session_for_tests(&id).await.unwrap();
+                if let Ok(r) = s.execute(databrain_connector_core::Statement::internal(&sql), Default::default()).await {
+                    let _ = r.collect().await;
+                }
+            }
+        };
+        for (table, insert_only) in [("dbr_sf_arr_a", false), ("dbr_sf_arr_i", true)] {
+            drop(table).await;
+            let job = load_job(&st, &id, table, src, |n| {
+                n.load_mode = LoadMode::Append;
+                n.load_insert_only = insert_only;
+            });
+            let run = run_all(&st, &job).await;
+            assert_eq!(run.status, "success", "{table}: {run:?}");
+            assert_eq!(step(&run, "loaded").rows, Some(5_000), "{table}");
+            let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+            assert_eq!(
+                log.iter().any(|l| l.message.contains("array INSERTs")),
+                !insert_only,
+                "{table}: {:#?}",
+                log.iter().map(|l| &l.message).collect::<Vec<_>>()
+            );
+        }
+        let (a, i) = (r#"select * from "dbr_sf_arr_a""#, r#"select * from "dbr_sf_arr_i""#);
+        let differ = rows(&st, &id, &format!("select count(*) from (({a} minus {i}) union all ({i} minus {a}))")).await;
+        assert_eq!(differ[0][0], "0", "array binds and INSERTs wrote different rows");
+        assert_eq!(rows(&st, &id, &format!("select count(*) from ({a})")).await[0][0], "5000");
+        // The 19-digit numbers and the decimals kept every digit.
+        let some = rows(&st, &id, r#"select "big", "amount" from "dbr_sf_arr_a" where "id" = 4999"#).await;
+        assert_eq!(some[0][0], "1234567890123460999");
+        assert!(some[0][1].starts_with("714.1428571428"), "{some:?}");
+        for t in ["dbr_sf_arr_a", "dbr_sf_arr_i"] {
+            drop(t).await;
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn export_steps_write_files_with_duckdb() {
     guarded(async {
