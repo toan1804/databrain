@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.4.3 - 2026-11-17
+
 ### Added
 
 - **Jobs, limits and retries:** a time limit per run and per step (a step past its limit is stopped and fails), retries with growing waits after a connection error for steps that can't write twice (reads, saves to a file, loads rolled back as a whole), and a maximum of steps running at once in a job and on one connection (the others show as waiting).
