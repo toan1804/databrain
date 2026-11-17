@@ -10,7 +10,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Changed
 
-- **Faster loads into Databricks:** INSERTs default to 10,000 rows and 8 MB each (were 500 rows and 1 MB; each INSERT is one Delta commit, taking seconds whatever its size), up to 100,000 rows. An INSERT the database refuses for its size is split in two and sent again, outside a transaction, on any database; the run log says so.
+- **Faster loads into Databricks:** INSERTs default to 10,000 rows and 8 MB each (were 500 rows and 1 MB; each INSERT is one Delta commit, taking seconds whatever its size), up to 100,000 rows, and up to 4 run at once (appends to a Delta table don't conflict). An INSERT the database refuses for its size is split in two and sent again, outside a transaction, on any database; the run log says so.
 
 ### Security
 

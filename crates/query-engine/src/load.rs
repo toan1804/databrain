@@ -1278,14 +1278,66 @@ impl Feed<'_, '_> {
     }
 }
 
-/// Batched INSERTs, built one at a time while the rows are sent. A
-/// statement takes rows from as many incoming batches as it needs (rows
-/// arrive 2,000 at a time from a query or a result on disk, which capped
-/// every INSERT at that, whatever the step's setting). An INSERT the
-/// server refuses as too large ([`rejected_as_too_large`]) is sent again
-/// as two of half the rows, and the rest of the load uses that size; only
-/// outside a transaction, where a refused statement wrote nothing and the
-/// session goes on.
+/// Rows waiting for an INSERT: those an INSERT refused as too large (sent
+/// again first), then the feed's. A statement takes rows from as many
+/// incoming batches as its size needs (rows arrive 2,000 at a time from a
+/// query or a result on disk, which capped every INSERT at that).
+struct Pending<'f, 'a, 'b> {
+    feed: &'f mut Feed<'a, 'b>,
+    retry: std::collections::VecDeque<RecordBatch>,
+    rows: Option<RecordBatch>,
+    at: usize,
+    ended: bool,
+}
+
+impl Pending<'_, '_, '_> {
+    /// The next statement for at most `size` rows: its SQL and its rows.
+    async fn next(&mut self, b: &sqlgen::InsertSql, size: usize) -> Result<Option<(String, RecordBatch)>> {
+        fn internal(e: impl std::fmt::Display) -> EngineError {
+            EngineError::new("internal", e.to_string())
+        }
+        if let Some(chunk) = self.retry.pop_front() {
+            let Some((sql, k)) = b.next(&chunk, 0, Some(size)).map_err(internal)? else { return Ok(None) };
+            if k < chunk.num_rows() {
+                self.retry.push_front(chunk.slice(k, chunk.num_rows() - k));
+            }
+            return Ok(Some((sql, chunk.slice(0, k))));
+        }
+        // Rows enough for a full statement, or all that is left.
+        let mut have: Vec<RecordBatch> = self.rows.take().map(|r| r.slice(self.at, r.num_rows() - self.at)).into_iter().filter(|r| r.num_rows() > 0).collect();
+        let mut n: usize = have.iter().map(RecordBatch::num_rows).sum();
+        while !self.ended && n < size {
+            match self.feed.next().await? {
+                Some(batch) => {
+                    n += batch.num_rows();
+                    have.push(batch);
+                }
+                None => self.ended = true,
+            }
+        }
+        self.at = 0;
+        let rows = match have.as_slice() {
+            [] => return Ok(None),
+            [one] => one.clone(),
+            many => databrain_connector_core::arrow::compute::concat_batches(&many[0].schema(), many).map_err(internal)?,
+        };
+        let Some((sql, k)) = b.next(&rows, 0, Some(size)).map_err(internal)? else { return Ok(None) };
+        self.at = k;
+        let taken = rows.slice(0, k);
+        self.rows = Some(rows);
+        Ok(Some((sql, taken)))
+    }
+}
+
+/// Batched INSERTs, built while the rows are sent: one after the other, or
+/// outside a transaction up to the database's `parallel_inserts` at once
+/// (Databricks: each waits seconds for its Delta commit, and appends don't
+/// conflict). An INSERT the server refuses as too large
+/// ([`rejected_as_too_large`]) is sent again as INSERTs of half its rows,
+/// and the rest of the load uses that size; only outside a transaction,
+/// where a refused statement wrote nothing and the session goes on. After a
+/// failure, the INSERTs already running end before it is reported (their
+/// rows count as written).
 async fn insert_rows(
     p: &Prepared,
     table: &str,
@@ -1295,83 +1347,61 @@ async fn insert_rows(
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
     let b = sqlgen::InsertSql::new(p.dialect, table, schema, p.batch);
-    let want = p.batch.rows.max(1);
+    let at_once = if p.tx.is_none() { p.dialect.traits().load.map_or(1, |l| l.parallel_inserts).max(1) } else { 1 };
     let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None };
-    // Rows read and not written yet, and whether the feed has ended.
-    let mut pending: Vec<RecordBatch> = Vec::new();
-    let mut pending_rows = 0usize;
-    let mut ended = false;
-    // Rows per statement after a refusal as too large.
-    let mut cap: Option<usize> = None;
+    let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
+    let mut size = p.batch.rows.max(1);
+    let mut running: tokio::task::JoinSet<(String, RecordBatch, Result<Option<u64>>)> = tokio::task::JoinSet::new();
+    let mut failed: Option<(String, EngineError)> = None;
+    let mut drained = false;
     loop {
-        let fill = cap.unwrap_or(want);
-        while !ended && pending_rows < fill {
-            match feed.next().await {
-                Ok(Some(batch)) => {
-                    pending_rows += batch.num_rows();
-                    pending.push(batch);
+        while failed.is_none() && !drained && running.len() < at_once {
+            match rows.next(&b, size).await {
+                Ok(Some((sql, chunk))) => {
+                    if w.sql.is_empty() {
+                        w.sql = sql.clone();
+                    }
+                    let (session, cancel) = (p.session.clone(), cancel.clone());
+                    running.spawn(async move {
+                        let r = exec(&session, Statement::internal(&sql), &cancel).await;
+                        (sql, chunk, r)
+                    });
                 }
-                Ok(None) => ended = true,
-                Err(e) => {
-                    w.result = Err(e);
-                    return w;
-                }
+                Ok(None) => drained = true,
+                Err(e) => failed = Some((String::new(), e)),
             }
         }
-        if pending_rows == 0 {
-            break;
-        }
-        // Batches carry the rows' names; the statement uses the target's.
-        let rows = match pending.as_slice() {
-            [one] => one.clone(),
-            many => match databrain_connector_core::arrow::compute::concat_batches(&many[0].schema(), many) {
-                Ok(b) => b,
-                Err(e) => {
-                    w.result = Err(EngineError::new("internal", e.to_string()));
-                    return w;
-                }
-            },
+        let Some(done) = running.join_next().await else { break };
+        let (sql, chunk, r) = match done {
+            Ok(x) => x,
+            Err(e) => {
+                failed.get_or_insert((String::new(), EngineError::new("internal", e.to_string())));
+                continue;
+            }
         };
-        pending.clear();
-        let mut at = 0;
-        // Full statements while the rows last; at the end, the rest too.
-        while at < rows.num_rows() && (ended || rows.num_rows() - at >= cap.unwrap_or(want)) {
-            let (sql, k) = match b.next(&rows, at, cap) {
-                Ok(Some(x)) => x,
-                Ok(None) => break,
-                Err(e) => {
-                    w.result = Err(EngineError::new("internal", e.to_string()));
-                    return w;
-                }
-            };
-            if w.sql.is_empty() {
-                w.sql = sql.clone();
+        let k = chunk.num_rows();
+        match r {
+            Ok(_) => {
+                w.rows += k as u64;
+                w.statements += 1;
+                progress(w.rows);
             }
-            match exec(&p.session, Statement::internal(&sql), cancel).await {
-                Ok(_) => {}
-                Err(e) if k > 1 && p.tx.is_none() && rejected_as_too_large(&e) => {
-                    let half = k / 2;
-                    w.split.get_or_insert((k, half)).1 = half;
-                    cap = Some(half);
-                    continue;
-                }
-                Err(e) => {
-                    w.sql = sql;
-                    w.result = Err(e);
-                    return w;
-                }
+            Err(e) if k > 1 && p.tx.is_none() && failed.is_none() && rejected_as_too_large(&e) => {
+                size = size.min(k / 2);
+                w.split.get_or_insert((k, size)).1 = size;
+                rows.retry.push_back(chunk);
+                drained = false;
             }
-            at += k;
-            w.rows += k as u64;
-            w.statements += 1;
-            progress(w.rows);
+            Err(e) => {
+                failed.get_or_insert((sql, e));
+            }
         }
-        if at < rows.num_rows() {
-            pending_rows = rows.num_rows() - at;
-            pending.push(rows.slice(at, pending_rows));
-        } else {
-            pending_rows = 0;
+    }
+    if let Some((sql, e)) = failed {
+        if !sql.is_empty() {
+            w.sql = sql;
         }
+        w.result = Err(e);
     }
     w
 }
@@ -1838,9 +1868,24 @@ mod tests {
 
     /// A warehouse that refuses an INSERT of more than `limit` rows as too
     /// large, and records the rows of each INSERT it takes.
+    #[derive(Default)]
     struct Warehouse {
         limit: usize,
         taken: parking_lot::Mutex<Vec<usize>>,
+        /// INSERTs running now, and the most at once.
+        now: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Warehouse {
+        fn refusing_over(limit: usize) -> Arc<Self> {
+            Arc::new(Warehouse { limit, ..Default::default() })
+        }
+        fn taken(&self) -> Vec<usize> {
+            let mut t = self.taken.lock().clone();
+            t.sort_unstable();
+            t
+        }
     }
 
     #[async_trait::async_trait]
@@ -1855,7 +1900,12 @@ mod tests {
             Ok(())
         }
         async fn execute(&self, stmt: Statement<'_>, _: ExecOptions) -> databrain_connector_core::Result<QueryStream> {
+            use std::sync::atomic::Ordering::SeqCst;
             let rows = stmt.sql().matches("), (").count() + 1;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(n, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.now.fetch_sub(1, SeqCst);
             if rows > self.limit {
                 return Err(databrain_connector_core::ConnectorError::query("Databricks (413 Payload Too Large): request too large"));
             }
@@ -1875,7 +1925,42 @@ mod tests {
         }
     }
 
-    fn prepared(w: Arc<Warehouse>, rows: usize, tx: Option<Tx>) -> Prepared {
+    /// The `at`th INSERT fails (a row the table refuses); the others go to `inner`.
+    struct Failing {
+        inner: Arc<Warehouse>,
+        at: usize,
+        n: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for Failing {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind::Databricks
+        }
+        async fn server_version(&self) -> databrain_connector_core::Result<String> {
+            Ok("test".into())
+        }
+        async fn ping(&self) -> databrain_connector_core::Result<()> {
+            Ok(())
+        }
+        async fn execute(&self, stmt: Statement<'_>, opts: ExecOptions) -> databrain_connector_core::Result<QueryStream> {
+            if self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.at {
+                return Err(databrain_connector_core::ConnectorError::query("bad row: cannot cast 'x' to INT"));
+            }
+            self.inner.execute(stmt, opts).await
+        }
+        async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<databrain_connector_core::SchemaInfo>> {
+            Ok(vec![])
+        }
+        async fn list_objects(&self, _: &str) -> databrain_connector_core::Result<Vec<databrain_connector_core::DbObject>> {
+            Ok(vec![])
+        }
+        async fn describe(&self, _: &str, _: &str) -> databrain_connector_core::Result<databrain_connector_core::ObjectDetail> {
+            Err(databrain_connector_core::ConnectorError::query("no"))
+        }
+    }
+
+    fn prepared(w: Arc<dyn Session>, rows: usize, tx: Option<Tx>) -> Prepared {
         Prepared {
             dialect: ConnectorKind::Databricks,
             connection: "dbx".into(),
@@ -1912,13 +1997,52 @@ mod tests {
     /// INSERT at 2,000 rows); the last one takes what is left.
     #[tokio::test]
     async fn inserts_fill_up_across_incoming_batches() {
-        let w = Arc::new(Warehouse { limit: usize::MAX, taken: Default::default() });
+        let w = Warehouse::refusing_over(usize::MAX);
         let p = prepared(w.clone(), 10, None);
         let (schema, held) = batches(33, 3);
         let written = insert_rows(&p, "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
         assert!(written.result.is_ok());
         assert_eq!((written.rows, written.statements, written.split), (33, 4, None));
-        assert_eq!(*w.taken.lock(), vec![10, 10, 10, 3]);
+        assert_eq!(w.taken(), vec![3, 10, 10, 10]);
+    }
+
+    /// Outside a transaction, Databricks gets up to `parallel_inserts` (4)
+    /// INSERTs at once; in a transaction, one after the other.
+    #[tokio::test]
+    async fn databricks_inserts_run_four_at_once_outside_a_transaction() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (schema, held) = batches(100, 2000);
+        let w = Warehouse::refusing_over(usize::MAX);
+        let written =
+            insert_rows(&prepared(w.clone(), 5, None), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_ok());
+        assert_eq!((written.rows, written.statements), (100, 20));
+        assert_eq!(w.peak.load(SeqCst), 4);
+        assert_eq!(w.taken(), vec![5; 20], "every row once");
+
+        let one = Warehouse::refusing_over(usize::MAX);
+        let tx = Tx { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK" };
+        let written =
+            insert_rows(&prepared(one.clone(), 5, Some(tx)), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert_eq!(written.rows, 100);
+        assert_eq!(one.peak.load(SeqCst), 1);
+    }
+
+    /// A failed INSERT stops the load: no new INSERT starts, those already
+    /// running end, and their rows count as written.
+    #[tokio::test]
+    async fn a_failed_insert_lets_the_running_ones_end() {
+        let w = Warehouse::refusing_over(usize::MAX);
+        let (schema, held) = batches(1000, 2000);
+        let p = prepared(w.clone(), 10, None);
+        // The fourth INSERT fails: a row the table refuses.
+        let failing = Arc::new(Failing { inner: w.clone(), at: 4, n: Default::default() });
+        let p = Prepared { session: failing, ..p };
+        let written = insert_rows(&p, "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.as_ref().is_err_and(|e| e.message.contains("bad row")));
+        let taken = w.taken();
+        assert_eq!(written.rows as usize, taken.iter().sum::<usize>(), "what was written is counted");
+        assert!(taken.len() < 100 && taken.len() >= 3, "no new INSERT after the failure: {}", taken.len());
     }
 
     /// An INSERT refused as too large is sent again as two of half its rows,
@@ -1927,21 +2051,21 @@ mod tests {
     /// and not when a single row is refused.
     #[tokio::test]
     async fn an_insert_refused_as_too_large_is_split() {
-        let w = Arc::new(Warehouse { limit: 4, taken: Default::default() });
+        let w = Warehouse::refusing_over(4);
         let p = prepared(w.clone(), 10, None);
         let (schema, held) = batches(25, 2000);
         let written = insert_rows(&p, "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
         assert!(written.result.is_ok(), "{:?}", written.result.err());
         assert_eq!(written.rows, 25);
-        assert_eq!(written.split, Some((10, 2)), "10 refused, then 5 refused: the load went on with 2");
-        assert_eq!(w.taken.lock().iter().sum::<usize>(), 25);
-        assert!(w.taken.lock().iter().all(|n| *n <= 4));
+        assert_eq!(written.split.map(|s| s.1), Some(2), "10 refused, then 5 refused: the load went on with 2");
+        assert_eq!(w.taken().iter().sum::<usize>(), 25, "every row once");
+        assert!(w.taken().iter().all(|n| *n <= 4));
 
-        let one = Arc::new(Warehouse { limit: 0, taken: Default::default() });
+        let one = Warehouse::refusing_over(0);
         let written = insert_rows(&prepared(one, 10, None), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
         assert!(written.result.is_err_and(|e| e.message.contains("413")));
 
-        let in_tx = Arc::new(Warehouse { limit: 4, taken: Default::default() });
+        let in_tx = Warehouse::refusing_over(4);
         let tx = Tx { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK" };
         let written =
             insert_rows(&prepared(in_tx.clone(), 10, Some(tx)), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
