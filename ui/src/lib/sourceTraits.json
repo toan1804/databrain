@@ -400,7 +400,7 @@
       "create_if_missing": "object_id_check",
       "create_suffix": "",
       "default_bytes": 8388608,
-      "default_rows": 1000,
+      "default_rows": 500,
       "delete_all": "DELETE FROM {}",
       "drop_in_plsql_block": false,
       "explicit_null": false,

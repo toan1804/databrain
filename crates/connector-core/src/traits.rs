@@ -600,7 +600,8 @@ pub const MSSQL: SourceTraits = SourceTraits {
             text: "NVARCHAR(MAX)",
             ..STANDARD_TYPES
         },
-        default_rows: 1000,
+        // 500, not the 1,000 maximum, until compile times of 1,000-row
+        // VALUES lists on wide tables are measured (docs/TODO.md).
         max_rows: 1000,
         rows_note: "SQL Server allows at most 1,000 rows in one VALUES list",
         default_bytes: 8 * MB,

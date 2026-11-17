@@ -1325,24 +1325,25 @@ mod tests {
 
     #[test]
     fn batches_rows() {
-        let (schema, batches) = rows(1201);
+        // MySQL's default is 5,000 rows: 5,000 + 5,000 + 2,001.
+        let (schema, batches) = rows(12_001);
         let s = insert_statements(ConnectorKind::Mysql, "t", &schema, &batches).unwrap();
         assert_eq!(s.len(), 3);
-        assert_eq!(s[2].matches("), (").count() + 1, 201);
+        assert_eq!(s[2].matches("), (").count() + 1, 2001);
         assert!(insert_statements(ConnectorKind::Mysql, "t", &schema, &[]).unwrap().is_empty());
         // One statement at a time, capped.
         let b = InsertSql::new(ConnectorKind::Postgres, "t", &schema, batch_limits(ConnectorKind::Postgres).default_size());
-        let (sql, n) = b.next(&batches[0], 1199, Some(10)).unwrap().unwrap();
+        let (sql, n) = b.next(&batches[0], 11_999, Some(10)).unwrap().unwrap();
         assert_eq!(n, 2);
-        assert!(sql.starts_with(r#"INSERT INTO "t" ("id", "name", "ok", "at") VALUES (1199,"#), "{sql}");
-        assert!(b.next(&batches[0], 1201, None).unwrap().is_none());
+        assert!(sql.starts_with(r#"INSERT INTO "t" ("id", "name", "ok", "at") VALUES (11999,"#), "{sql}");
+        assert!(b.next(&batches[0], 12_001, None).unwrap().is_none());
     }
 
     #[test]
     fn batch_sizes_per_dialect() {
         use ConnectorKind as K;
         let ms = batch_limits(K::Mssql);
-        assert_eq!(ms.resolve(None, None).0, BatchSize { rows: 500, bytes: MB });
+        assert_eq!(ms.resolve(None, None).0, BatchSize { rows: 500, bytes: 8 * MB });
         let (size, notes) = ms.resolve(Some(5000), Some(1_000_000));
         assert_eq!(size, BatchSize { rows: 1000, bytes: 64 * MB });
         assert_eq!(notes.len(), 2);

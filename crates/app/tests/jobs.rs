@@ -336,6 +336,14 @@ async fn load_into_server_databases() {
                 let run = finished(&st, &job.id).await;
                 assert_eq!(run.status, "success", "{kind:?} {mode:?}: {:?}", run.error);
             }
+            if kind == ConnectorKind::Mysql {
+                // INSERTs stay under the server's max_allowed_packet (read when the load starts).
+                let packet: usize = rows(&st, &id, "select @@max_allowed_packet").await[0][0].parse().unwrap();
+                let mut j = st.workspace.get_job(&job.id).unwrap();
+                j.nodes[1].batch_kb = Some(1_000_000);
+                let r = api::dry_run_job_step(&st, j, "b").await.unwrap();
+                assert!(r.batch.unwrap().bytes < packet, "{r:?}");
+            }
             let got = rows(&st, &id, "select id, name, amount, missing from databrain_job_load order by id").await;
             assert_eq!(got.len(), 2, "{kind:?}: truncate kept 2 rows");
             assert_eq!(got[0][1], "it's \"x\"", "{kind:?}");

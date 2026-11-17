@@ -1190,8 +1190,15 @@ impl QueryEngine {
         for (i, s) in after.iter().enumerate() {
             plan.push(Act::User { label: format!("After SQL {}", i + 1), sql: s.clone() });
         }
-        let (batch, lowered) = sqlgen::batch_limits(dialect).resolve(spec.batch_rows, spec.batch_kb);
+        let (mut batch, lowered) = sqlgen::batch_limits(dialect).resolve(spec.batch_rows, spec.batch_kb);
         notices.extend(lowered);
+        if dialect == ConnectorKind::Mysql {
+            let packet = databrain_connector_core::query_text(&*session, "SELECT @@max_allowed_packet")
+                .await
+                .ok()
+                .and_then(|r| r.first().and_then(|row| row.first().cloned().flatten()).and_then(|v| v.trim().parse::<usize>().ok()));
+            notices.extend(fit_packet(&mut batch, packet, spec.batch_kb.is_some_and(|k| k > 0)));
+        }
         let tx = transaction(dialect, &plan);
         if tx.is_none() {
             notices.push(match dialect.traits().transactions {
@@ -1219,6 +1226,29 @@ impl QueryEngine {
             insert_only,
         })
     }
+}
+
+/// MySQL refuses a statement past the server's `max_allowed_packet` and
+/// closes the connection (in a load's transaction, nothing can go on), so
+/// INSERTs stay under it, with room for the packet's own bytes: the
+/// default size quietly, a size the step set with a note. When the server
+/// doesn't say (`packet` is `None`), the default stays at 1 MB, under any
+/// server's setting.
+fn fit_packet(batch: &mut sqlgen::BatchSize, packet: Option<usize>, user_set: bool) -> Option<String> {
+    const KB: usize = 1024;
+    let Some(packet) = packet else {
+        if !user_set {
+            batch.bytes = batch.bytes.min(1024 * KB);
+        }
+        return None;
+    };
+    let room = packet.saturating_sub((packet / 10).max(16 * KB)).max(KB);
+    if batch.bytes <= room {
+        return None;
+    }
+    let was = batch.bytes;
+    batch.bytes = room;
+    user_set.then(|| format!("INSERT size lowered from {} KB to {} KB (the server's max_allowed_packet is {} KB)", was / KB, room / KB, packet / KB))
 }
 
 fn created_notice(p: &Prepared, rows: &LoadRows) -> String {
@@ -2442,6 +2472,33 @@ mod tests {
         assert!(w.result.is_err_and(|e| e.message.contains("WRITE VOLUME")));
         assert_eq!(w.rows, 0, "nothing inserted");
         assert!(!st.finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// MySQL INSERTs stay under the server's max_allowed_packet: the
+    /// default quietly, a size the step set with a note; unknown, 1 MB.
+    #[test]
+    fn mysql_inserts_fit_the_servers_packet() {
+        const MB: usize = 1024 * 1024;
+        let size = |bytes| sqlgen::BatchSize { rows: 5000, bytes };
+        // 64 MB (MySQL 8.0): the 3 MB default fits.
+        let mut b = size(3 * MB);
+        assert_eq!(fit_packet(&mut b, Some(64 * MB), false), None);
+        assert_eq!(b.bytes, 3 * MB);
+        // A hosted server at 1 MB: under it, quietly.
+        let mut b = size(3 * MB);
+        assert_eq!(fit_packet(&mut b, Some(MB), false), None);
+        assert!(b.bytes < MB && b.bytes > MB / 2, "{}", b.bytes);
+        // 4 MB (5.7) and the step's own 16 MB: lowered, with a note.
+        let mut b = size(16 * MB);
+        let note = fit_packet(&mut b, Some(4 * MB), true).unwrap();
+        assert!(b.bytes < 4 * MB && note.contains("max_allowed_packet is 4096 KB"), "{note}");
+        // The server didn't say: 1 MB, or the step's own size.
+        let mut b = size(3 * MB);
+        assert_eq!(fit_packet(&mut b, None, false), None);
+        assert_eq!(b.bytes, MB);
+        let mut b = size(8 * MB);
+        fit_packet(&mut b, None, true);
+        assert_eq!(b.bytes, 8 * MB);
     }
 
     /// What counts as refused for its size (sent again smaller), and what doesn't.
