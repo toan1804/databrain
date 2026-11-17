@@ -48,13 +48,18 @@ impl Inner {
     /// A Files API request on `path` (`files` or `directories`), its body if
     /// any. Sent again (both are idempotent: an upload overwrites, a delete
     /// of what is gone is done) after a refused sign-in once, and after a
-    /// busy or failing server (429, 5xx) or a dropped connection up to
-    /// [`FILES_TRIES`] times in all, waiting longer each time.
+    /// busy or failing server (429, 5xx) or a connection that failed (not a
+    /// timeout: the client waits minutes for each) up to [`FILES_TRIES`]
+    /// times in all, waiting longer each time. When the tries run out, the
+    /// server's own answer is the error.
     async fn files(&self, method: reqwest::Method, api: &str, path: &str, body: Option<bytes::Bytes>) -> Result<()> {
         let url = format!("{}/api/2.0/fs/{api}{}{}", self.origin, url_path(path), if body.is_some() { "?overwrite=true" } else { "" });
         let mut signed_in_again = false;
         let mut wait = std::time::Duration::from_millis(500);
-        for attempt in 1..=FILES_TRIES {
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let last = tries >= FILES_TRIES;
             let token = self.token().await?;
             let mut req = self.http.request(method.clone(), &url).bearer_auth(token);
             if let Some(b) = &body {
@@ -63,8 +68,8 @@ impl Inner {
             }
             let resp = match req.send().await {
                 Ok(r) => r,
-                Err(e) if attempt < FILES_TRIES => {
-                    tracing::info!(error = %e, attempt, "Databricks Files API request failed; trying again");
+                Err(e) if !last && !e.is_timeout() && (e.is_connect() || e.is_request() || e.is_body()) => {
+                    tracing::info!(error = %e, tries, "Databricks Files API request failed; trying again");
                     tokio::time::sleep(wait).await;
                     wait *= 2;
                     continue;
@@ -73,11 +78,13 @@ impl Inner {
             };
             let status = resp.status().as_u16();
             if status == 401 && !signed_in_again {
+                // Signing in again doesn't use up a try.
                 signed_in_again = true;
+                tries -= 1;
                 self.creds.invalidate().await;
                 continue;
             }
-            if (status == 429 || resp.status().is_server_error()) && attempt < FILES_TRIES {
+            if (status == 429 || resp.status().is_server_error()) && !last {
                 tokio::time::sleep(wait).await;
                 wait *= 2;
                 continue;
@@ -88,7 +95,6 @@ impl Inner {
             }
             return json_body(resp, "Databricks Files API").await.map(|_| ());
         }
-        Err(ConnectorError::connection("Databricks Files API: no answer after several tries"))
     }
 
     /// Delete the staged files and their folder, best effort.
@@ -267,6 +273,18 @@ mod tests {
         let mut w = s.bulk_load("INSERT INTO t SELECT 1", CancellationToken::new()).await.unwrap().unwrap();
         w.write(b"PAR1".to_vec()).await.unwrap();
         assert_eq!(log.lock().unwrap().requests.iter().filter(|r| r.0 == "PUT").count(), 2, "refused once, then taken");
+    }
+
+    /// A server that stays down: tried 4 times, then its own message is the error.
+    #[tokio::test]
+    async fn a_server_that_stays_down_says_why() {
+        use databrain_connector_core::Session;
+        let (origin, log) = crate::databricks::testutil::mock::serve("volume_down").await;
+        let s = crate::databricks::testutil::mock::staging_session(&origin, "/Volumes/main/etl/stage");
+        let mut w = s.bulk_load("INSERT INTO t SELECT 1", CancellationToken::new()).await.unwrap().unwrap();
+        let e = w.write(b"PAR1".to_vec()).await.unwrap_err();
+        assert!(e.message.contains("down for maintenance"), "{}", e.message);
+        assert_eq!(log.lock().unwrap().requests.iter().filter(|r| r.0 == "PUT").count(), FILES_TRIES as usize);
     }
 
     /// A finish stopped while its INSERT runs (a step's time limit, a

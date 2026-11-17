@@ -1360,11 +1360,13 @@ async fn insert_rows(
 ) -> Written {
     let b = sqlgen::InsertSql::new(p.dialect, table, schema, p.batch);
     let mut at_once = if p.tx.is_none() { p.dialect.traits().load.map_or(1, |l| l.parallel_inserts).max(1) } else { 1 };
-    let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None, parallel: at_once > 1, serialized: false };
+    let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()), split: None, parallel: false, serialized: false };
     let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     let mut size = p.batch.rows.max(1);
-    // Each INSERT's SQL, rows, result, and whether it ran beside others.
-    let mut running: tokio::task::JoinSet<(String, RecordBatch, Result<Option<u64>>, bool)> = tokio::task::JoinSet::new();
+    // Each INSERT's SQL, rows, result, whether another was running when it
+    // started, and how many had started before it.
+    let mut running: tokio::task::JoinSet<(String, RecordBatch, Result<Option<u64>>, bool, usize)> = tokio::task::JoinSet::new();
+    let mut started = 0usize;
     let mut failed: Option<(String, EngineError)> = None;
     let mut drained = false;
     loop {
@@ -1374,10 +1376,13 @@ async fn insert_rows(
                     if w.sql.is_empty() {
                         w.sql = sql.clone();
                     }
-                    let (session, cancel, together) = (p.session.clone(), cancel.clone(), at_once > 1);
+                    let (session, cancel, beside, seq) = (p.session.clone(), cancel.clone(), !running.is_empty(), started);
+                    // Rows written before a failure may now not be the first ones.
+                    w.parallel |= beside;
+                    started += 1;
                     running.spawn(async move {
                         let r = exec(&session, Statement::internal(&sql), &cancel).await;
-                        (sql, chunk, r, together)
+                        (sql, chunk, r, beside, seq)
                     });
                 }
                 Ok(None) => drained = true,
@@ -1385,7 +1390,7 @@ async fn insert_rows(
             }
         }
         let Some(done) = running.join_next().await else { break };
-        let (sql, chunk, r, together) = match done {
+        let (sql, chunk, r, beside, seq) = match done {
             Ok(x) => x,
             Err(e) => {
                 failed.get_or_insert((String::new(), EngineError::new("internal", e.to_string())));
@@ -1393,6 +1398,9 @@ async fn insert_rows(
             }
         };
         let k = chunk.num_rows();
+        // It ran beside another: one was running when it started, or one
+        // started before its result was taken.
+        let together = beside || started > seq + 1;
         match r {
             Ok(_) => {
                 w.rows += k as u64;
@@ -1441,6 +1449,8 @@ fn concurrent_write_conflict(e: &EngineError) -> bool {
         "delta_concurrent_append",
         "delta_metadata_changed",
         "delta_concurrent_transaction",
+        "concurrentwriteexception",
+        "delta_concurrent_write",
     ]
     .iter()
     .any(|w| m.contains(w))
@@ -1912,7 +1922,7 @@ async fn run_plan(
                 });
                 let note = Some(format!("{n} rows in {statements} statement{}", if statements == 1 { "" } else { "s" }));
                 push(&mut record, label, &first, &r, if r.is_ok() { note } else { None });
-                let after = if parallel {
+                let after = if parallel && n > 0 {
                     format!("{label} ({n} rows written by INSERTs that ran at the same time: not necessarily the first {n} rows)")
                 } else {
                     format!("{label} (after {n} rows)")
@@ -2264,13 +2274,26 @@ mod tests {
         assert!(written.serialized);
         assert_eq!(written.rows, 100);
         assert_eq!(w.taken().iter().sum::<usize>(), 100, "every row once");
-        // A conflict when only one ran (another writer): it fails as before.
+        // A conflict on an INSERT that ran alone (another writer), outside a
+        // transaction: it fails as before, and the rows aren't said to be out of order.
         let alone = Arc::new(Warehouse { limit: usize::MAX, one_writer: true, ..Default::default() });
         alone.now.store(1, SeqCst);
-        let tx = Tx { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK" };
-        let written =
-            insert_rows(&prepared(alone, 10, Some(tx)), "t", &schema, Feed { held: held.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        let (schema, one) = batches(5, 2000);
+        let written = insert_rows(&prepared(alone, 10, None), "t", &schema, Feed { held: one.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
         assert!(written.result.is_err_and(|e| e.message.contains("MetadataChangedException")));
+        assert!(!written.parallel && !written.serialized);
+    }
+
+    /// A load whose only INSERT fails, or whose first one does, ran nothing
+    /// beside it: its error keeps "after 0 rows", not the parallel wording.
+    #[tokio::test]
+    async fn a_load_that_ran_one_insert_isnt_called_parallel() {
+        let w = Warehouse::refusing_over(usize::MAX);
+        let (schema, one) = batches(5, 2000);
+        let p = Prepared { session: Arc::new(Failing { inner: w, at: 1, n: Default::default() }), ..prepared(Warehouse::refusing_over(1), 10, None) };
+        let written = insert_rows(&p, "t", &schema, Feed { held: one.iter(), rest: None }, &CancellationToken::new(), &|_| {}).await;
+        assert!(written.result.is_err());
+        assert!(!written.parallel);
     }
 
     #[test]
@@ -2278,6 +2301,7 @@ mod tests {
         let e = |m: &str| EngineError::new("query", m);
         assert!(concurrent_write_conflict(&e("[DELTA_CONCURRENT_APPEND] ConcurrentAppendException: Files were added")));
         assert!(concurrent_write_conflict(&e("MetadataChangedException: The metadata of the Delta table has been changed")));
+        assert!(concurrent_write_conflict(&e("[DELTA_CONCURRENT_WRITE] ConcurrentWriteException: A concurrent transaction has written new data")));
         assert!(!concurrent_write_conflict(&e("[TABLE_OR_VIEW_NOT_FOUND] t")));
         assert!(!concurrent_write_conflict(&e("[CAST_INVALID_INPUT] 'x' cannot be cast to INT")));
     }

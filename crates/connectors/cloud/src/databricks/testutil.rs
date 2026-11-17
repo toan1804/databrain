@@ -129,7 +129,10 @@ pub mod mock {
                             *h += 1;
                             *h == 1
                         };
-                        if blob_mode == "volume_flaky" && first_put {
+                        if blob_mode == "volume_down" && method == "PUT" {
+                            raw = None;
+                            (503, json!({"error_code": "TEMPORARILY_UNAVAILABLE", "message": "the volume service is down for maintenance"}))
+                        } else if blob_mode == "volume_flaky" && first_put {
                             raw = None;
                             (503, json!({"error_code": "TEMPORARILY_UNAVAILABLE", "message": "try again"}))
                         } else if blob_mode == "volume_denied" && method == "PUT" {
