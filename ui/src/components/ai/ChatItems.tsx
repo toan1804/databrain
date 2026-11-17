@@ -17,7 +17,9 @@ export function SqlBlock({ code, lang }: { code: string; lang: string }) {
   const isSql = !lang || lang === "sql";
   return (
     <div className="overflow-hidden rounded-md border border-line bg-panel-2">
-      <pre className="max-h-72 overflow-auto p-2 font-mono text-[12px] leading-snug select-text">{code}</pre>
+      {/* Long lines wrap: the panel is narrow, and a line cut at its edge
+          (its scrollbar hidden until scrolled) looked like the whole statement. */}
+      <pre className="max-h-72 overflow-auto whitespace-pre-wrap wrap-anywhere p-2 font-mono text-[12px] leading-snug select-text">{code}</pre>
       <div className="flex gap-1 border-t border-line px-1.5 py-1">
         <button className="btn-ghost h-6 px-1.5 py-0 text-[11px]" onClick={() => void writeText(code).then(() => st().toast("Copied", "success"))}>
           <Copy size={11} /> Copy
@@ -150,7 +152,7 @@ function ToolCard({ item }: { item: Extract<ChatItem, { kind: "tool" }> }) {
       {results[0] && <MiniGrid info={results[0]} />}
       {open && (
         <div className="space-y-1.5 border-t border-line p-2">
-          {arg("sql") && <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11.5px] select-text">{arg("sql")}</pre>}
+          {arg("sql") && <pre className="overflow-x-auto whitespace-pre-wrap wrap-anywhere font-mono text-[11.5px] select-text">{arg("sql")}</pre>}
           {item.content && (
             <pre className="max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-muted select-text">{item.content}</pre>
           )}
@@ -234,7 +236,7 @@ function ApprovalCard({
             {lines > 24 && <div className="mt-0.5 text-[11px] text-warning">{lines} lines: scroll the box to read all of it before allowing.</div>}
           </>
         ) : (
-          <pre className="whitespace-pre-wrap font-mono text-[11.5px] select-text">{sql}</pre>
+          <pre className="whitespace-pre-wrap wrap-anywhere font-mono text-[11.5px] select-text">{sql}</pre>
         ))}
       {initialSql === undefined && typeof item.detail.preview === "string" && (
         <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border border-line bg-panel-2 p-1.5 font-mono text-[11px] select-text">{item.detail.preview}</pre>

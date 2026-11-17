@@ -11,6 +11,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Fixed
 
 - AI usage with Kiro: "today" and "this month" showed 0 tokens, since Kiro bills credits, not tokens. They now show the credits DataBrain's conversations and test data spent, including turns that were stopped.
+- AI panel: a long line of SQL in an answer (a `CREATE TABLE … PARTITION BY …`) was cut at the panel's edge, as if the statement ended there. Long lines now wrap; Copy, Insert and Open in tab keep the statement's own line breaks.
 
 ## 0.4.3 - 2026-11-17
 
