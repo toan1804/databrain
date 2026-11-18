@@ -12,4 +12,10 @@ rows: number,
 /**
  * Sync: rows of the table deleted because their key isn't among the rows.
  */
-deleted: number, created_table: boolean, transaction: boolean, notices: Array<string>, };
+deleted: number, created_table: boolean, transaction: boolean, notices: Array<string>, 
+/**
+ * The rows went slower than they could: the target bulk loads, but a
+ * column of the rows isn't the table's type, so they went by INSERTs
+ * (what to change is in the text).
+ */
+warnings: Array<string>, };

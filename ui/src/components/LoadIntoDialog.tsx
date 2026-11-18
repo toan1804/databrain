@@ -10,6 +10,7 @@ import { useLoads } from "../loadsStore";
 import type { LoadDryRun, LoadMode, LoadReport, ResultInfo } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { useStore } from "../store";
+import { Warnings } from "./job/shared";
 import { DryRunReport, LoadTargetCheck, isKeyedMode, loadModesFor, loadResultAsking, loadTargetBlocked, useLoadTarget } from "./job/LoadFields";
 import { Modal } from "./ui";
 
@@ -197,6 +198,7 @@ export function LoadIntoDialog({
             {report.deleted > 0 ? `, ${formatCount(report.deleted)} deleted` : ""}
             {report.transaction ? ", in one transaction" : ""}.
           </p>
+          <Warnings warnings={report.warnings} />
           {report.notices.map((n, i) => (
             <p key={i} className="text-[11.5px] text-muted">
               {n}

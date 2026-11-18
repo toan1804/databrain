@@ -654,7 +654,7 @@ export function DryRunReport({ report }: { report: LoadDryRun }) {
             )}
             <div className="min-w-0 flex-1">
               <span className="font-medium">{c.label}</span>
-              {c.message && <span className={c.status === "error" ? " text-danger" : " text-muted"}> · {c.message}</span>}
+              {c.message && <span className={c.status === "error" ? " text-danger" : c.status === "warning" ? " text-warning" : " text-muted"}> · {c.message}</span>}
               {c.sql && (
                 <div className="truncate font-mono text-[10.5px] text-muted" title={c.sql}>
                   {c.sql}

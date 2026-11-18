@@ -78,6 +78,11 @@ pub struct LoadReport {
     pub created_table: bool,
     pub transaction: bool,
     pub notices: Vec<String>,
+    /// The rows went slower than they could: the target bulk loads, but a
+    /// column of the rows isn't the table's type, so they went by INSERTs
+    /// (what to change is in the text).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Where a load would write, checked against the database: which parts of
@@ -161,6 +166,9 @@ pub struct LoadDryRun {
 pub enum LoadEvent {
     /// Something to know (the plan, a created table, the transaction).
     Info(String),
+    /// Something the user should change: the target bulk loads, but a
+    /// column of the rows sends them by INSERTs.
+    Warning(String),
     /// One statement finished (before/after SQL, DDL, update/merge…).
     Statement { label: String, sql: String, rows: Option<u64>, duration_ms: u64, error: Option<String> },
     /// Rows written so far by a group of INSERTs (sent after each
@@ -179,6 +187,21 @@ pub enum LoadEvent {
 /// Receives [`LoadEvent`]s while a load runs.
 pub trait LoadObserver: Send + Sync {
     fn event(&self, e: LoadEvent);
+}
+
+/// Passes events on, keeping the warnings for the load's report.
+struct Noting<'a> {
+    obs: &'a dyn LoadObserver,
+    warnings: parking_lot::Mutex<Vec<String>>,
+}
+
+impl LoadObserver for Noting<'_> {
+    fn event(&self, e: LoadEvent) {
+        if let LoadEvent::Warning(w) = &e {
+            self.warnings.lock().push(w.clone());
+        }
+        self.obs.event(e);
+    }
 }
 
 /// Observer that ignores everything.
@@ -640,6 +663,9 @@ impl QueryEngine {
         // Once the commit is sent, a failure (a lost connection) may come
         // after the server committed.
         let mut committing = false;
+        // Warnings go into the report too (the step, the dialog), not only the log.
+        let noting = Noting { obs, warnings: Default::default() };
+        let obs: &dyn LoadObserver = &noting;
         let result = async {
             let n = run_plan(&p, rows, rest.as_deref_mut(), expected, cancel, None, obs).await?;
             if let Some(tx) = &p.tx {
@@ -662,7 +688,7 @@ impl QueryEngine {
                     obs.event(LoadEvent::Info(d.clone()));
                     notices.push(d);
                 }
-                Ok(LoadReport { rows: n, deleted, created_table: p.creates, transaction: p.tx.is_some(), notices })
+                Ok(LoadReport { rows: n, deleted, created_table: p.creates, transaction: p.tx.is_some(), notices, warnings: noting.warnings.lock().clone() })
             }
             Err(e) => {
                 obs.event(LoadEvent::Failed { kept_nothing: kept_nothing(p.tx.is_some(), p.may_commit, committing) });
@@ -1826,6 +1852,9 @@ impl Bulk {
     }
 }
 
+/// After a warning that a column sends the rows by INSERTs: what to change.
+const MISFIT_HINT: &str = " To load in bulk, give that column of the rows the table's type in the SQL that selects them (a cast)";
+
 /// The bulk load these rows may use (`Ok(None)`: INSERTs), as [`bulk_copy`]
 /// and [`bulk_staged`] decide.
 async fn bulk_plan(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<Bulk>, CopyCheck> {
@@ -2264,9 +2293,18 @@ async fn run_plan(
                 let started = std::time::Instant::now();
                 let phase = if *target { "Inserting rows" } else { "Staging rows" };
                 let mut why_not = None;
+                // A column of the rows the bulk load won't take (the connection
+                // has one): the user's to change, so a warning; a setting (no
+                // staging volume, load jobs off) stays a note.
+                let bulk_on = !p.insert_only && p.session.bulk_load_possible();
+                let mut column_misfit = false;
+                if p.insert_only {
+                    obs.event(LoadEvent::Info(format!("{label}: INSERTs (the step is set to INSERTs only)")));
+                }
                 let copy = match bulk_plan(p, table, &schema, cancel).await {
                     Ok(c) => c,
                     Err(CopyCheck::Inserts(why)) => {
+                        column_misfit = bulk_on;
                         why_not = Some(why);
                         None
                     }
@@ -2281,6 +2319,7 @@ async fn run_plan(
                     Some(c) => match p.session.bulk_load(c.spec(), cancel.clone()).await {
                         Ok(Some(w)) => Some((c, w)),
                         Ok(None) => {
+                            column_misfit = false;
                             why_not = Some(match c {
                                 Bulk::Copy(_) => "this connection has no COPY".into(),
                                 Bulk::Staged(_) => "no staging volume is set in the connection's settings".into(),
@@ -2320,8 +2359,18 @@ async fn run_plan(
                     };
                     match fits {
                         Ok(()) => Some(()),
-                        Err(why) => {
+                        // Not read: a note (nothing for the user to cast).
+                        Err(why) if why.starts_with("the table's columns couldn't be read") => {
                             obs.event(LoadEvent::Info(format!("{label}: INSERTs, not {} ({why})", appender_word(p.dialect))));
+                            None
+                        }
+                        Err(why) => {
+                            let w = format!("{label}: INSERTs, not {} ({why}).{MISFIT_HINT}", appender_word(p.dialect));
+                            obs.event(LoadEvent::Warning(w.clone()));
+                            push(&mut record, &format!("{label}: how"), "", &Ok(()), Some(w));
+                            if let Some(last) = record.as_deref_mut().and_then(|r| r.last_mut()) {
+                                last.status = "warning".into();
+                            }
                             None
                         }
                     }
@@ -2345,9 +2394,13 @@ async fn run_plan(
                     (None, None) => String::new(),
                 };
                 if !how.is_empty() {
-                    obs.event(LoadEvent::Info(format!("{label}: {how}")));
-                    // The dry run says which one the load would use.
-                    push(&mut record, &format!("{label}: how"), "", &Ok(()), Some(how));
+                    let misfit = column_misfit && writer.is_none();
+                    obs.event(if misfit { LoadEvent::Warning(format!("{label}: {how}.{MISFIT_HINT}")) } else { LoadEvent::Info(format!("{label}: {how}")) });
+                    // The dry run says which one the load would use (a misfit as a warning).
+                    push(&mut record, &format!("{label}: how"), "", &Ok(()), Some(if misfit { format!("{how}.{MISFIT_HINT}") } else { how }));
+                    if misfit && let Some(last) = record.as_deref_mut().and_then(|r| r.last_mut()) {
+                        last.status = "warning".into();
+                    }
                 }
                 obs.event(LoadEvent::Progress { phase: phase.into(), done: 0, total, elapsed_ms: 0 });
                 let feed = Feed { held: rows.batches.iter(), rest: rest.as_deref_mut() };

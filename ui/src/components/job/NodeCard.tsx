@@ -1,6 +1,6 @@
 // A step on the job canvas: name, action, connection, status, link handle.
 import { type PointerEvent as ReactPointerEvent } from "react";
-import { FileDown, ArrowDownToLine, Database, Square } from "lucide-react";
+import { AlertTriangle, FileDown, ArrowDownToLine, Database, Square } from "lucide-react";
 import type { JobNode, NodeRunSummary } from "../../lib/types";
 import { NODE_H, NODE_W } from "../../lib/jobGraph";
 import { useStore } from "../../store";
@@ -89,6 +89,12 @@ export function NodeCard({
       <div className={`mt-auto flex min-w-0 items-center gap-1 text-[10.5px] ${status?.status === "error" ? "text-danger" : "text-muted"}`} title={status?.error ?? undefined}>
         <StatusIcon status={status?.status} />
         <span className="min-w-0 flex-1 truncate">{node.sql.trim() || node.kind !== "query" ? statusText(status) : "No SQL yet"}</span>
+        {/* Loaded, but by INSERTs where a bulk load could have: why is in the step's panel. */}
+        {!!status?.warnings?.length && status.status !== "running" && (
+          <span title={status.warnings.join("\n")} aria-label="Loaded by INSERTs, not in bulk" className="shrink-0 text-warning">
+            <AlertTriangle size={11} />
+          </span>
+        )}
         {(status?.status === "running" || status?.status === "waiting") && (
           <button
             type="button"

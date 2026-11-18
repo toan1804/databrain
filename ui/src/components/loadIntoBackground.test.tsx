@@ -17,7 +17,7 @@ const { ActivityBar } = await import("./ActivityBar");
 import type { LoadReport, ResultInfo } from "../lib/types";
 
 const info = { id: "r1", total_rows: 1000, truncated: false, columns: [] } as unknown as ResultInfo;
-const report: LoadReport = { rows: 1000, deleted: 0, created_table: false, transaction: true, notices: [] };
+const report: LoadReport = { rows: 1000, deleted: 0, created_table: false, transaction: true, notices: [], warnings: [] };
 const target = { resolved: "orders", catalog: null, schema: null, table: "orders", catalog_exists: null, schema_exists: null, table_exists: true, problems: [], notes: [], respelled: false };
 
 /** The dialog open on "select * from orders" with Warehouse picked, ready to load. */

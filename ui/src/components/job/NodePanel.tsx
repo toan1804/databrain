@@ -18,7 +18,7 @@ import { StepLimitFields } from "./LimitFields";
 import { RunLog } from "./RunLog";
 import { RunDateFields } from "./RunDateFields";
 import { RUN_DATE, wallClockUse } from "./runDate";
-import { EDITOR_KEY, NodeList, ProgressBar, StatusIcon, actionIcon, field, isResults, label, latestTab, statusText, type Patch } from "./shared";
+import { EDITOR_KEY, NodeList, ProgressBar, StatusIcon, Warnings, actionIcon, field, isResults, label, latestTab, statusText, type Patch } from "./shared";
 import { outputNames } from "../../lib/sqlText";
 
 export function NodePanel({
@@ -188,6 +188,7 @@ export function NodePanel({
             <ProgressBar p={status.progress} />
           </div>
         )}
+        <Warnings warnings={status?.warnings} className="mt-1.5" />
         {status?.notices?.map((n, i) => (
           <div key={i} className="mt-1 flex items-start gap-1 text-[11.5px] text-accent">
             <Info size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">{n}</span>

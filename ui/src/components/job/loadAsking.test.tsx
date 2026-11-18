@@ -4,7 +4,7 @@ import type { ConnectionView, LoadReport, LoadResultArgs } from "../../lib/types
 import { useStore } from "../../store";
 import { loadResultAsking } from "./LoadFields";
 
-const report: LoadReport = { rows: 2, deleted: 0, created_table: false, transaction: true, notices: [] };
+const report: LoadReport = { rows: 2, deleted: 0, created_table: false, transaction: true, notices: [], warnings: [] };
 const args: LoadResultArgs = { target_connection_id: "c1", table: "t", mode: "append", key_columns: [], create_table: false, confirmed: false };
 const withEnv = (env: ConnectionView["env"]) => useStore.setState({ connections: [{ id: "c1", name: "Main", env } as ConnectionView] });
 

@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, BookOpen, Eye, Link2, Loader2, Sparkles, Square, Upload } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { useLoads } from "../loadsStore";
+import { Warnings } from "./job/shared";
 import type { LoadDryRun, LoadReport, TestDataColumn, TestDataOutput, TestDataPlan, TestDataSpec } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { openOutput } from "../outputs";
@@ -435,6 +436,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
             {formatCount(report.rows)} rows written into <span className="font-mono">{p.table}</span> on {conn?.name}
             {report.transaction ? ", in one transaction" : ""}.
           </p>
+          <Warnings warnings={report.warnings} />
           {[...(made?.notes ?? []), ...report.notices].map((n, i) => (
             <p key={i} className="text-[11.5px] text-muted">
               {n}
