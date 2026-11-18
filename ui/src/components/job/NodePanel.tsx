@@ -330,7 +330,7 @@ function WallClockHint({ sql }: { sql: string }) {
       <AlertTriangle size={12} className="mt-0.5 shrink-0 text-warning" />
       <span>
         Uses <code>{fn}</code>: a run that starts late, a missed run made up later or a Resume the next day reads the day it runs, not the day it is for. Use{" "}
-        <code>:{RUN_DATE}</code> (the date the run is for): below, how to write the day before on this database and what it gives.
+        <code>:{RUN_DATE}</code> (the date the run is for): the box below shows what it is where this SQL runs.
       </span>
     </div>
   );

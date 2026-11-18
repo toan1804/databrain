@@ -1902,18 +1902,33 @@ fn type_run_moment(params: &mut HashMap<String, ParamValue>, kind: ConnectorKind
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[ts(export)]
 pub struct RunMomentPreview {
-    /// Where the step's SQL runs (a load's or export's on Results, DuckDB).
-    pub kind: ConnectorKind,
-    /// The run's date and time as given (`2026-11-18`, `2026-11-18 06:30:00`).
+    /// The run's date and time (`2026-11-18`, `2026-11-18 06:30:00`): the
+    /// one asked for, else the job's (its parameter set's) `run_date`, else
+    /// now in the job's time zone.
     pub date: String,
     pub time: String,
-    /// As the step's database gets them (`DATE '2026-11-18'`).
+    /// The step's SQL, then a load's before and after SQL (on the target),
+    /// those it has.
+    pub parts: Vec<RunMomentPart>,
+}
+
+/// One SQL text of a step, on the database it runs on.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct RunMomentPart {
+    #[ts(type = "\"step\" | \"before\" | \"after\"")]
+    pub what: String,
+    /// Where it runs: a query step's connection; a load's or export's own
+    /// SQL on Results (DuckDB); before/after SQL on the load's target.
+    pub kind: ConnectorKind,
+    /// `:run_date` is text there (SQLite, MongoDB, Neo4j), not a date.
+    pub text: bool,
+    /// As that database gets them (`DATE '2026-11-18'`).
     pub run_date: String,
     pub run_time: String,
-    /// The step's SQL with them in (other parameters as written); empty
-    /// when the step has none of its own.
+    /// The SQL with them in (other parameters as written).
     pub sql: String,
-    /// Ways to write the day before in this database, and what each gives.
+    /// Ways to write the day before there, and what each gives.
     pub examples: Vec<RunDateExample>,
 }
 
@@ -1990,33 +2005,52 @@ pub fn run_date_examples(kind: ConnectorKind, date: chrono::NaiveDate) -> Vec<Ru
 }
 
 /// [`RunMomentPreview`] of step `node_id` of `job` (as edited), for a run
-/// for `date` (`2026-11-18`), or now in the job's time zone.
+/// for `date` (`2026-11-18`): the values a run would get, the run's date
+/// as the job's parameters set it otherwise ([`effective_params`]), else now.
 pub fn run_moment_preview(ctx: &JobCtx, job: &Job, node_id: &str, date: Option<&str>) -> Result<RunMomentPreview> {
     let node = job.nodes.iter().find(|n| n.id == node_id).ok_or_else(|| EngineError::new("not_found", "No such step"))?;
-    let kind = match (&node.kind, node.connection_id.as_deref()) {
-        (JobNodeKind::Query, Some(c)) if !c.is_empty() => connection_kind(ctx, c),
-        _ => ConnectorKind::Duckdb,
-    };
-    let mut values = BTreeMap::new();
+    // As a run builds them: the set's, the job's, then the run's (the date asked for).
+    let (all, _) = effective_params(&ctx.workspace, job, None).unwrap_or_default();
+    let mut values: BTreeMap<String, ParamValue> = all.into_iter().filter(|(k, _)| k == RUN_DATE || k == RUN_TIME).collect();
     if let Some(d) = date.map(str::trim).filter(|d| !d.is_empty()) {
         values.insert(RUN_DATE.to_string(), ParamValue { value: d.to_string(), raw: false });
+        values.remove(RUN_TIME);
     }
     fill_run_moment(job, &mut values, now_ms()).map_err(|e| EngineError::new("invalid", e))?;
     let plain = |k: &str| values.get(k).map(|v| v.value.clone()).unwrap_or_default();
     let (date, time) = (plain(RUN_DATE), plain(RUN_TIME));
-    let mut typed: HashMap<String, ParamValue> = values.into_iter().collect();
-    type_run_moment(&mut typed, kind);
-    let literal = |k: &str| typed.get(k).map(|v| v.value.clone()).unwrap_or_default();
     let day = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok();
-    Ok(RunMomentPreview {
-        kind,
-        examples: day.map(|d| run_date_examples(kind, d)).unwrap_or_default(),
-        date,
-        time,
-        run_date: literal(RUN_DATE),
-        run_time: literal(RUN_TIME),
-        sql: databrain_connector_core::sql::substitute_known_parameters(&node.sql, kind, &typed),
-    })
+    let step_kind = match (&node.kind, node.connection_id.as_deref()) {
+        (JobNodeKind::Query, Some(c)) if !c.is_empty() => connection_kind(ctx, c),
+        _ => ConnectorKind::Duckdb,
+    };
+    // Before/after SQL run on the target: its kind, not Results'.
+    let target = node.target_connection_id.as_deref().filter(|c| node.kind == JobNodeKind::Load && !c.is_empty());
+    let mut texts = vec![("step", step_kind, node.sql.as_str())];
+    if let Some(t) = target {
+        let kind = connection_kind(ctx, t);
+        texts.push(("before", kind, node.load_before_sql.as_deref().unwrap_or_default()));
+        texts.push(("after", kind, node.load_after_sql.as_deref().unwrap_or_default()));
+    }
+    let parts = texts
+        .into_iter()
+        .filter(|(_, _, sql)| !sql.trim().is_empty())
+        .map(|(what, kind, sql)| {
+            let mut typed: HashMap<String, ParamValue> = values.clone().into_iter().collect();
+            type_run_moment(&mut typed, kind);
+            let literal = |k: &str| typed.get(k).map(|v| v.value.clone()).unwrap_or_default();
+            RunMomentPart {
+                what: what.into(),
+                kind,
+                text: matches!(kind, ConnectorKind::Sqlite | ConnectorKind::Mongodb | ConnectorKind::Neo4j),
+                run_date: literal(RUN_DATE),
+                run_time: literal(RUN_TIME),
+                sql: databrain_connector_core::sql::substitute_known_parameters(sql, kind, &typed),
+                examples: day.map(|d| run_date_examples(kind, d)).unwrap_or_default(),
+            }
+        })
+        .collect();
+    Ok(RunMomentPreview { date, time, parts })
 }
 
 /// The `:run_date` / `:run_time` of `job_id`'s latest successful run, for
