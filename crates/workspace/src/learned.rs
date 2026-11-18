@@ -15,6 +15,26 @@ use crate::{HistoryEntry, Origin, Result, Workspace, now_ms};
 
 const DAY_MS: i64 = 86_400_000;
 
+/// The computer's local date of `at` (ms), as a day number: "used on 2
+/// days" means 2 of the user's days. UTC dates split them elsewhere: at
+/// UTC+7 a run at 17:00 and one at 05:00 the next morning share a UTC date.
+fn local_day(at: i64) -> i64 {
+    use chrono::{Offset, TimeZone};
+    let off = chrono::Local.timestamp_millis_opt(at).single().map(|d| i64::from(d.offset().fix().local_minus_utc()) * 1000).unwrap_or(0);
+    (at + off).div_euclid(DAY_MS)
+}
+
+/// Distinct local days of the sightings in `rows` (their `at`): days
+/// recorded before local days were (UTC dates) count as the local date of
+/// the run they kept.
+const DAYS_SQL: &str = "count(DISTINCT (at + ?2) / 86400000)";
+
+/// The local time zone's offset now (ms), for [`DAYS_SQL`].
+fn local_offset_now() -> i64 {
+    use chrono::Offset;
+    i64::from(chrono::Local::now().offset().fix().local_minus_utc()) * 1000
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
@@ -216,7 +236,7 @@ impl Workspace {
             "INSERT INTO kn_join_seen (join_id, fingerprint, day, ai, kind, history_id, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT (join_id, fingerprint, day, ai) DO UPDATE SET \
                history_id = max(history_id, excluded.history_id), at = max(at, excluded.at), kind = excluded.kind",
-            params![id, s.fingerprint, s.at.div_euclid(DAY_MS), assistant(s.origin), kind, s.history_id, s.at],
+            params![id, s.fingerprint, local_day(s.at), assistant(s.origin), kind, s.history_id, s.at],
         )?;
         Ok(id)
     }
@@ -305,7 +325,7 @@ impl Workspace {
         self.conn.lock().execute(
             "INSERT INTO kn_table_seen (connection_id, table_name, fingerprint, day, at) VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT (connection_id, table_name, fingerprint, day) DO UPDATE SET at = max(at, excluded.at)",
-            params![connection_id, table, fingerprint, at.div_euclid(DAY_MS), at],
+            params![connection_id, table, fingerprint, local_day(at), at],
         )?;
         Ok(())
     }
@@ -313,17 +333,17 @@ impl Workspace {
     /// Every learned join of a connection, most used first.
     pub fn learned_joins(&self, connection_id: &str) -> Result<Vec<LearnedJoin>> {
         let c = self.conn.lock();
-        let mut stmt = c.prepare(
+        let mut stmt = c.prepare(&format!(
             "SELECT j.id, j.left_table, j.left_cols, j.right_table, j.right_cols, j.status, j.declared, j.first_seen, \
                (SELECT count(DISTINCT fingerprint) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0), \
-               (SELECT count(DISTINCT day) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0), \
+               (SELECT {DAYS_SQL} FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0), \
                (SELECT count(DISTINCT fingerprint) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 1), \
                (SELECT max(at) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0), \
                j.doc_source, j.doc_by, j.doc_state, j.doc_at \
-             FROM kn_joins j WHERE j.connection_id = ?1",
-        )?;
+             FROM kn_joins j WHERE j.connection_id = ?1"
+        ))?;
         let mut joins: Vec<LearnedJoin> = stmt
-            .query_map([connection_id], |r| {
+            .query_map(params![connection_id, local_offset_now()], |r| {
                 let cols = |i: usize| -> rusqlite::Result<Vec<String>> { Ok(serde_json::from_str(&r.get::<_, String>(i)?).unwrap_or_default()) };
                 Ok(LearnedJoin {
                     id: r.get(0)?,
@@ -390,12 +410,14 @@ impl Workspace {
     /// Tables the user's and jobs' queries read, most used first.
     pub fn table_usage(&self, connection_id: &str) -> Result<Vec<TableUsage>> {
         let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT table_name, count(DISTINCT fingerprint), count(DISTINCT day), max(at) FROM kn_table_seen \
-             WHERE connection_id = ?1 GROUP BY table_name ORDER BY 2 DESC, 3 DESC, 4 DESC, 1",
-        )?;
+        let mut stmt = c.prepare(&format!(
+            "SELECT table_name, count(DISTINCT fingerprint), {DAYS_SQL}, max(at) FROM kn_table_seen \
+             WHERE connection_id = ?1 GROUP BY table_name ORDER BY 2 DESC, 3 DESC, 4 DESC, 1"
+        ))?;
         let rows = stmt
-            .query_map([connection_id], |r| Ok(TableUsage { table: r.get(0)?, queries: r.get(1)?, days: r.get(2)?, last_seen: r.get(3)? }))?
+            .query_map(params![connection_id, local_offset_now()], |r| {
+                Ok(TableUsage { table: r.get(0)?, queries: r.get(1)?, days: r.get(2)?, last_seen: r.get(3)? })
+            })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -558,6 +580,26 @@ mod tests {
         assert_eq!((j.left_table.as_str(), j.right_table.as_str()), ("sales.customers", "sales.orders"));
         assert_eq!(j.kinds, BTreeMap::from([("right".to_string(), 2)]));
         assert_eq!((j.queries, j.days, j.status), (2, 1, JoinStatus::Learned));
+    }
+
+    /// Days are the computer's local dates: a run at 17:00 and one at 05:00
+    /// the next morning are 2 days (at UTC+7 they share a UTC date), two
+    /// runs of one local day are 1.
+    #[test]
+    fn days_are_local_dates() {
+        use chrono::TimeZone;
+        let (ws, c) = setup();
+        let local = |d: u32, h: u32| chrono::Local.with_ymd_and_hms(2026, 3, d, h, 0, 0).single().unwrap().timestamp_millis();
+        let at = |fp: &str, ms: i64, id: i64| JoinSighting { at: ms, ..seen(ORD, CUS, "inner", fp, id, 0, Origin::User) };
+        ws.record_join(&c, &at("q", local(10, 17), 1)).unwrap();
+        ws.record_join(&c, &at("q", local(11, 5), 2)).unwrap();
+        let j = &ws.learned_joins(&c).unwrap()[0];
+        assert_eq!((j.queries, j.days), (1, 2));
+        ws.record_join(&c, &at("p", local(12, 1), 3)).unwrap();
+        ws.record_join(&c, &at("p", local(12, 23), 4)).unwrap();
+        ws.record_join(&c, &at("q", local(12, 12), 5)).unwrap();
+        let j = &ws.learned_joins(&c).unwrap()[0];
+        assert_eq!((j.queries, j.days), (2, 3));
     }
 
     #[test]
