@@ -56,6 +56,9 @@ impl Connector for BigQueryConnector {
                 FieldSpec::new("location", "Location").placeholder("US / EU / asia-southeast1"),
                 FieldSpec::new("dataset", "Default dataset").placeholder("(optional)"),
                 FieldSpec::new("maximum_bytes_billed", "Max bytes billed per query").placeholder("(optional) e.g. 10000000000"),
+                FieldSpec::new(LOAD_JOBS_OPTION, "Load jobs for loads (beta)").placeholder("off").help(
+                    "on: job loads and \"Load into…\" upload the rows and make one load job (all rows or none, no query cost) instead of INSERT jobs. Each job counts toward the table's daily modification limit. Off by default until it has been tried against live projects.",
+                ),
             ],
             note: Some("Browser sign-in needs a Google OAuth client ID (Desktop app). Service accounts need BigQuery Job User."),
         }
@@ -105,6 +108,7 @@ impl Connector for BigQueryConnector {
             http: http(),
             session_id: Mutex::new(None),
             api: API.to_string(),
+            load_jobs: cfg.opt(LOAD_JOBS_OPTION).is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")),
         }));
         // Validate access.
         s.0.call(reqwest::Method::GET, format!("{API}/projects/{}/datasets?maxResults=1", s.0.project), None).await?;
@@ -124,6 +128,8 @@ struct Inner {
     session_id: Mutex<Option<String>>,
     /// The API's base URL for query jobs ([`API`]; a local server in tests).
     api: String,
+    /// Loads go by load jobs ([`LOAD_JOBS_OPTION`]).
+    load_jobs: bool,
 }
 
 /// A query job: its id and where it runs. `jobs.query` answers with the
@@ -502,6 +508,30 @@ mod dataset_path_tests {
 
 #[async_trait]
 impl Session for BqSession {
+    async fn bulk_load(
+        &self,
+        table: &str,
+        cancel: databrain_connector_core::CancellationToken,
+    ) -> Result<Option<Box<dyn databrain_connector_core::BulkWriter>>> {
+        if !self.0.load_jobs {
+            return Ok(None);
+        }
+        let dest = self.0.table_ref(table)?;
+        Ok(Some(Box::new(LoadWriter::new(self.0.clone(), dest, cancel))))
+    }
+
+    fn bulk_load_possible(&self) -> bool {
+        self.0.load_jobs
+    }
+
+    /// The table's columns from `tables.get` (no query, nothing billed).
+    async fn column_types(&self, table: &str) -> Result<Option<Vec<(String, String)>>> {
+        let (p, d, t) = self.0.table_ref(table)?;
+        let got = self.0.call(reqwest::Method::GET, format!("{}/projects/{p}/datasets/{d}/tables/{t}", self.0.api), None).await?;
+        let fields = got.pointer("/schema/fields").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        Ok(Some(fields.iter().map(|f| (f["name"].as_str().unwrap_or_default().to_string(), load_type(f))).collect()))
+    }
+
     fn kind(&self) -> ConnectorKind {
         ConnectorKind::Bigquery
     }
@@ -689,6 +719,326 @@ impl Session for BqSession {
     }
 }
 
+/// Connection option: loads go by one load job (newline-delimited JSON,
+/// uploaded resumably), not INSERT jobs. Off by default until tried
+/// against live projects.
+pub const LOAD_JOBS_OPTION: &str = "load_jobs";
+
+/// Bytes per upload request of a load job: a multiple of 256 KiB, as a
+/// resumable upload's chunks must be (all but the last).
+const UPLOAD_CHUNK: usize = 32 * 256 * 1024;
+
+impl Inner {
+    /// `(project, dataset, table)` of a load's table: `project.dataset.table`,
+    /// `dataset.table` (this project) or `table` (the default dataset). A
+    /// domain-scoped project (`example.com:project`) has a dot of its own.
+    fn table_ref(&self, table: &str) -> Result<(String, String, String)> {
+        let plain = table.replace('`', "");
+        let mut parts: Vec<&str> = plain.rsplitn(3, '.').collect();
+        parts.reverse();
+        if parts.len() == 3 && parts[0].contains('.') && !parts[0].contains(':') {
+            return Err(ConnectorError::query(format!("not a BigQuery table: {}", crate::common::truncate(table, 120))));
+        }
+        let name = |n: &str| !n.is_empty() && !n.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\\' | '/' | '?' | '#' | '\'' | '"' | ';'));
+        let r = match parts.as_slice() {
+            [p, d, t] => (p.to_string(), d.to_string(), t.to_string()),
+            [d, t] => (self.project.clone(), d.to_string(), t.to_string()),
+            [t] => match &self.dataset {
+                Some(d) => (self.project.clone(), d.clone(), t.to_string()),
+                None => return Err(ConnectorError::query(format!("{table}: name its dataset (no default dataset is set)"))),
+            },
+            _ => return Err(ConnectorError::query(format!("not a BigQuery table: {}", crate::common::truncate(table, 120)))),
+        };
+        if ![&r.0, &r.1, &r.2].iter().all(|n| name(n)) {
+            return Err(ConnectorError::query(format!("not a BigQuery table: {}", crate::common::truncate(table, 120))));
+        }
+        Ok(r)
+    }
+
+    /// Where load data is uploaded (`…/upload/bigquery/v2`).
+    fn upload_api(&self) -> String {
+        match self.api.strip_suffix("/bigquery/v2") {
+            Some(origin) => format!("{origin}/upload/bigquery/v2"),
+            None => format!("{}/upload", self.api),
+        }
+    }
+}
+
+/// [`Session::bulk_load`]: the chunks go up as one resumable upload, and
+/// once it is complete BigQuery makes the load job (all rows or none),
+/// which is waited for. Dropped unfinished, no job is made.
+struct LoadWriter {
+    inner: Arc<Inner>,
+    dest: (String, String, String),
+    job_id: String,
+    /// The upload's session URL, once started.
+    upload: Option<String>,
+    /// Data not yet uploaded, from byte `sent` on.
+    buf: Vec<u8>,
+    sent: u64,
+    chunk: usize,
+    /// The first wait after a 429, doubled on each one after it.
+    rate_wait: std::time::Duration,
+    cancel: databrain_connector_core::CancellationToken,
+}
+
+/// Upload requests retried (or asked about) after a failure, per send.
+const UPLOAD_TRIES: u32 = 6;
+/// The longest wait after a 429.
+const RATE_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(32);
+
+/// What an upload request got: more wanted (bytes received so far) or the job.
+enum Uploaded {
+    Received(u64),
+    Job(serde_json::Value),
+}
+
+impl LoadWriter {
+    fn new(inner: Arc<Inner>, dest: (String, String, String), cancel: databrain_connector_core::CancellationToken) -> Self {
+        let job_id = format!("databrain_load_{}", uuid::Uuid::new_v4().simple());
+        LoadWriter { inner, dest, job_id, upload: None, buf: Vec::new(), sent: 0, chunk: UPLOAD_CHUNK, rate_wait: std::time::Duration::from_secs(1), cancel }
+    }
+
+    /// Start the upload with the job's settings: append, the table must exist,
+    /// no bad record allowed, no unknown field ignored.
+    async fn start(&mut self) -> Result<()> {
+        let i = &self.inner;
+        let mut job_ref = json!({ "projectId": i.project, "jobId": self.job_id });
+        if let Some(l) = &i.location {
+            job_ref["location"] = l.clone().into();
+        }
+        let body = json!({
+            "jobReference": job_ref,
+            "configuration": { "load": {
+                "destinationTable": { "projectId": self.dest.0, "datasetId": self.dest.1, "tableId": self.dest.2 },
+                "sourceFormat": "NEWLINE_DELIMITED_JSON",
+                "writeDisposition": "WRITE_APPEND",
+                "createDisposition": "CREATE_NEVER",
+                "maxBadRecords": 0,
+                "ignoreUnknownValues": false,
+            }},
+        });
+        let url = format!("{}/projects/{}/jobs?uploadType=resumable", i.upload_api(), i.project);
+        for attempt in 0..2 {
+            let resp = i
+                .http
+                .post(&url)
+                .bearer_auth(i.token().await?)
+                .header("X-Upload-Content-Type", "application/octet-stream")
+                .json(&body)
+                .send()
+                .await
+                .map_err(net_err)?;
+            if resp.status().as_u16() == 401 && attempt == 0 {
+                i.creds.invalidate().await;
+                continue;
+            }
+            if !resp.status().is_success() {
+                return json_body(resp, "BigQuery load").await.map(|_| ());
+            }
+            let Some(loc) = resp.headers().get("location").and_then(|v| v.to_str().ok()) else {
+                return Err(ConnectorError::internal("BigQuery load: the upload started without a session URL"));
+            };
+            self.upload = Some(loc.to_string());
+            return Ok(());
+        }
+        unreachable!()
+    }
+
+    /// One upload request: `len` bytes from `sent`, the last when `last`.
+    async fn put(&self, len: usize, last: bool) -> Result<Uploaded> {
+        let url = self.upload.clone().expect("started");
+        let total = if last { (self.sent + len as u64).to_string() } else { "*".into() };
+        let range = if len == 0 { format!("bytes */{total}") } else { format!("bytes {}-{}/{total}", self.sent, self.sent + len as u64 - 1) };
+        let resp = self
+            .inner
+            .http
+            .put(&url)
+            .bearer_auth(self.inner.token().await?)
+            .header("Content-Range", range)
+            .body(self.buf[..len].to_vec())
+            .send()
+            .await
+            .map_err(net_err)?;
+        Self::uploaded(resp).await
+    }
+
+    /// How far the upload got (after a failed request).
+    async fn status(&self) -> Result<Uploaded> {
+        let url = self.upload.clone().expect("started");
+        let resp = self
+            .inner
+            .http
+            .put(&url)
+            .bearer_auth(self.inner.token().await?)
+            .header("Content-Range", "bytes */*")
+            .body(Vec::new())
+            .send()
+            .await
+            .map_err(net_err)?;
+        Self::uploaded(resp).await
+    }
+
+    /// A 308 (more wanted), the job, or an error; 429 (too many requests)
+    /// is a `Connection` error, retried as a 5xx is.
+    async fn uploaded(resp: reqwest::Response) -> Result<Uploaded> {
+        if resp.status().as_u16() == 429 {
+            let e = json_body(resp, "BigQuery load").await.err().unwrap_or_else(|| ConnectorError::query("BigQuery load (429)"));
+            return Err(ConnectorError::new(databrain_connector_core::ErrorKind::Connection, e.message));
+        }
+        if resp.status().as_u16() == 308 {
+            // `Range: bytes=0-N`: N + 1 bytes received; none without it.
+            let got = resp
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|r| r.rsplit('-').next())
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .map_or(0, |n| n + 1);
+            return Ok(Uploaded::Received(got));
+        }
+        json_body(resp, "BigQuery load").await.map(Uploaded::Job)
+    }
+
+    /// Upload `len` bytes of the buffer (all of it when `last`), resuming
+    /// from where the server is after a dropped or failed request.
+    /// A dropped request or a 5xx waits 0.1 s, doubling; a 429 waits
+    /// `rate_wait` (1 s), doubling up to 32 s, as Google asks. The status
+    /// request after a failure is retried the same way.
+    async fn send(&mut self, len: usize, last: bool) -> Result<Option<serde_json::Value>> {
+        let mut backoff = Backoff::new();
+        let mut rate_wait = self.rate_wait;
+        let mut tries = 0;
+        let mut resume = false;
+        let end = self.sent + len as u64;
+        loop {
+            let left = (end - self.sent) as usize;
+            let r = if resume { self.status().await } else { self.put(left, last).await };
+            let got = match r {
+                Err(e) if e.kind == databrain_connector_core::ErrorKind::Connection && tries < UPLOAD_TRIES => {
+                    tries += 1;
+                    if e.message.starts_with("BigQuery load (429") {
+                        tokio::time::sleep(rate_wait).await;
+                        rate_wait = (rate_wait * 2).min(RATE_WAIT_MAX);
+                    } else {
+                        backoff.wait().await;
+                    }
+                    resume = true;
+                    continue;
+                }
+                r => r?,
+            };
+            resume = false;
+            match got {
+                Uploaded::Job(job) => {
+                    self.buf.clear();
+                    return Ok(Some(job));
+                }
+                Uploaded::Received(got) => {
+                    if got < self.sent || got > end {
+                        return Err(ConnectorError::internal(format!("BigQuery load: the upload is at byte {got}, expected {} to {end}", self.sent)));
+                    }
+                    self.buf.drain(..(got - self.sent) as usize);
+                    self.sent = got;
+                    if got == end && !last {
+                        return Ok(None);
+                    }
+                    if got == end && left == 0 {
+                        return Err(ConnectorError::internal("BigQuery load: the upload ended without a job"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait for the job; rows loaded. Stop cancels it.
+    async fn wait(&self, job: serde_json::Value) -> Result<Option<u64>> {
+        let i = &self.inner;
+        let r = JobRef::of(&job, i.location.as_deref());
+        let mut job = job;
+        let mut backoff = Backoff::new();
+        loop {
+            if job.pointer("/status/state").and_then(|s| s.as_str()) == Some("DONE") {
+                if let Some(e) = job.pointer("/status/errorResult") {
+                    let mut msg = e["message"].as_str().unwrap_or("the load job failed").to_string();
+                    let more: Vec<&str> = job
+                        .pointer("/status/errors")
+                        .and_then(|a| a.as_array())
+                        .map(|a| a.iter().filter_map(|x| x["message"].as_str()).filter(|m| *m != msg).take(3).collect())
+                        .unwrap_or_default();
+                    if !more.is_empty() {
+                        msg = format!("{msg} ({})", more.join("; "));
+                    }
+                    return Err(ConnectorError::query(format!("BigQuery load job {}: {msg}", r.id)));
+                }
+                return Ok(job.pointer("/statistics/load/outputRows").and_then(|n| n.as_str()).and_then(|n| n.parse().ok()));
+            }
+            let mut url = format!("{}/projects/{}/jobs/{}", i.api, i.project, r.id);
+            let loc = r.loc_param();
+            if !loc.is_empty() {
+                url.push('?');
+                url.push_str(&loc);
+            }
+            // Stop also ends a poll in flight.
+            tokio::select! {
+                got = async {
+                    backoff.wait().await;
+                    i.call(reqwest::Method::GET, url, None).await
+                } => job = got?,
+                _ = self.cancel.cancelled() => {
+                    i.cancel_job(&r).await;
+                    return Err(ConnectorError::cancelled());
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl databrain_connector_core::BulkWriter for LoadWriter {
+    async fn write(&mut self, data: Vec<u8>) -> Result<()> {
+        let cancel = self.cancel.clone();
+        tokio::select! {
+            r = async {
+                if self.upload.is_none() {
+                    self.start().await?;
+                }
+                self.buf.extend_from_slice(&data);
+                while self.buf.len() >= self.chunk {
+                    self.send(self.chunk, false).await?;
+                }
+                Ok(())
+            } => r,
+            _ = cancel.cancelled() => Err(ConnectorError::cancelled()),
+        }
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<Option<u64>> {
+        if self.upload.is_none() && self.buf.is_empty() {
+            return Ok(Some(0));
+        }
+        let cancel = self.cancel.clone();
+        let job = tokio::select! {
+            r = async {
+                if self.upload.is_none() {
+                    self.start().await?;
+                }
+                let len = self.buf.len();
+                self.send(len, true).await
+            } => r?,
+            _ = cancel.cancelled() => return Err(ConnectorError::cancelled()),
+        };
+        let job = job.ok_or_else(|| ConnectorError::internal("BigQuery load: the upload ended without a job"))?;
+        self.wait(job).await
+    }
+}
+
+/// A column's type as a load checks it: `ARRAY<…>` when repeated.
+fn load_type(f: &serde_json::Value) -> String {
+    let t = f["type"].as_str().unwrap_or("STRING").to_string();
+    if f["mode"].as_str() == Some("REPEATED") { format!("ARRAY<{t}>") } else { t }
+}
+
 fn fields_to_columns(fields: &[serde_json::Value]) -> Vec<ColumnInfo> {
     fn ty(f: &serde_json::Value) -> String {
         let base = f["type"].as_str().unwrap_or("STRING");
@@ -770,6 +1120,195 @@ mod tests {
         assert_eq!(r.num_rows(), 1);
     }
 
+    fn load_inner(origin: &str) -> Inner {
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        Inner {
+            project: "p1".into(),
+            location: None,
+            dataset: Some("ds".into()),
+            max_bytes: None,
+            creds: Arc::new(InlineCredentialSource::new(AuthMethod::ApiToken { user: None }, Some("tok".to_string().into()))),
+            http: http(),
+            session_id: Mutex::new(None),
+            api: origin.to_string(),
+            load_jobs: true,
+        }
+    }
+
+    /// A scripted upload server: the first non-final chunk is kept only in
+    /// part (`partial`), one request is answered with a status (`drop_put`:
+    /// its index and status, 0 dropping the connection), and the job ends
+    /// as `outcome` (its status once polled; `None`: the poll hangs).
+    async fn load_server(
+        partial: bool,
+        drop_put: Option<(usize, u16)>,
+        outcome: Option<&'static str>,
+    ) -> (String, crate::mock_http::FullLog, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let got: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let origin: Arc<std::sync::Mutex<String>> = Arc::default();
+        let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // After a 429, the status request that follows is answered 429 once too.
+        let rate_limited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (g, o) = (got.clone(), origin.clone());
+        let (url, _, log) = crate::mock_http::serve_full(move |m, p, h, b| {
+            let range = h.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-range:").map(|v| v.trim().to_string())).unwrap_or_default();
+            // Before taking the lock: a hanging poll mustn't hold up the cancel.
+            if m == "GET" && p == "/projects/p1/jobs/j9?location=EU" {
+                match outcome {
+                    Some(o) => return (200, vec![], o.to_string()),
+                    None => tokio::task::block_in_place(|| std::thread::sleep(std::time::Duration::from_secs(4))),
+                }
+            }
+            let mut got = g.lock().unwrap();
+            let received = |n: usize| if n == 0 { vec![] } else { vec![("Range".to_string(), format!("bytes=0-{}", n - 1))] };
+            if m == "POST" && p == "/upload/projects/p1/jobs?uploadType=resumable" {
+                return (200, vec![("Location".into(), format!("{}/up/1", o.lock().unwrap()))], String::new());
+            }
+            if m == "PUT" && p == "/up/1" {
+                if range == "bytes */*" {
+                    if rate_limited.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return (429, vec![], json!({"error": {"message": "Too many requests"}}).to_string());
+                    }
+                    return (308, received(got.len()), String::new());
+                }
+                let k = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some((at, status)) = drop_put
+                    && at == k
+                {
+                    rate_limited.store(status == 429, std::sync::atomic::Ordering::SeqCst);
+                    return (status, vec![], json!({"error": {"message": "Too many requests"}}).to_string());
+                }
+                let spec = range.trim_start_matches("bytes ");
+                let (span, total) = spec.split_once('/').unwrap();
+                if span != "*" {
+                    let start: usize = span.split('-').next().unwrap().parse().unwrap();
+                    assert_eq!(start, got.len(), "a chunk from where the server is");
+                    let mut body = b.as_bytes().to_vec();
+                    if partial && k == 0 && total == "*" {
+                        body.truncate(body.len() / 2);
+                    }
+                    got.extend_from_slice(&body);
+                }
+                if total != "*" && total.parse::<usize>().unwrap() == got.len() {
+                    return (
+                        200,
+                        vec![],
+                        json!({"jobReference": {"projectId": "p1", "jobId": "j9", "location": "EU"}, "status": {"state": "RUNNING"}}).to_string(),
+                    );
+                }
+                return (308, received(got.len()), String::new());
+            }
+            (404, vec![], "{}".into())
+        })
+        .await;
+        *origin.lock().unwrap() = url.clone();
+        (url, log, got)
+    }
+
+    async fn load(inner: Inner, chunks: &[&str], chunk: usize) -> Result<Option<u64>> {
+        use databrain_connector_core::BulkWriter;
+        let inner = Arc::new(inner);
+        let dest = inner.table_ref("ds.t").unwrap();
+        let mut w = Box::new(LoadWriter::new(inner, dest, Default::default()));
+        w.chunk = chunk;
+        w.rate_wait = std::time::Duration::from_millis(10);
+        for c in chunks {
+            w.write(c.as_bytes().to_vec()).await?;
+        }
+        w.finish().await
+    }
+
+    const DONE_3: &str = r#"{"status": {"state": "DONE"}, "statistics": {"load": {"outputRows": "3"}}}"#;
+
+    /// The rows go up in chunks of one upload (resent from where the server
+    /// is when it kept only part of one), then the job is waited for, where
+    /// it runs, and its row count is the load's.
+    #[tokio::test]
+    async fn a_load_job_uploads_its_rows_then_waits_for_the_job() {
+        let (url, log, got) = load_server(true, None, Some(DONE_3)).await;
+        let rows = ["{\"a\":1}\n", "{\"a\":2}\n", "{\"a\":3}\n"];
+        assert_eq!(load(load_inner(&url), &rows, 8).await.unwrap(), Some(3));
+        assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), rows.concat());
+        let log = log.lock().unwrap();
+        let start: serde_json::Value = serde_json::from_str(&log[0].3).unwrap();
+        let cfg = &start["configuration"]["load"];
+        assert_eq!(cfg["destinationTable"], json!({"projectId": "p1", "datasetId": "ds", "tableId": "t"}));
+        assert_eq!(
+            (cfg["sourceFormat"].as_str(), cfg["writeDisposition"].as_str(), cfg["createDisposition"].as_str()),
+            (Some("NEWLINE_DELIMITED_JSON"), Some("WRITE_APPEND"), Some("CREATE_NEVER"))
+        );
+        assert!(start["jobReference"]["jobId"].as_str().unwrap().starts_with("databrain_load_"));
+        assert!(log.iter().any(|(m, p, _, _)| m == "GET" && p == "/projects/p1/jobs/j9?location=EU"));
+        // Every upload request carries the token, not only the first.
+        for (m, _, h, _) in log.iter().filter(|(m, ..)| m == "PUT") {
+            assert!(h.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok")), "{m}: {h}");
+        }
+    }
+
+    /// Stop while the job's status is being asked for ends the load at once
+    /// (the poll in flight isn't waited for).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_ends_a_poll_in_flight() {
+        use databrain_connector_core::BulkWriter;
+        let (url, _, _) = load_server(false, None, None).await;
+        let inner = Arc::new(load_inner(&url));
+        let dest = inner.table_ref("ds.t").unwrap();
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let mut w = Box::new(LoadWriter::new(inner, dest, cancel.clone()));
+        w.write(b"{\"a\":1}\n".to_vec()).await.unwrap();
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            cancel.cancel();
+        });
+        let e = tokio::time::timeout(std::time::Duration::from_secs(3), w.finish()).await.expect("stopped, not waiting for the poll").unwrap_err();
+        assert!(e.is_cancelled(), "{e:?}");
+        stop.await.unwrap();
+    }
+
+    /// A dropped upload request, or one answered 429 or 5xx: the writer asks
+    /// where the upload is (asking again when that is answered 429) and goes
+    /// on from there.
+    #[tokio::test]
+    async fn a_dropped_upload_request_resumes() {
+        for drop in [(0, 0), (2, 0), (1, 429), (0, 503)] {
+            let (url, _, got) = load_server(false, Some(drop), Some(DONE_3)).await;
+            let rows = ["{\"a\":1}\n", "{\"a\":2}\n", "{\"a\":3}\n"];
+            assert_eq!(load(load_inner(&url), &rows, 8).await.unwrap(), Some(3), "drop {drop:?}");
+            assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), rows.concat(), "drop {drop:?}");
+        }
+    }
+
+    /// A job that fails says why (its first errors).
+    #[tokio::test]
+    async fn a_failed_load_job_says_why() {
+        let failed = r#"{"status": {"state": "DONE", "errorResult": {"message": "Error while reading data"}, "errors": [{"message": "Error while reading data"}, {"message": "Could not parse 'x' as INT64 for field a"}]}}"#;
+        let (url, _, _) = load_server(false, None, Some(failed)).await;
+        let e = load(load_inner(&url), &["{\"a\":\"x\"}\n"], 8).await.unwrap_err();
+        assert!(e.message.contains("Error while reading data (Could not parse 'x' as INT64 for field a)"), "{}", e.message);
+    }
+
+    /// No rows: no upload and no job.
+    #[tokio::test]
+    async fn an_empty_load_makes_no_job() {
+        let (url, log, _) = load_server(false, None, Some(DONE_3)).await;
+        assert_eq!(load(load_inner(&url), &[], 8).await.unwrap(), Some(0));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_tables_are_named_in_full() {
+        let i = load_inner("http://x");
+        assert_eq!(i.table_ref("`p2.d.t`").unwrap(), ("p2".into(), "d".into(), "t".into()));
+        assert_eq!(i.table_ref("d.t").unwrap(), ("p1".into(), "d".into(), "t".into()));
+        assert_eq!(i.table_ref("t").unwrap(), ("p1".into(), "ds".into(), "t".into()));
+        assert!(i.table_ref("a.b.c.d").is_err());
+        // A domain-scoped project has a dot of its own.
+        assert_eq!(i.table_ref("`example.com:p3.d.t`").unwrap(), ("example.com:p3".into(), "d".into(), "t".into()));
+        assert!(i.table_ref("d.t?x").is_err());
+        assert_eq!(i.upload_api(), "http://x/upload");
+        assert_eq!(Inner { api: API.into(), ..load_inner("") }.upload_api(), "https://bigquery.googleapis.com/upload/bigquery/v2");
+    }
+
     /// A job running in `asia-southeast1` on a connection set to `US`: the
     /// first poll gets `poll` (status 0: the connection drops).
     async fn running_job(poll: (u16, &'static str)) -> (Inner, crate::mock_http::Log) {
@@ -795,6 +1334,7 @@ mod tests {
             http: http(),
             session_id: Mutex::new(None),
             api: origin,
+            load_jobs: false,
         };
         (inner, log)
     }

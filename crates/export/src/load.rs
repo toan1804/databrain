@@ -983,6 +983,142 @@ impl DbxStage {
     }
 }
 
+/// Rows for a BigQuery load job: newline-delimited JSON, one object per
+/// row keyed by the table's column names, each value the text its INSERT
+/// literal holds (a JSON string, which BigQuery's JSON loader parses into
+/// the column's type as the literal is coerced: [`bq_fits`] says when it
+/// is the same); numbers into INT64 and FLOAT64 as JSON numbers, NaN/±inf
+/// as null (the INSERT writes NULL), booleans as `true`/`false`, binary as
+/// base64 (how BYTES are read from JSON).
+pub struct BqJson {
+    kinds: Vec<Lit>,
+    /// Each row column's key: its name in the table, as a JSON string.
+    keys: Vec<String>,
+    /// Each column's target written as a JSON number (INT64, FLOAT64).
+    bare: Vec<bool>,
+    /// The table, as the load names it (the session's to resolve).
+    pub table: String,
+    /// What the run log shows.
+    pub sql: String,
+}
+
+impl BqJson {
+    /// `target`: each row column's name and type in the table, checked by
+    /// [`bq_fits`] first.
+    pub fn new(table: &str, schema: &SchemaRef, target: &[(String, String)]) -> Self {
+        let bare = target.iter().map(|(_, t)| matches!(bq_base(t).as_str(), "INT64" | "INTEGER" | "FLOAT64" | "FLOAT")).collect();
+        Self {
+            kinds: schema.fields().iter().map(|f| lit_kind(f)).collect(),
+            keys: target.iter().map(|(n, _)| serde_json::Value::from(n.as_str()).to_string()).collect(),
+            bare,
+            table: table.to_string(),
+            sql: format!("a load job of newline-delimited JSON into {table}"),
+        }
+    }
+
+    /// Rows `start..` of `batch` as JSON lines, up to about `max_bytes` (at
+    /// least one row): the bytes and how many rows they hold. `None` past
+    /// the end.
+    pub fn next(&self, batch: &RecordBatch, start: usize, max_bytes: usize) -> Result<Option<(Vec<u8>, usize)>> {
+        if start >= batch.num_rows() {
+            return Ok(None);
+        }
+        let fopts = format_options();
+        let fmts: Vec<ArrayFormatter<'_>> =
+            batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
+        let mut out = Vec::new();
+        let mut n = 0;
+        let mut cell = String::new();
+        for r in start..batch.num_rows() {
+            if n > 0 && out.len() >= max_bytes {
+                break;
+            }
+            out.push(b'{');
+            for (i, ((a, f), k)) in batch.columns().iter().zip(&fmts).zip(&self.kinds).enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(self.keys[i].as_bytes());
+                out.push(b':');
+                if a.is_null(r) {
+                    out.extend_from_slice(b"null");
+                    continue;
+                }
+                cell.clear();
+                use std::fmt::Write as _;
+                let _ = write!(cell, "{}", f.value(r));
+                match k {
+                    Lit::Number | Lit::Float if non_finite(&cell).is_some() => out.extend_from_slice(b"null"),
+                    Lit::Number | Lit::Float if self.bare[i] => out.extend_from_slice(cell.as_bytes()),
+                    Lit::Bool => out.extend_from_slice(cell.to_ascii_lowercase().as_bytes()),
+                    Lit::Binary => {
+                        let bytes: Vec<u8> = (0..cell.len() / 2).filter_map(|j| u8::from_str_radix(&cell[2 * j..2 * j + 2], 16).ok()).collect();
+                        out.push(b'"');
+                        out.extend_from_slice(base64(&bytes).as_bytes());
+                        out.push(b'"');
+                    }
+                    _ => out.extend_from_slice(serde_json::Value::from(cell.as_str()).to_string().as_bytes()),
+                }
+            }
+            out.extend_from_slice(b"}\n");
+            n += 1;
+        }
+        Ok(Some((out, n)))
+    }
+}
+
+/// Standard base64 with padding.
+fn base64(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            s.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    s
+}
+
+/// A BigQuery type's base, uppercase, without parameters (`NUMERIC(10, 2)` → `NUMERIC`).
+fn bq_base(target: &str) -> String {
+    target.trim().to_ascii_uppercase().split(['(', '<', ' ']).next().unwrap_or_default().to_string()
+}
+
+/// Whether column `f` of the rows can go into a BigQuery column of type
+/// `target` (as `tables.get` writes it; `ARRAY<…>` for a repeated one) by
+/// a JSON load job with the same result as its INSERT literal; `Err` says
+/// why not. The pairs where the JSON loader reads the literal's text as the
+/// literal is coerced: text into STRING, integers into INT64 and the
+/// numerics and FLOAT64, decimals of up to 9 places into NUMERIC and any
+/// into BIGNUMERIC (the literal is `NUMERIC '…'`, which BIGNUMERIC widens),
+/// floats into FLOAT64, booleans into BOOL, binary into BYTES, dates into
+/// DATE, timestamps of up to microseconds into DATETIME (none) or
+/// TIMESTAMP.
+pub fn bq_fits(f: &Field, target: &str) -> std::result::Result<(), String> {
+    let base = bq_base(target);
+    let int = matches!(
+        f.data_type(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+    );
+    use databrain_connector_core::arrow::datatypes::TimeUnit;
+    let micro = |u: &TimeUnit| *u != TimeUnit::Nanosecond;
+    let ok = match (f.data_type(), base.as_str()) {
+        (_, "STRING") => matches!(lit_kind(f), Lit::Text),
+        (_, "INT64" | "INTEGER") => int,
+        (_, "FLOAT64" | "FLOAT") => int || matches!(f.data_type(), DataType::Float32 | DataType::Float64),
+        (_, "BIGNUMERIC" | "BIGDECIMAL") => int || matches!(f.data_type(), DataType::Decimal128(_, s) if *s >= 0),
+        (_, "NUMERIC" | "DECIMAL") => int || matches!(f.data_type(), DataType::Decimal128(_, s) if (0..=9).contains(s)),
+        (DataType::Boolean, "BOOL" | "BOOLEAN") => true,
+        (DataType::Binary | DataType::LargeBinary, "BYTES") => true,
+        (DataType::Date32, "DATE") => true,
+        (DataType::Timestamp(u, None), "DATETIME" | "TIMESTAMP") => micro(u),
+        (DataType::Timestamp(u, Some(_)), "TIMESTAMP") => micro(u),
+        _ => false,
+    };
+    if ok { Ok(()) } else { Err(format!("{} ({}) into a {target} column", f.name(), f.data_type())) }
+}
+
 /// A value as the text its Databricks INSERT literal stands for (`None`: NULL).
 fn dbx_text(cell: Option<&str>, kind: Lit) -> Option<String> {
     let s = cell?;
@@ -1568,6 +1704,89 @@ mod tests {
         assert_eq!(first, 1);
         assert_eq!(st.next(&batch, 2, 1).unwrap().unwrap().1, 1);
         assert!(st.next(&batch, 3, 1).unwrap().is_none());
+    }
+
+    /// BigQuery load jobs: each value the INSERT literal's text, as JSON
+    /// (numbers bare into INT64/FLOAT64, strings otherwise), NaN/±inf null,
+    /// binary base64, keyed by the table's own column names.
+    #[test]
+    fn bq_json_writes_the_inserts_text() {
+        use databrain_connector_core::arrow::array::{BinaryArray, Decimal128Array, Float64Array, TimestampMicrosecondArray};
+        use databrain_connector_core::arrow::datatypes::{Schema, TimeUnit};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("amount", DataType::Decimal128(12, 3), true),
+            Field::new("ok", DataType::Boolean, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("tz", DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("it's \"q\"\n"), None])),
+                Arc::new(Float64Array::from(vec![Some(0.5), Some(f64::NAN)])),
+                Arc::new(Decimal128Array::from(vec![Some(1234), None]).with_precision_and_scale(12, 3).unwrap()),
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+                Arc::new(BinaryArray::from(vec![Some(&b"\x00\xffab"[..]), None])),
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(1_767_261_600_123_456), None]).with_timezone("+00:00")),
+            ],
+        )
+        .unwrap();
+        let target: Vec<(String, String)> =
+            [("ID", "INT64"), ("name", "STRING"), ("f", "FLOAT64"), ("amount", "NUMERIC"), ("ok", "BOOL"), ("b", "BYTES"), ("tz", "TIMESTAMP")]
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect();
+        let j = BqJson::new("ds.t", &schema, &target);
+        let (data, n) = j.next(&batch, 0, MB).unwrap().unwrap();
+        assert_eq!(n, 2);
+        let lines: Vec<serde_json::Value> = String::from_utf8(data).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(
+            lines[0],
+            serde_json::json!({"ID": 1, "name": "it's \"q\"\n", "f": 0.5, "amount": "1.234", "ok": true, "b": "AP9hYg==", "tz": "2026-01-01 10:00:00.123456+00:00"})
+        );
+        assert_eq!(lines[1], serde_json::json!({"ID": 2, "name": null, "f": null, "amount": null, "ok": null, "b": null, "tz": null}));
+        assert_eq!(base64(b"a"), "YQ==");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b""), "");
+    }
+
+    #[test]
+    fn bq_fits_per_type() {
+        use databrain_connector_core::arrow::datatypes::TimeUnit;
+        let f = |t: DataType| Field::new("c", t, true);
+        for (field, target) in [
+            (f(DataType::Utf8), "STRING"),
+            (f(DataType::Int32), "INT64"),
+            (f(DataType::Int64), "NUMERIC"),
+            (f(DataType::Int64), "FLOAT64"),
+            (f(DataType::Float64), "FLOAT64"),
+            (f(DataType::Decimal128(12, 3)), "NUMERIC(18, 3)"),
+            (f(DataType::Decimal128(38, 20)), "BIGNUMERIC"),
+            (f(DataType::Boolean), "BOOL"),
+            (f(DataType::Binary), "BYTES"),
+            (f(DataType::Date32), "DATE"),
+            (f(DataType::Timestamp(TimeUnit::Microsecond, None)), "DATETIME"),
+            (f(DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))), "TIMESTAMP"),
+        ] {
+            assert!(bq_fits(&field, target).is_ok(), "{field:?} into {target}");
+        }
+        for (field, target) in [
+            (f(DataType::Int64), "STRING"),
+            (f(DataType::Decimal128(12, 3)), "INT64"),
+            (f(DataType::Decimal128(38, 10)), "NUMERIC"),
+            (f(DataType::Float64), "NUMERIC"),
+            (f(DataType::Utf8), "ARRAY<STRING>"),
+            (f(DataType::Utf8), "RECORD"),
+            (f(DataType::Date32), "DATETIME"),
+            (f(DataType::Timestamp(TimeUnit::Nanosecond, None)), "DATETIME"),
+            (f(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))), "DATETIME"),
+        ] {
+            assert!(bq_fits(&field, target).is_err(), "{field:?} into {target}");
+        }
     }
 
     /// Which columns a Databricks bulk load takes (the cast gives what the

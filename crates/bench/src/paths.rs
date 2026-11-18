@@ -308,6 +308,7 @@ fn export_and_load(s: &mut Suite) {
         databrain_export::load::insert_statements(ConnectorKind::Postgres, "app.orders", &schema, &data).map(|v| v.len()).expect("inserts")
     });
     let (stage_schema, stage_data) = (copy_schema.clone(), copy_data.clone());
+    let (bq_schema, bq_data) = (copy_schema.clone(), copy_data.clone());
     let ms_data = copy_data.clone();
     let (tsv_schema, tsv_data) = (copy_schema.clone(), copy_data.clone());
     let (array_schema, array_data) = (copy_schema.clone(), copy_data.clone());
@@ -334,6 +335,20 @@ fn export_and_load(s: &mut Suite) {
             }
         }
         values
+    });
+    s.add("bq_json_100k_rows", "a BigQuery load job writes its JSON lines", 1500, rows, move || {
+        let target: Vec<(String, String)> =
+            bq_schema.fields().iter().map(|f| (f.name().clone(), databrain_export::load::column_type(ConnectorKind::Bigquery, f).to_string())).collect();
+        let j = databrain_export::load::BqJson::new("app.orders", &bq_schema, &target);
+        let mut bytes = 0;
+        for b in &bq_data {
+            let mut at = 0;
+            while let Some((d, n)) = j.next(b, at, 64 << 20).expect("json") {
+                bytes += d.len();
+                at += n;
+            }
+        }
+        bytes
     });
     s.add("mssql_bulk_100k_rows", "a SQL Server load checks and converts its rows for bulk copy", 1500, rows, move || {
         ms_data.iter().map(|b| databrain_connector_mssql::bench_rows(b).expect("bulk rows")).sum::<usize>()

@@ -342,6 +342,13 @@ pub trait Session: Send + Sync {
         false
     }
 
+    /// `table`'s columns and their types as the database names them, read
+    /// without running a query (BigQuery: `tables.get`), for a bulk load to
+    /// check its rows against. `Ok(None)`: the session doesn't read them so.
+    async fn column_types(&self, _table: &str) -> Result<Option<Vec<(String, String)>>> {
+        Ok(None)
+    }
+
     /// Whether [`Self::bulk_load`] may give a writer, so a load doesn't
     /// prepare one (read the table's column types) for a session that has
     /// none: Databricks only with a staging volume.

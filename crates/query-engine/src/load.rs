@@ -1776,16 +1776,40 @@ enum CopyCheck {
 enum Bulk {
     Copy(sqlgen::PgCopy),
     Staged(sqlgen::DbxStage),
+    /// BigQuery: one load job of newline-delimited JSON.
+    Json(sqlgen::BqJson),
     /// ClickHouse: `INSERT … FORMAT TabSeparated`, the rows as the body.
     Tsv(sqlgen::ChTsv),
 }
 
 impl Bulk {
+    /// What the run log shows.
     fn sql(&self) -> &str {
         match self {
             Bulk::Copy(c) => &c.sql,
             Bulk::Staged(s) => &s.sql,
+            Bulk::Json(j) => &j.sql,
             Bulk::Tsv(t) => &t.sql,
+        }
+    }
+
+    /// What `Session::bulk_load` is given: the statement, or the table a
+    /// load job writes.
+    fn spec(&self) -> &str {
+        match self {
+            Bulk::Json(j) => &j.table,
+            b => b.sql(),
+        }
+    }
+
+    /// The next chunk of rows `start..` of `batch`, up to about `max_bytes`,
+    /// for a writer that takes chunks ([`staged_rows`]).
+    fn chunk(&self, batch: &RecordBatch, start: usize, max_bytes: usize) -> std::result::Result<Option<(Vec<u8>, usize)>, String> {
+        match self {
+            Bulk::Staged(s) => s.next(batch, start, max_bytes).map_err(|e| e.to_string()),
+            Bulk::Json(j) => j.next(batch, start, max_bytes).map_err(|e| e.to_string()),
+            Bulk::Copy(_) => Err("COPY data goes by copy_rows".into()),
+            Bulk::Tsv(_) => Err("TabSeparated data goes by tsv_rows".into()),
         }
     }
 }
@@ -1799,12 +1823,14 @@ async fn bulk_plan(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &Cance
     if !p.session.bulk_load_possible() {
         return Err(CopyCheck::Inserts(match p.dialect {
             ConnectorKind::Databricks => "no staging volume is set in the connection's settings".into(),
+            ConnectorKind::Bigquery => "load jobs are off in the connection's settings (beta)".into(),
             _ => "this connection has no bulk load".into(),
         }));
     }
     match p.dialect {
         ConnectorKind::Postgres => Ok(bulk_copy(p, table, schema, cancel).await?.map(Bulk::Copy)),
         ConnectorKind::Databricks => Ok(bulk_staged(p, table, schema, cancel).await?.map(Bulk::Staged)),
+        ConnectorKind::Bigquery => Ok(bulk_json(p, table, schema, cancel).await?.map(Bulk::Json)),
         ConnectorKind::Clickhouse => Ok(bulk_tsv(p, table, schema, cancel).await?.map(Bulk::Tsv)),
         _ => Ok(None),
     }
@@ -1914,6 +1940,31 @@ async fn tsv_rows(
         w.result = Err(EngineError::from(e));
     }
     w
+}
+
+/// A BigQuery load job for these rows into `table`, when it writes what the
+/// INSERTs would: every column's rows parse from JSON into its column's
+/// type as its literal is coerced ([`sqlgen::bq_fits`]), the types read by
+/// the session (`tables.get`, no query).
+async fn bulk_json(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<sqlgen::BqJson>, CopyCheck> {
+    let columns = tokio::select! {
+        r = p.session.column_types(table) => r,
+        _ = cancel.cancelled() => return Err(CopyCheck::Fatal(EngineError::new("cancelled", "Cancelled"))),
+    };
+    let columns = match columns {
+        Ok(Some(c)) => c,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(CopyCheck::Inserts(format!("the table's column types couldn't be read: {}", e.message))),
+    };
+    let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
+    let mut target = Vec::with_capacity(schema.fields().len());
+    for f in schema.fields() {
+        let Some(name) = match_column(f.name(), &names) else { return Err(CopyCheck::Inserts(format!("no column {}", f.name()))) };
+        let ty = columns.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone()).unwrap_or_default();
+        sqlgen::bq_fits(f, &ty).map_err(CopyCheck::Inserts)?;
+        target.push((name.clone(), ty));
+    }
+    Ok(Some(sqlgen::BqJson::new(table, schema, &target)))
 }
 
 /// Postgres `COPY … FROM STDIN` for these rows into `table`, when it writes
@@ -2089,17 +2140,18 @@ const STAGED_FILE_ROWS: usize = 250_000;
 /// Text per staged file, before compression.
 const STAGED_FILE_BYTES: usize = 64 * 1024 * 1024;
 
-/// The rows as staged files for one statement ([`Bulk::Staged`]): files of
-/// up to [`STAGED_FILE_ROWS`] rows, then the statement that reads them all
-/// (one commit). Stopped or failed, nothing is inserted, and the files are
-/// deleted.
+/// The rows as staged chunks for one statement or job ([`Bulk::Staged`]:
+/// files of up to [`STAGED_FILE_ROWS`] rows, then the statement that reads
+/// them all; [`Bulk::Json`]: the upload of one load job), one commit.
+/// Stopped or failed, nothing is inserted (Databricks deletes the files; a
+/// load job is only made once its upload is complete).
 async fn staged_rows(
-    stage: &sqlgen::DbxStage,
+    stage: &Bulk,
     mut writer: Box<dyn databrain_connector_core::BulkWriter>,
     mut feed: Feed<'_, '_>,
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
-    let mut w = Written { rows: 0, statements: 1, sql: stage.sql.clone(), result: Ok(()), split: None, parallel: false, serialized: false };
+    let mut w = Written { rows: 0, statements: 1, sql: stage.sql().to_string(), result: Ok(()), split: None, parallel: false, serialized: false };
     let mut rows = Pending { feed: &mut feed, retry: Default::default(), rows: None, at: 0, ended: false };
     let failed = loop {
         let batch = match rows.gather(STAGED_FILE_ROWS).await {
@@ -2109,11 +2161,11 @@ async fn staged_rows(
         };
         let mut at = 0;
         let mut err = None;
-        while let Some(file) = stage.next(&batch, at, STAGED_FILE_BYTES).transpose() {
+        while let Some(file) = stage.chunk(&batch, at, STAGED_FILE_BYTES).transpose() {
             let (data, k) = match file {
                 Ok(x) => x,
                 Err(e) => {
-                    err = Some(EngineError::new("internal", e.to_string()));
+                    err = Some(EngineError::new("internal", e));
                     break;
                 }
             };
@@ -2211,12 +2263,13 @@ async fn run_plan(
                 // The COPY starts here (it waits for the table's lock); a
                 // session without one sends INSERTs.
                 let writer = match &copy {
-                    Some(c) => match p.session.bulk_load(c.sql(), cancel.clone()).await {
+                    Some(c) => match p.session.bulk_load(c.spec(), cancel.clone()).await {
                         Ok(Some(w)) => Some((c, w)),
                         Ok(None) => {
                             why_not = Some(match c {
                                 Bulk::Copy(_) => "this connection has no COPY".into(),
                                 Bulk::Staged(_) => "no staging volume is set in the connection's settings".into(),
+                                Bulk::Json(_) => "load jobs are off in the connection's settings (beta)".into(),
                                 Bulk::Tsv(_) => "this connection is read-only".into(),
                             });
                             None
@@ -2262,6 +2315,7 @@ async fn run_plan(
                 };
                 let bulk_word = match p.dialect {
                     ConnectorKind::Databricks => "a bulk load",
+                    ConnectorKind::Bigquery => "a load job",
                     ConnectorKind::Clickhouse => "TabSeparated",
                     _ => "COPY",
                 };
@@ -2270,6 +2324,7 @@ async fn run_plan(
                     (None, _) if array_insert.is_some() => String::new(),
                     (Some((Bulk::Copy(c), _)), _) => format!("bulk load ({})", c.sql),
                     (Some((Bulk::Staged(s), _)), _) => format!("bulk load: Parquet files in the staging volume, then {}", s.sql),
+                    (Some((Bulk::Json(j), _)), _) => format!("bulk load: {} (one job: all rows or none)", j.sql),
                     (Some((Bulk::Tsv(t), _)), _) => format!("rows as TabSeparated, up to {} rows an INSERT ({})", grouped(p.batch.rows), t.sql),
                     (None, Some(why)) => format!("INSERTs, not {bulk_word} ({why})"),
                     (None, None) => String::new(),
@@ -2284,7 +2339,7 @@ async fn run_plan(
                 let progress = |done: u64| obs.event(LoadEvent::Progress { phase: phase.into(), done, total });
                 let w = match writer {
                     Some((Bulk::Copy(c), writer)) => copy_rows(p, c, writer, feed, &progress).await,
-                    Some((Bulk::Staged(s), writer)) => staged_rows(s, writer, feed, &progress).await,
+                    Some((b @ (Bulk::Staged(_) | Bulk::Json(_)), writer)) => staged_rows(b, writer, feed, &progress).await,
                     Some((Bulk::Tsv(t), writer)) => tsv_rows(p, t, writer, feed, &progress).await,
                     None => match array_insert.as_ref() {
                         Some(ai) => {
@@ -2829,7 +2884,7 @@ mod tests {
     #[tokio::test]
     async fn staged_rows_go_in_large_files_then_one_statement() {
         let (schema, held) = batches(600_000, 2000);
-        let stage = sqlgen::DbxStage::new("t", &schema, &["bigint".to_string()]);
+        let stage = Bulk::Staged(sqlgen::DbxStage::new("t", &schema, &["bigint".to_string()]));
         let st = Arc::new(Staging::default());
         let w = staged_rows(&stage, Box::new(StagingWriter(st.clone())), Feed { held: held.iter(), rest: None }, &|_| {}).await;
         assert!(w.result.is_ok());
@@ -2842,6 +2897,37 @@ mod tests {
         assert!(w.result.is_err_and(|e| e.message.contains("WRITE VOLUME")));
         assert_eq!(w.rows, 0, "nothing inserted");
         assert!(!st.finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    struct JsonWriter(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    #[async_trait::async_trait]
+    impl databrain_connector_core::BulkWriter for JsonWriter {
+        async fn write(&mut self, data: Vec<u8>) -> databrain_connector_core::Result<()> {
+            self.0.lock().extend_from_slice(&data);
+            Ok(())
+        }
+        async fn finish(self: Box<Self>) -> databrain_connector_core::Result<Option<u64>> {
+            Ok(Some(self.0.lock().iter().filter(|b| **b == b'\n').count() as u64))
+        }
+    }
+
+    /// A BigQuery load job gets every row as one JSON line keyed by the
+    /// table's column name, then one finish (the job), whose count is the
+    /// load's.
+    #[tokio::test]
+    async fn load_job_rows_go_as_json_lines_then_one_job() {
+        let (schema, held) = batches(5_000, 2000);
+        let target = vec![(schema.field(0).name().to_uppercase(), "INT64".to_string())];
+        let stage = Bulk::Json(sqlgen::BqJson::new("ds.t", &schema, &target));
+        assert_eq!(stage.spec(), "ds.t", "the session gets the table");
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let w = staged_rows(&stage, Box::new(JsonWriter(got.clone())), Feed { held: held.iter(), rest: None }, &|_| {}).await;
+        assert!(w.result.is_ok());
+        assert_eq!((w.rows, w.statements), (5_000, 1));
+        let text = String::from_utf8(got.lock().clone()).unwrap();
+        let key = format!("{{\"{}\":", target[0].0);
+        assert!(text.lines().all(|l| l.starts_with(&key)), "{}", &text[..80]);
     }
 
     /// MySQL INSERTs stay under the server's max_allowed_packet: the
