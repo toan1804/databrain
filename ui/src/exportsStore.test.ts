@@ -22,6 +22,7 @@ vi.mock("./lib/api", () => ({
 }));
 
 const { useExports } = await import("./exportsStore");
+const { useActivity } = await import("./activityStore");
 const { useStore } = await import("./store");
 const opts = { format: "csv", header: true, table_name: "t", dialect: null } as never;
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -62,6 +63,31 @@ describe("background exports", () => {
     await flush();
     expect(useExports.getState().items.map((x) => x.id)).toEqual([b]);
     expect(useStore.getState().toasts.at(-1)?.message).toContain("a.csv stopped");
+  });
+
+  it("an export hidden from the activity bar that ends well is a toast; one that fails stays", async () => {
+    const a = await useExports.getState().start({ resultId: "r1", options: opts, path: "/a.csv", source: "A" });
+    const b = await useExports.getState().start({ resultId: "r2", options: opts, path: "/b.csv", source: "B" });
+    useActivity.getState().hide([`export:${a}`, `export:${b}`]);
+    pending.get(a)!.resolve(7);
+    pending.get(b)!.reject({ kind: "query", message: "boom" });
+    await flush();
+    expect(useStore.getState().toasts.at(-1)?.message).toBe("Exported 7 rows to a.csv");
+    expect(useExports.getState().items.map((x) => [x.id, x.status])).toEqual([[b, "failed"]]);
+    expect(useActivity.getState().hidden).toEqual({});
+  });
+
+  it("an export of a tab being closed says why it stopped", async () => {
+    const { registerTabUser } = await import("./tabUsers");
+    void registerTabUser; // registered by the store
+    const { tabUses, tabClosing } = await import("./tabUsers");
+    const id = await useExports.getState().start({ resultId: "r1", options: opts, path: "/a.csv", source: "A", tabId: "t9" });
+    expect(tabUses("t9")).toEqual(["the export to a.csv"]);
+    expect(tabUses("other")).toEqual([]);
+    tabClosing("t9");
+    pending.get(id)!.reject({ kind: "cancelled", message: "cancelled" });
+    await flush();
+    expect(useStore.getState().toasts.at(-1)?.message).toBe("Export of a.csv stopped: its tab was closed");
   });
 
   it("keeps a failed export with its error until dismissed", async () => {

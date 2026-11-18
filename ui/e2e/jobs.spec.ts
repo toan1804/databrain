@@ -374,13 +374,13 @@ test.describe("the activity bar", () => {
     await page.screenshot({ path: process.env.ACTIVITY_SHOT ?? "test-results/activity-bar.png" });
 
     await bar.getByRole("button", { name: /Nightly sales/ }).click();
-    await expect(page.getByRole("dialog", { name: "Running jobs" })).toContainText("Stop");
+    await expect(page.getByRole("dialog", { name: "Background work" })).toContainText("Stop");
     if (process.env.ACTIVITY_SHOT) await page.screenshot({ path: process.env.ACTIVITY_SHOT.replace(".png", "-open.png") });
     await page.keyboard.press("Escape");
 
     await emit(page, "job-run", { job_id: job.id, run: run("error", { status: "error", error: 'relation "orders" does not exist' }) });
     await expect(bar.getByRole("alert")).toContainText('Failed at load_orders: relation "orders" does not exist');
-    await bar.getByRole("button", { name: "Dismiss Nightly sales" }).click();
+    await bar.getByRole("button", { name: "Dismiss Job Nightly sales" }).click();
     await expect(bar).toHaveCount(0);
   });
 });

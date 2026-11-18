@@ -401,7 +401,16 @@ export function ResultView({
       {pinning && stmt.output && connId && (
         <PinChartDialog info={info} spec={pinning.spec} kind={pinning.kind} sql={stmt.output.sql} connectionId={stmt.output.connection_id || connId} defaultTitle={title ?? tab?.title ?? "Chart"} onClose={() => setPinning(null)} />
       )}
-      {loadOpen && <LoadIntoDialog info={info} sql={stmt.output?.sql ?? ""} outputName={stmt.output?.name} connectionId={stmt.output?.connection_id} onClose={() => setLoadOpen(false)} />}
+      {loadOpen && (
+        <LoadIntoDialog
+          info={info}
+          sql={stmt.output?.sql ?? ""}
+          outputName={stmt.output?.name}
+          connectionId={stmt.output?.connection_id}
+          tabId={stmt.output?.tab_id ?? tabId}
+          onClose={() => setLoadOpen(false)}
+        />
+      )}
       {preview && <EditPreviewModal preview={preview} setPreview={setPreview} target={target} saving={saving} saveEdits={saveEdits} />}
 
       {headerMenu && (
@@ -423,6 +432,7 @@ export function ResultView({
           viewRows={viewRows}
           dialect={conn?.config.kind}
           defaultName={title ?? tab?.title ?? "result"}
+          tabId={stmt.output?.tab_id ?? tabId}
           onClose={() => setExportOpen(false)}
         />
       )}

@@ -5,7 +5,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Square, Upload } from "lucide-react";
-import { api, onLoadProgress, toError } from "../lib/api";
+import { api, toError } from "../lib/api";
+import { useLoads } from "../loadsStore";
 import type { LoadDryRun, LoadMode, LoadReport, ResultInfo } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { useStore } from "../store";
@@ -35,6 +36,7 @@ export function LoadIntoDialog({
   sql,
   outputName,
   connectionId,
+  tabId,
   onClose,
 }: {
   info: ResultInfo;
@@ -42,6 +44,8 @@ export function LoadIntoDialog({
   outputName?: string | null;
   /** Connection the rows came from: the default target for generated test data. */
   connectionId?: string;
+  /** The result's tab: an "every row" load runs its query again on that tab's session. */
+  tabId?: string;
   onClose: () => void;
 }) {
   const toast = useStore((s) => s.toast);
@@ -58,7 +62,19 @@ export function LoadIntoDialog({
   const [keys, setKeys] = useState<string[]>([]);
   const [create, setCreate] = useState(!generated);
   const [dry, setDry] = useState<{ busy: boolean; report?: LoadDryRun }>({ busy: false });
-  const [run, setRun] = useState<{ id: string; done: number; total: number } | null>(null);
+  // The load running from this dialog: its progress comes through the loads
+  // store, which keeps following it if the dialog closes (the activity bar).
+  const [runId, setRunId] = useState<string | null>(null);
+  const run = useLoads((s) => (runId ? s.items.find((l) => l.id === runId && l.status === "running") : undefined)) ?? null;
+  // Left (closed, "Continue in background") while it runs: the bar shows it from now on.
+  const left = useRef(false);
+  useEffect(
+    () => () => {
+      left.current = true;
+      if (useLoads.getState().inDialog) useLoads.getState().setInDialog(null);
+    },
+    [],
+  );
   const [report, setReport] = useState<LoadReport | null>(null);
   const targetKind = connections.find((c) => c.id === target)?.config.kind;
   const modes = useMemo(() => loadModesFor(targetKind), [targetKind]);
@@ -82,11 +98,6 @@ export function LoadIntoDialog({
   const keyList = keys.join(",");
   useEffect(() => setDry({ busy: false }), [target, table, mode, keyList, create]);
 
-  const runId = useRef<string | null>(null);
-  useEffect(() => {
-    const un = onLoadProgress((e) => e.load_id === runId.current && setRun((r) => (r ? { ...r, done: e.done, total: e.total } : r)));
-    return () => void un.then((f) => f());
-  }, []);
 
   const check = async () => {
     setDry({ busy: true });
@@ -99,6 +110,9 @@ export function LoadIntoDialog({
   };
   const load = async () => {
     const id = uid();
+    const loads = useLoads.getState();
+    // Asked while it shows here; "Continue in background" or closing hands it to the bar.
+    const shownHere = () => useLoads.getState().inDialog === id;
     try {
       // Progress and Stop once the load starts (after a production prompt).
       const r = await loadResultAsking(
@@ -106,30 +120,45 @@ export function LoadIntoDialog({
         args,
         id,
         () => {
-          runId.current = id;
-          setRun({ id, done: 0, total: streaming ? 0 : info.total_rows });
+          loads.begin({ id, table, target: targetName || "the connection", total: streaming ? 0 : info.total_rows, tabId: streaming ? tabId : undefined });
+          // Not after the dialog was left: a start again (after a production
+          // prompt) would hide the load from the bar, its end with it.
+          if (!left.current) loads.setInDialog(id);
+          setRunId(id);
         },
         () => {
-          runId.current = null;
-          setRun(null);
+          loads.dismiss(id);
+          setRunId(null);
         },
       );
       if (!r) return;
-      setReport(r);
-      toast(`Loaded ${formatCount(r.rows)} rows into ${table}`, "success");
+      const here = shownHere();
+      loads.finish(id, r.rows);
+      if (here) setReport(r);
     } catch (e) {
-      toast(toError(e).message, "error");
+      const err = toError(e);
+      const here = shownHere();
+      if (err.kind === "cancelled") loads.stopped(id);
+      else {
+        loads.fail(id, err.message);
+        if (here) toast(err.message, "error");
+      }
     } finally {
-      setRun(null);
-      runId.current = null;
+      setRunId(null);
     }
+  };
+  // Leave the dialog, keep the load: the activity bar follows it.
+  const toBackground = () => {
+    left.current = true;
+    useLoads.getState().setInDialog(null);
+    onClose();
   };
   const targetName = connections.find((c) => c.id === target)?.name ?? "";
 
   return (
     <Modal
       title="Load rows into a table"
-      onClose={() => !run && onClose()}
+      onClose={() => (run ? toBackground() : onClose())}
       width={520}
       footer={
         report ? (
@@ -137,9 +166,14 @@ export function LoadIntoDialog({
             Close
           </button>
         ) : run ? (
-          <button className="btn-ghost mr-auto" onClick={() => void api.cancelLoad(run.id)}>
-            <Square size={12} /> Stop
-          </button>
+          <>
+            <button className="btn-ghost mr-auto" onClick={() => useLoads.getState().cancel(run.id)} disabled={run.stopping}>
+              {run.stopping ? <Loader2 size={12} className="animate-spin" /> : <Square size={12} />} Stop
+            </button>
+            <button className="btn-ghost border border-line" onClick={toBackground} title="Close this dialog; the bar at the bottom shows the load until it ends">
+              Continue in background
+            </button>
+          </>
         ) : (
           <>
             <button className="btn-ghost mr-auto border border-line" disabled={!ready || dry.busy} onClick={() => void check()} title="Run the load on up to 1,000 rows and roll it back (or check each statement), keeping nothing">

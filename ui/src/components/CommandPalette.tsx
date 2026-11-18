@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { Bookmark, Database, FileCode2, FileSearch, FolderOpen, GitCompare, History, LayoutDashboard, Moon, NotebookPen, Play, Plus, Save, Search, Settings2, Sparkles, Square, Sun, Workflow, X } from "lucide-react";
 import { useAi } from "../aiStore";
 import { useJobs } from "../jobsStore";
+import { useActivity } from "../activityStore";
 import { openOutput, openResultsQuery, outputLabel, outputRef } from "../outputs";
 import { queryLocalFile } from "./Sidebar";
 import { exportConnections } from "./ConnectionsIoDialog";
@@ -78,7 +79,7 @@ function Palette() {
       { id: "new-nb", group: "Actions", label: "New notebook", icon: <NotebookPen size={14} />, run: () => void st.newNotebook() },
       { id: "new-job", group: "Actions", label: "New job", icon: <Workflow size={14} />, run: () => void useJobs.getState().create() },
       { id: "jobs", group: "Actions", label: "Show jobs", icon: <Workflow size={14} />, run: () => st.setSidebarPanel("jobs") },
-      { id: "activity", group: "Actions", label: "Show background activity", icon: <Workflow size={14} />, run: () => useJobs.getState().showBar() },
+      { id: "activity", group: "Actions", label: "Show background activity", icon: <Workflow size={14} />, run: () => useActivity.getState().showAll() },
       { id: "file", group: "Actions", label: "Query a local file (CSV, Parquet, JSON, Excel)…", icon: <FileSearch size={14} />, run: () => void queryLocalFile() },
       { id: "import-file", group: "Actions", label: "Import a file (CSV, Excel, Parquet, JSON) into a table…", icon: <FileSearch size={14} />, run: () => void queryLocalFile(true) },
       { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: kbd("⌘L"), run: () => useAi.getState().setOpen(true, "chat") },

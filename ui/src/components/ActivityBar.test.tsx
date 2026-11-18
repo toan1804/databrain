@@ -1,12 +1,12 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import type { JobRun } from "../lib/types";
 
 vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {}, removeItem: () => {} });
 vi.mock("../lib/api", () => ({
   isTauri: () => false,
   toError: (e: unknown) => ({ kind: "internal", message: String(e) }),
-  api: { cancelJob: vi.fn(async () => true), notifyJobRun: vi.fn(async () => {}) },
+  api: { cancelJob: vi.fn(async () => true), notifyJobRun: vi.fn(async () => {}), cancelExport: vi.fn(async () => true), revealExportFile: vi.fn(async () => {}), cancelLoad: vi.fn(async () => true) },
 }));
 
 const { useJobs, runEvent } = await import("../jobsStore");
@@ -14,6 +14,9 @@ const { useJobs, runEvent } = await import("../jobsStore");
 const event = (r: JobRun) => runEvent({ job_id: r.job_id, run: r });
 const { useStore } = await import("../store");
 const { ActivityBar, DONE_MS } = await import("./ActivityBar");
+const { useActivity } = await import("../activityStore");
+const { useExports } = await import("../exportsStore");
+const { useLoads } = await import("../loadsStore");
 const { runLine } = await import("./job/shared");
 
 const node = (name: string, status: string, extra = {}) => ({ node_id: name, name, status, finished_at: 0, duration_ms: 0, ...extra }) as JobRun["nodes"][number];
@@ -25,7 +28,10 @@ function setRun(r: JobRun) {
 }
 
 beforeEach(() => {
-  useJobs.setState({ jobs: [{ id: "j", name: "Nightly sales" } as never, { id: "k", name: "Hourly" } as never], runs: {}, running: {}, elsewhere: {}, seen: {}, barHidden: {}, barDismissed: {} });
+  useJobs.setState({ jobs: [{ id: "j", name: "Nightly sales" } as never, { id: "k", name: "Hourly" } as never], runs: {}, running: {}, elsewhere: {}, seen: {}, barDismissed: {} });
+  useActivity.setState({ hidden: {} });
+  useExports.setState({ items: [], inDialog: null });
+  useLoads.setState({ items: [], inDialog: null });
   useStore.setState({ tabs: [{ id: "t1", title: "Query", sql: "", connection_id: null } as never], activeTabId: "t1" });
 });
 
@@ -55,11 +61,11 @@ describe("the activity bar", () => {
     expect((container.firstElementChild as HTMLElement).style.height).toBe("24px");
     // The details: Open and Stop.
     act(() => screen.getByRole("button", { name: /Nightly sales/ }).click());
-    expect(screen.getByRole("dialog", { name: "Running jobs" }).textContent).toContain("Stop");
+    expect(screen.getByRole("dialog", { name: "Background work" }).textContent).toContain("Stop");
     setRun(run("error", [node("load_orders", "error", { error: "disk full" })], { finished_at: 5 }));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.getByRole("alert", { name: "Job Nightly sales" }).textContent).toContain("Failed at load_orders: disk full");
-    act(() => screen.getByRole("button", { name: "Dismiss Nightly sales" }).click());
+    act(() => screen.getByRole("button", { name: "Dismiss Job Nightly sales" }).click());
     expect(bar()).toBeNull();
   });
 
@@ -67,9 +73,9 @@ describe("the activity bar", () => {
     render(<ActivityBar />);
     setRun(run("running", [loading]));
     act(() => useJobs.setState({ elsewhere: { k: true } }));
-    expect(bar()!.textContent).toContain("2 jobs running · Nightly sales 25%, Hourly");
-    act(() => screen.getByRole("button", { name: /2 jobs running/ }).click());
-    const rows = screen.getByRole("dialog", { name: "Running jobs" });
+    expect(bar()!.textContent).toContain("2 running · Nightly sales 25%, Hourly");
+    act(() => screen.getByRole("button", { name: /2 running/ }).click());
+    const rows = screen.getByRole("dialog", { name: "Background work" });
     expect(rows.textContent).toContain("Running in the background runner");
     expect(screen.getAllByRole("button", { name: /Stop/ })).toHaveLength(1);
   });
@@ -129,7 +135,7 @@ describe("the activity bar", () => {
       // New work: it shows, the hidden runs don't.
       setRun(run("running", [loading], { id: 3, job_id: "f" }));
       expect(bar()!.textContent).toContain("Job · load_orders");
-      expect(bar()!.textContent).not.toContain("jobs running");
+      expect(bar()!.textContent).not.toContain("2 running");
       act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
       // Hidden and succeeded: a toast, the bar stays away.
       setRun(run("success", [node("a", "success")], { finished_at: 60_000 }));
@@ -140,7 +146,7 @@ describe("the activity bar", () => {
       expect(screen.getByRole("alert", { name: "Job Hourly" })).toBeTruthy();
       expect(bar()!.textContent).not.toContain("running");
       // The Jobs icon or the command palette show what was hidden.
-      act(() => useJobs.getState().showBar());
+      act(() => useActivity.getState().showAll());
       expect(bar()!.textContent).toContain("Job · load_orders");
     } finally {
       useStore.setState({ toast: orig });
@@ -157,6 +163,41 @@ describe("the activity bar", () => {
     // Back in the editor: it doesn't come back.
     act(() => useStore.setState({ activeTabId: "t1" }));
     expect(bar()).toBeNull();
+  });
+});
+
+describe("exports and loads in the activity bar", () => {
+  const exp = (p: Record<string, unknown>) => ({ id: "e1", fileName: "all.csv", path: "/tmp/all.csv", source: "Sales", phase: "writing", rows: 20_000, bytes: 4096, started: Date.now() - 3_000, status: "running", ...p }) as never;
+  const load = (p: Record<string, unknown>) => ({ id: "l1", table: "orders", target: "Warehouse", done: 250, total: 1000, started: Date.now(), status: "running", ...p }) as never;
+
+  it("shows a running export, then the file it wrote (a click shows it), and keeps a failure", async () => {
+    const { api } = await import("../lib/api");
+    render(<ActivityBar />);
+    act(() => useExports.setState({ items: [exp({})] }));
+    expect(bar()!.textContent).toMatch(/Export to all\.csv · Writing rows… 20,000 rows · 4(\.0)? KB/);
+    act(() => screen.getByRole("button", { name: /Export to all\.csv/ }).click());
+    expect(screen.getByRole("dialog", { name: "Background work" }).textContent).toContain("Stop");
+    act(() => within(screen.getByRole("dialog", { name: "Background work" })).getByRole("button", { name: /Stop/ }).click());
+    expect(api.cancelExport).toHaveBeenCalledWith("e1");
+    act(() => useExports.setState({ items: [exp({ status: "done", rows: 50_000 })] }));
+    act(() => screen.getByRole("button", { name: "Exported 50,000 rows to all.csv" }).click());
+    expect(api.revealExportFile).toHaveBeenCalledWith("e1");
+    act(() => useExports.setState({ items: [exp({ status: "failed", error: "disk full" })] }));
+    expect(screen.getByRole("alert", { name: "Export to all.csv" }).textContent).toContain("Export to all.csv failed: disk full");
+    act(() => screen.getByRole("button", { name: "Dismiss Export to all.csv" }).click());
+    expect(bar()).toBeNull();
+  });
+
+  it("leaves out what its dialog shows, and counts everything that runs", () => {
+    render(<ActivityBar />);
+    act(() => useExports.setState({ items: [exp({})], inDialog: "e1" }));
+    expect(bar()).toBeNull();
+    setRun(run("running", [loading]));
+    act(() => {
+      useExports.setState({ inDialog: null });
+      useLoads.setState({ items: [load({})] });
+    });
+    expect(bar()!.textContent).toContain("3 running · Nightly sales 25%, all.csv, orders 25%");
   });
 });
 

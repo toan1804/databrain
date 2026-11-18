@@ -1,30 +1,8 @@
-import { useEffect, useState } from "react";
 import { CheckCircle2, Download, FolderOpen, Loader2, Square, X, XCircle } from "lucide-react";
 import { phaseLabel, useExports, type BackgroundExport } from "../exportsStore";
 import { formatBytes, formatCount, formatDuration } from "../lib/util";
 
-/** Full exports running in the background (bottom right, above the toasts). */
-export function ExportsTray() {
-  const all = useExports((s) => s.items);
-  const inDialog = useExports((s) => s.inDialog);
-  const items = all.filter((x) => x.id !== inDialog);
-  const running = items.some((x) => x.status === "running");
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    if (!running) return;
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [running]);
-  if (items.length === 0) return null;
-  return (
-    <>
-      {items.map((x) => (
-        <ExportCard key={x.id} x={x} now={now} />
-      ))}
-    </>
-  );
-}
-
+/** A full export, as its dialog shows it (the activity bar shows the others). */
 export function ExportCard({ x, now, bare = false }: { x: BackgroundExport; now: number; bare?: boolean }) {
   const { cancel, dismiss, reveal } = useExports.getState();
   const elapsed = formatDuration(Math.max(0, (x.finished ?? now) - x.started));

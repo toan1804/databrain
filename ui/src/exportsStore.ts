@@ -2,12 +2,14 @@ import { create } from "zustand";
 import { api, onExportProgress, toError, type ExportPhase } from "./lib/api";
 import type { ExportOptions } from "./lib/types";
 import { useStore } from "./store";
-import { uid } from "./lib/util";
+import { formatCount, uid } from "./lib/util";
+import { useActivity } from "./activityStore";
+import { registerTabUser } from "./tabUsers";
 
 /**
  * Full exports ("All rows of the query") run in the background: the query
  * runs again on its own session and every row goes straight to the file, so
- * the app stays usable while a slow query exports. Shown in the exports tray.
+ * the app stays usable while a slow query exports. Shown in the activity bar.
  */
 export type ExportStatus = "running" | "done" | "failed";
 
@@ -27,22 +29,26 @@ export interface BackgroundExport {
   error?: string;
   /** Stop was pressed; waiting for the backend to stop. */
   stopping?: boolean;
+  /** The tab whose session runs its query (closing it stops the export). */
+  tabId?: string;
+  /** Why it stopped, when not Stop ("its tab was closed"). */
+  stopReason?: string;
 }
 
 interface ExportsState {
   items: BackgroundExport[];
-  /** Export shown in the export dialog (the tray leaves it out meanwhile). */
+  /** Export shown in the export dialog (the activity bar leaves it out meanwhile). */
   inDialog: string | null;
   setInDialog: (id: string | null) => void;
   /** Start a full export; resolves with its id once it is running. */
-  start: (a: { resultId: string; options: ExportOptions; path: string; source: string }) => Promise<string>;
+  start: (a: { resultId: string; options: ExportOptions; path: string; source: string; tabId?: string }) => Promise<string>;
   cancel: (id: string) => void;
   dismiss: (id: string) => void;
   reveal: (id: string) => void;
 }
 
-/** Finished exports leave the tray on their own after this long. */
-export const DONE_VISIBLE_MS = 30_000;
+/** Finished exports leave the activity bar on their own after this long (time to click "Show file"). */
+export const DONE_VISIBLE_MS = 15_000;
 
 let listening: Promise<unknown> | null = null;
 
@@ -61,7 +67,7 @@ export const useExports = create<ExportsState>((set, get) => {
     inDialog: null,
     setInDialog: (inDialog) => set({ inDialog }),
 
-    start: async ({ resultId, options, path, source }) => {
+    start: async ({ resultId, options, path, source, tabId }) => {
       await listen();
       const id = uid();
       const item: BackgroundExport = {
@@ -74,11 +80,18 @@ export const useExports = create<ExportsState>((set, get) => {
         bytes: 0,
         started: Date.now(),
         status: "running",
+        tabId,
       };
       set((s) => ({ items: [...s.items, item] }));
       void api
         .exportFullResult(resultId, options, path, id)
         .then((rows) => {
+          // Hidden from the bar (×): a toast, not the bar again.
+          if (useActivity.getState().ended(`export:${id}`) && get().inDialog !== id) {
+            get().dismiss(id);
+            useStore.getState().toast(`Exported ${formatCount(rows)} rows to ${item.fileName}`, "success");
+            return;
+          }
           patch(id, { status: "done", rows, finished: Date.now(), stopping: false });
           setTimeout(() => {
             if (get().items.find((x) => x.id === id)?.status === "done") get().dismiss(id);
@@ -86,9 +99,11 @@ export const useExports = create<ExportsState>((set, get) => {
         })
         .catch((e) => {
           const err = toError(e);
+          useActivity.getState().ended(`export:${id}`);
           if (err.kind === "cancelled") {
+            const why = get().items.find((x) => x.id === id)?.stopReason;
             get().dismiss(id);
-            useStore.getState().toast(`Export of ${item.fileName} stopped`, "info");
+            useStore.getState().toast(`Export of ${item.fileName} stopped${why ? `: ${why}` : ""}`, "info");
           } else patch(id, { status: "failed", error: err.message, finished: Date.now(), stopping: false });
         });
       return id;
@@ -122,3 +137,13 @@ export function phaseLabel(p: ExportPhase): string {
       return "Finishing the file…";
   }
 }
+
+registerTabUser({
+  uses: (tabId) =>
+    useExports
+      .getState()
+      .items.filter((x) => x.status === "running" && x.tabId === tabId)
+      .map((x) => `the export to ${x.fileName}`),
+  closing: (tabId) =>
+    useExports.setState((s) => ({ items: s.items.map((x) => (x.status === "running" && x.tabId === tabId ? { ...x, stopReason: "its tab was closed" } : x)) })),
+});

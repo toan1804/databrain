@@ -5,6 +5,7 @@ import type { ParamValue } from "../lib/types";
 import { uid } from "../lib/util";
 import { editorBridge } from "../editorBridge";
 import { baseName, persistParams, persistTabs } from "./helpers";
+import { tabClosing, tabUses } from "../tabUsers";
 import { isQueryTab, type State, type Tab } from "./types";
 
 const RECENT_FILES = 12;
@@ -191,6 +192,8 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     const idx = s.tabs.findIndex((t) => t.id === id);
     if (idx === -1) return;
     if (s.txOpen[id] && !window.confirm("This tab has an open transaction. Close it and roll back the uncommitted changes?")) return;
+    // What runs on its session stops with it, and says why.
+    tabClosing(id);
     if (isTauri() && isQueryTab(s.tabs[idx])) api.closeTab(id).catch(() => {});
     // Dashboards: their charts' sessions and results.
     const dash = s.tabs[idx].dashboard_id;
@@ -228,11 +231,17 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
   requestCloseTab: (id) => {
     const t = get().tabs.find((x) => x.id === id);
     if (!t) return;
-    if (!t.dirty) return get().closeTab(id);
+    // A full export or an "every row" load runs the query again on this
+    // tab's session: closing the tab stops it.
+    const uses = tabUses(id);
+    if (!t.dirty && !uses.length) return get().closeTab(id);
     get().askConfirm({
       title: `Close "${t.title}"?`,
-      reasons: [t.file_path ? `This tab has changes not saved to ${t.file_path}.` : "This tab has unsaved changes to its saved query."],
-      confirmLabel: "Close without saving",
+      reasons: [
+        ...(t.dirty ? [t.file_path ? `This tab has changes not saved to ${t.file_path}.` : "This tab has unsaved changes to its saved query."] : []),
+        ...(uses.length ? [`Closing it stops what runs on its connection session: ${uses.join(", ")}.`] : []),
+      ],
+      confirmLabel: uses.length ? "Close and stop" : "Close without saving",
       onConfirm: () => get().closeTab(id),
     });
   },
