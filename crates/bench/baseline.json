@@ -19,6 +19,7 @@
     "load/ch_tsv_100k_rows": 33234542,
     "load/dbx_stage_100k_rows": 65004333,
     "load/insert_sql_100k_rows": 88796584,
+    "load/mssql_bulk_100k_rows": 27202375,
     "load/oracle_array_100k_rows": 43930542,
     "load/pg_copy_100k_rows": 34211083,
     "redact/create_user": 14806,

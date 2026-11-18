@@ -316,10 +316,10 @@ pub trait Session: Send + Sync {
     }
 
     /// Rows of `batch` added to `table` through the database's appender
-    /// (DuckDB), when the session has one: `columns` are the table's columns
-    /// for the batch's, by position; the database converts each value to its
-    /// column's type with its own casts, as for an INSERT. Rows added;
-    /// `Ok(None)` when it can't. A call that fails adds none of its rows.
+    /// (DuckDB) or bulk copy (SQL Server), when the session has one:
+    /// `columns` are the table's columns for the batch's, by position; each
+    /// value ends up as an INSERT's literal would. Rows added; `Ok(None)`
+    /// when it can't. A call that fails adds none of its rows.
     async fn append_rows(&self, _table: &str, _columns: &[String], _batch: arrow::array::RecordBatch, _cancel: CancellationToken) -> Result<Option<u64>> {
         Ok(None)
     }

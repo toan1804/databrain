@@ -1900,6 +1900,7 @@ dependencies = [
  "databrain-ai",
  "databrain-auth",
  "databrain-connector-core",
+ "databrain-connector-mssql",
  "databrain-connector-sqlite",
  "databrain-export",
  "databrain-lineage",

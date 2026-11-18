@@ -92,6 +92,23 @@ impl MssqlSession {
         .await
     }
 
+    /// How each of `columns` of `table` takes the rows of `schema` by bulk
+    /// copy (`Err`: why one can't), from the columns' metadata.
+    async fn bulk_plan(
+        c: &mut Conn,
+        table: &str,
+        columns: &[String],
+        schema: &databrain_connector_core::arrow::datatypes::Schema,
+    ) -> Result<std::result::Result<Vec<crate::bulk::Col>, String>> {
+        let cols: Vec<String> = columns.iter().map(|c| quote_ident(ConnectorKind::Mssql, c)).collect();
+        let refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+        let meta = c.column_metadata(table, &refs).await.map_err(map_err)?;
+        if meta.len() != columns.len() {
+            return Ok(Err(format!("{} of the {} columns were described", meta.len(), columns.len())));
+        }
+        Ok(schema.fields().iter().zip(&meta).map(|(f, m)| crate::bulk::plan(f, m)).collect())
+    }
+
     /// Split a schema id: `(database, schema)` in all-databases mode, after
     /// the longest database listed that the id starts with (a name may hold
     /// a dot), else at the first dot.
@@ -215,6 +232,77 @@ impl Session for MssqlSession {
 
     async fn ping(&self) -> Result<()> {
         self.rows("select 1", vec![]).await.map(|_| ())
+    }
+
+    /// Bulk copy (`INSERT BULK … WITH (CHECK_CONSTRAINTS, KEEP_NULLS,
+    /// FIRE_TRIGGERS)`): the rows converted to their columns' types
+    /// ([`crate::bulk::plan`]), one statement, so a call that fails adds
+    /// none of its rows. In the session (its transaction, its #temp tables);
+    /// Stop drops the connection, which is mid-copy.
+    async fn append_rows(
+        &self,
+        table: &str,
+        columns: &[String],
+        batch: databrain_connector_core::arrow::array::RecordBatch,
+        cancel: databrain_connector_core::CancellationToken,
+    ) -> Result<Option<u64>> {
+        use tiberius::SqlBulkCopyOption as O;
+        if batch.num_rows() == 0 {
+            return Ok(Some(0));
+        }
+        let table = databrain_connector_core::quote_path(ConnectorKind::Mssql, table);
+        let mut g = self.conn.lock().await;
+        if g.is_none() {
+            *g = Some(self.opener.open().await?);
+            self.state.reset();
+        }
+        let c = g.as_mut().expect("connected");
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let copy = async {
+            let cols = match Self::bulk_plan(c, &table, columns, &batch.schema()).await? {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            crate::bulk::check(&batch, &cols, columns)?;
+            let quoted: Vec<String> = columns.iter().map(|c| quote_ident(ConnectorKind::Mssql, c)).collect();
+            let refs: Vec<&str> = quoted.iter().map(String::as_str).collect();
+            started.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut req = c.bulk_insert_with_options(&table, &refs, O::CheckConstraints | O::KeepNulls | O::FireTriggers, &[]).await.map_err(map_err)?;
+            for r in 0..batch.num_rows() {
+                let row = crate::bulk::row(&batch, r, &cols, columns)?;
+                req.send(row).await.map_err(map_err)?;
+            }
+            Ok(Some(req.finalize().await.map_err(map_err)?.total()))
+        };
+        let r = tokio::select! {
+            r = copy => r,
+            _ = cancel.cancelled() => Err(ConnectorError::cancelled()),
+        };
+        // A copy stopped part way (Stop, a lost connection, a value tiberius
+        // refuses after `check`) leaves the connection mid-message: a new one.
+        if let Err(e) = &r
+            && (e.is_cancelled()
+                || e.kind == databrain_connector_core::ErrorKind::Connection
+                || e.code.is_none() && started.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            *g = None;
+        }
+        r
+    }
+
+    fn append_rows_possible(&self) -> bool {
+        true
+    }
+
+    async fn append_rows_refused(
+        &self,
+        table: &str,
+        columns: &[String],
+        schema: &databrain_connector_core::arrow::datatypes::SchemaRef,
+    ) -> Result<Option<String>> {
+        let table = databrain_connector_core::quote_path(ConnectorKind::Mssql, table);
+        let (columns, schema) = (columns.to_vec(), schema.clone());
+        self.with_conn(move |c| Box::pin(async move { Ok(Self::bulk_plan(c, &table, &columns, &schema).await?.err()) })).await
     }
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
