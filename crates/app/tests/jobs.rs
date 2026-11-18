@@ -115,7 +115,12 @@ fn logged(st: &AppState, job: &str, prefix: &str) -> bool {
 async fn finished(st: &AppState, job: &str) -> JobRun {
     // Up to a minute: a slow step (DuckDB summing 300 M rows) takes seconds
     // more on a loaded machine.
-    for _ in 0..2400 {
+    finished_within(st, job, Duration::from_secs(60)).await
+}
+
+async fn finished_within(st: &AppState, job: &str, limit: Duration) -> JobRun {
+    let polls = limit.as_millis() / 25;
+    for _ in 0..polls {
         let run = st.workspace.job_runs(job, 1).unwrap().remove(0);
         // The run is recorded before the job lets go of its slot.
         if run.status != "running" && !st.jobs.is_running(job) {
@@ -607,7 +612,9 @@ async fn duckdb_appended_loads_write_what_inserts_do() {
 /// of every kind loaded both ways and compared, into tables the load
 /// creates and into existing ones with other column types (an `int`, a
 /// decimal of a smaller scale, `datetime2(3)` for a date, …), where the
-/// copy fires the insert trigger for every row, as INSERTs do.
+/// copy fires the insert trigger for every row, as INSERTs do. 120,000
+/// rows (two bulk copy calls); the INSERT half takes about a minute on CI's
+/// server and more on a slow one, so each run may take ten.
 #[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn mssql_bulk_loads_write_what_inserts_do() {
@@ -651,7 +658,7 @@ async fn mssql_bulk_loads_write_what_inserts_do() {
                    timestamp '2026-01-01 10:00:00.123456' + to_microseconds(i::bigint * 1000) as ts, \
                    to_timestamp(1767254400 + i) as tz, \
                    case when i % 5 = 0 then null else from_hex(printf('%04x', i)) end as b \
-                   from range(250000) t(i)";
+                   from range(120000) t(i)";
         let existing = "(id int NOT NULL CHECK (id >= 0), name nvarchar(200), ok bit, f float, amount decimal(18, 2), \
                         d datetime2(3), ts datetime2(6), tz datetimeoffset(7), b varbinary(100))";
         for (pre, label) in [(false, "created"), (true, "existing")] {
@@ -674,9 +681,9 @@ async fn mssql_bulk_loads_write_what_inserts_do() {
                     n.load_mode = LoadMode::Append;
                     n.load_insert_only = insert_only;
                 });
-                let run = run_all(&st, &job).await;
+                let run = run_all_within(&st, &job, Duration::from_secs(600)).await;
                 assert_eq!(run.status, "success", "{label} {table}: {run:?}");
-                assert_eq!(step(&run, "loaded").rows, Some(250_000), "{label} {table}");
+                assert_eq!(step(&run, "loaded").rows, Some(120_000), "{label} {table}");
                 let log = api::job_run_log(&st, &job.id, run.id).unwrap();
                 assert_eq!(
                     log.iter().any(|l| l.message.contains("bulk copy (INSERT BULK")),
@@ -685,13 +692,13 @@ async fn mssql_bulk_loads_write_what_inserts_do() {
                     log.iter().map(|l| &l.message).collect::<Vec<_>>()
                 );
                 if pre {
-                    assert_eq!(rows(&st, &id, &format!("SELECT sum(n) FROM {table}_log")).await[0][0], "250000", "{label} {table}: the trigger saw every row");
+                    assert_eq!(rows(&st, &id, &format!("SELECT sum(n) FROM {table}_log")).await[0][0], "120000", "{label} {table}: the trigger saw every row");
                 }
             }
             let (a, i) = ("SELECT * FROM dbr_ms_bulk", "SELECT * FROM dbr_ms_ins");
             let differ = rows(&st, &id, &format!("SELECT count(*) FROM (SELECT * FROM ({a} EXCEPT {i}) x UNION ALL SELECT * FROM ({i} EXCEPT {a}) y) z")).await;
             assert_eq!(differ[0][0], "0", "{label}: bulk copy and INSERTs wrote different rows");
-            assert_eq!(rows(&st, &id, "SELECT count(*) FROM dbr_ms_bulk").await[0][0], "250000", "{label}");
+            assert_eq!(rows(&st, &id, "SELECT count(*) FROM dbr_ms_bulk").await[0][0], "120000", "{label}");
         }
         for t in ["dbr_ms_bulk", "dbr_ms_ins", "dbr_ms_bulk_log", "dbr_ms_ins_log"] {
             rows(&st, &id, &format!("DROP TABLE IF EXISTS {t}; SELECT 1")).await;
@@ -995,6 +1002,13 @@ fn load_job(st: &AppState, target: &str, table: &str, src: &str, edit: impl FnOn
 async fn run_all(st: &AppState, job: &Job) -> JobRun {
     api::run_job(st, &job.id, None).unwrap();
     finished(st, &job.id).await
+}
+
+/// [`run_all`] for a job that may take longer than a minute (INSERTs into
+/// a slow live server).
+async fn run_all_within(st: &AppState, job: &Job, limit: Duration) -> JobRun {
+    api::run_job(st, &job.id, None).unwrap();
+    finished_within(st, &job.id, limit).await
 }
 
 fn step(run: &JobRun, name: &str) -> databrain_workspace::NodeRunSummary {

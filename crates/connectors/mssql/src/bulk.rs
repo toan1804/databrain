@@ -67,6 +67,8 @@ pub(crate) struct Col {
     pub nullable: bool,
     /// Bytes the column holds (`nvarchar(n)`: 2n; `None`: `max`).
     pub max_bytes: Option<usize>,
+    /// A `decimal`/`numeric` column's precision and scale.
+    pub decimal: Option<(u8, u8)>,
 }
 
 /// The target column kinds bulk copy writes here (others: INSERTs).
@@ -159,6 +161,9 @@ pub(crate) fn plan(f: &Field, col: &MetaDataColumn<'_>) -> std::result::Result<C
         (D::Int8 | D::Int16 | D::Int32 | D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64, Target::Decimal) => Some(Conv::IntDecimal),
         (D::Float64, Target::Float) => Some(Conv::Float),
         (D::Decimal128(_, s), Target::Decimal) if *s >= 0 => Some(Conv::Decimal(*s)),
+        // An exact decimal carried as text is a number literal in the
+        // INSERT (`00123.50` into nvarchar is `123.50`): INSERTs.
+        (D::Utf8 | D::LargeUtf8, Target::NText) if databrain_connector_core::value::is_decimal_text(f) => None,
         (D::Utf8 | D::LargeUtf8 | D::Utf8View, Target::NText) => Some(Conv::Text),
         (D::Binary | D::LargeBinary | D::BinaryView, Target::Binary) => Some(Conv::Binary),
         (D::Date32, Target::Date) => Some(Conv::Date),
@@ -179,7 +184,11 @@ pub(crate) fn plan(f: &Field, col: &MetaDataColumn<'_>) -> std::result::Result<C
         }
         _ => None,
     };
-    Ok(Col { conv, nullable: col.base.is_nullable(), max_bytes })
+    let decimal = match col.base.ty() {
+        TypeInfo::VarLenSizedPrecision { precision, scale, .. } => Some((*precision, *scale)),
+        _ => None,
+    };
+    Ok(Col { conv, nullable: col.base.is_nullable(), max_bytes, decimal })
 }
 
 /// A column type as SQL Server names it, for messages.
@@ -303,7 +312,10 @@ pub(crate) fn row(batch: &RecordBatch, r: usize, cols: &[Col], names: &[String])
 /// (a copy can't stop part way without dropping the connection, and with
 /// it the session's transaction and #temp tables): one that doesn't
 /// convert, a NULL into a NOT NULL column, text or bytes longer than the
-/// column. The error names the row among `batch`'s, from 1.
+/// column, a number with more digits than a decimal column holds once
+/// rounded to its scale (with the INSERT's message; the copy would fail
+/// part way, or tiberius's rescaling overflow and drop the connection). The
+/// error names the row among `batch`'s, from 1.
 pub(crate) fn check(batch: &RecordBatch, cols: &[Col], names: &[String]) -> Result<()> {
     for ((a, c), n) in batch.columns().iter().zip(cols).zip(names) {
         for r in 0..batch.num_rows() {
@@ -322,9 +334,39 @@ pub(crate) fn check(batch: &RecordBatch, cols: &[Col], names: &[String]) -> Resu
             {
                 return Err(at(ConnectorError::query(format!("String or binary data would be truncated in column {n} ({b} bytes, it holds {max})"))));
             }
+            let exact = match c.conv {
+                Conv::Decimal(sc) if !a.is_null(r) => Some((a.as_primitive::<Decimal128Type>().value(r), sc as u8)),
+                Conv::IntDecimal if !a.is_null(r) => Some((int_value(a.as_ref(), r), 0)),
+                _ => None,
+            };
+            if let (Some((v, sc)), Some((precision, scale))) = (exact, c.decimal)
+                && !decimal_fits(v, sc, precision, scale)
+            {
+                return Err(at(ConnectorError::query(format!(
+                    "Arithmetic overflow error converting numeric to data type numeric (column {n}, decimal({precision}, {scale}))"
+                ))));
+            }
         }
     }
     Ok(())
+}
+
+/// Whether `v` × 10^-`sc` fits `decimal(precision, scale)` once rounded to
+/// `scale` half away from zero (as the server rounds the literal, and
+/// tiberius rescales the value).
+fn decimal_fits(v: i128, sc: u8, precision: u8, scale: u8) -> bool {
+    let Some(limit) = 10i128.checked_pow(precision as u32) else { return true };
+    let scaled = if scale >= sc {
+        10i128.checked_pow((scale - sc) as u32).and_then(|m| v.checked_mul(m))
+    } else {
+        let d = 10i128.checked_pow((sc - scale) as u32);
+        d.map(|d| {
+            let (q, rem) = (v / d, v % d);
+            if rem.unsigned_abs() * 2 >= d.unsigned_abs() { q + v.signum() } else { q }
+        })
+        .or(Some(0))
+    };
+    scaled.is_some_and(|x| x.unsigned_abs() < limit.unsigned_abs())
 }
 
 /// The rows of `batch` checked and converted for a copy into a table the
@@ -348,7 +390,7 @@ pub fn bench_rows(batch: &RecordBatch) -> Result<usize> {
                 D::Timestamp(u, Some(_)) => Conv::DateTimeOffset(*u, 7, 0),
                 _ => Conv::Int(8),
             };
-            Col { conv, nullable: true, max_bytes: None }
+            Col { conv, nullable: true, max_bytes: None, decimal: None }
         })
         .collect();
     let names: Vec<String> = batch.schema().fields().iter().map(|f| f.name().clone()).collect();
@@ -408,6 +450,11 @@ mod tests {
             // varchar: the literal is N'…', which the server maps to the code page.
             (f(D::Utf8), var(VarLenType::BigVarChar, 100)),
             (f(D::Int64), var(VarLenType::NVarchar, 100)),
+            // A decimal carried as text: the INSERT writes it as a number.
+            (
+                f(D::Utf8).with_metadata([(databrain_connector_core::value::META_DB_TYPE.to_string(), "numeric(12,2)".to_string())].into()),
+                var(VarLenType::NVarchar, 100),
+            ),
             // More digits than the column: the literal rounds.
             (f(D::Timestamp(TimeUnit::Microsecond, None)), var(VarLenType::Datetime2, 3)),
             (f(D::Timestamp(TimeUnit::Nanosecond, None)), var(VarLenType::Datetime2, 7)),
@@ -431,7 +478,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(1), None])), Arc::new(StringArray::from(vec![Some("abcd"), None]))]).unwrap();
         let names = ["n".to_string(), "s".to_string()];
-        let c = |conv, nullable, max_bytes| Col { conv, nullable, max_bytes };
+        let c = |conv, nullable, max_bytes| Col { conv, nullable, max_bytes, decimal: None };
         assert!(check(&batch, &[c(Conv::Int(4), true, None), c(Conv::Text, true, Some(8))], &names).is_ok());
         let e = check(&batch, &[c(Conv::Int(4), false, None), c(Conv::Text, true, None)], &names).unwrap_err();
         assert!(e.message.contains("NULL into column n") && e.message.contains("row 2"), "{}", e.message);
@@ -443,6 +490,37 @@ mod tests {
         )
         .unwrap();
         assert!(check(&big, &[c(Conv::Int(1), true, None)], &names[..1]).unwrap_err().message.contains("out of range"));
+    }
+
+    /// A decimal over its column's precision once rounded fails before the
+    /// copy, with the INSERT's message; one that rounds into it goes.
+    #[test]
+    fn decimals_over_the_precision_are_found() {
+        use databrain_connector_core::arrow::array::{Decimal128Array, Int64Array};
+        use std::sync::Arc;
+        assert!(decimal_fits(-12355, 4, 5, 2), "-1.2355 is -1.24");
+        assert!(decimal_fits(999_994, 3, 5, 2), "999.994 is 999.99");
+        assert!(!decimal_fits(999_995, 3, 5, 2), "999.995 is 1000.00");
+        assert!(!decimal_fits(i128::MAX / 10, 0, 38, 10), "scaling up overflows");
+        assert!(decimal_fits(12, 0, 38, 36));
+        assert!(!decimal_fits(100, 0, 38, 37));
+        let schema = Arc::new(databrain_connector_core::arrow::datatypes::Schema::new(vec![Field::new("d", D::Decimal128(10, 3), true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Decimal128Array::from(vec![Some(1_000), None, Some(999_995)]).with_precision_and_scale(10, 3).unwrap())],
+        )
+        .unwrap();
+        let col = |decimal| Col { conv: Conv::Decimal(3), nullable: true, max_bytes: None, decimal };
+        let e = check(&batch, &[col(Some((5, 2)))], &["d".into()]).unwrap_err();
+        assert!(e.message.starts_with("Arithmetic overflow error converting numeric") && e.message.contains("row 3"), "{}", e.message);
+        assert!(check(&batch, &[col(Some((6, 2)))], &["d".into()]).is_ok());
+        let ints = RecordBatch::try_new(
+            Arc::new(databrain_connector_core::arrow::datatypes::Schema::new(vec![Field::new("n", D::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![99, 100]))],
+        )
+        .unwrap();
+        let int = Col { conv: Conv::IntDecimal, nullable: true, max_bytes: None, decimal: Some((4, 2)) };
+        assert!(check(&ints, &[int], &["n".into()]).unwrap_err().message.contains("row 2"));
     }
 
     #[test]
