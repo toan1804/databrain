@@ -924,9 +924,9 @@ pub fn learned(state: &AppState, connection_id: &str) -> Result<LearnedView> {
                     "A declared foreign key: the AI sees it as FK".into()
                 } else if !learn::surfaced(&j) {
                     if j.queries == 0 {
-                        "Only the AI's own queries used it: it counts once you or a job run it".into()
+                        "Only the AI's own queries used it: approve it, or it counts once you or a job run it".into()
                     } else {
-                        "Seen in one query on one day: given to the AI after another query or another day".into()
+                        "Seen in one query on one day: approve it, or it is given to the AI after another query or another day".into()
                     }
                 } else if !readable(&j.left_table) || !readable(&j.right_table) {
                     "Joins a table the AI may not read (table access rules)".into()

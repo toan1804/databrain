@@ -30,12 +30,23 @@ export function joinUsage(j: LearnedJoinView, now = Date.now()): string {
 }
 
 /** Where a join stands for the AI. */
-export type JoinState = "given" | "review" | "waiting" | "rejected";
+export type JoinState = "given" | "review" | "waiting" | "hidden" | "rejected";
 
-export function joinState(j: Pick<LearnedJoinView, "shown" | "status" | "documented">): JoinState {
+/** Uses that give a join to the AI without the user approving it (as `learn::surfaced`). */
+export const SURFACE_QUERIES = 2;
+export const SURFACE_DAYS = 2;
+
+/** Used enough to be given to the AI (in 2 different queries, or on 2 different days). */
+export const usedEnough = (j: Pick<LearnedJoinView, "queries" | "days">) => j.queries >= SURFACE_QUERIES || j.days >= SURFACE_DAYS;
+
+export function joinState(j: Pick<LearnedJoinView, "shown" | "status" | "documented" | "queries" | "days">): JoinState {
   if (j.status === "rejected") return "rejected";
   if (j.documented?.state === "proposed") return "review";
-  return j.shown ? "given" : "waiting";
+  if (j.shown) return "given";
+  // Approved, documented or used enough, and still not given: something
+  // else keeps it from the AI (its reason says what), not too little use.
+  const earned = j.status === "confirmed" || j.documented?.state === "approved" || usedEnough(j);
+  return earned ? "hidden" : "waiting";
 }
 
 /** "the AI", "an MCP client", "you" */
@@ -44,9 +55,10 @@ export function documentedBy(by: string): string {
 }
 
 const STATES: { key: JoinState; label: string; dot: string; help: string }[] = [
-  { key: "given", label: "Given to AI", dot: "bg-success", help: "The AI gets these joins: used in 2 different queries or on 2 different days" },
+  { key: "given", label: "Given to AI", dot: "bg-success", help: "The AI gets these joins: approved by you, or used in 2 different queries or on 2 different days" },
   { key: "review", label: "To review", dot: "bg-warning", help: "Recorded by the AI from a document or what you said: approve or discard" },
-  { key: "waiting", label: "Waiting", dot: "bg-muted/60", help: "Not used enough yet: given to the AI once used in another query or on another day" },
+  { key: "waiting", label: "Waiting", dot: "bg-muted/60", help: "Not used enough yet: given to the AI once you approve it, or once it is used in another query or on another day" },
+  { key: "hidden", label: "Not given", dot: "bg-warning/70", help: "Approved or used enough, but kept from the AI for another reason (a declared foreign key, table access rules, a column gone): see its reason" },
   { key: "rejected", label: "Rejected", dot: "bg-danger", help: "Never given to the AI" },
 ];
 
@@ -128,7 +140,7 @@ export function LearnedSection({
 
   const joins = useMemo(() => view?.joins ?? [], [view]);
   const counts = useMemo(() => {
-    const c: Record<JoinState, number> = { given: 0, review: 0, waiting: 0, rejected: 0 };
+    const c: Record<JoinState, number> = { given: 0, review: 0, waiting: 0, hidden: 0, rejected: 0 };
     for (const j of joins) c[joinState(j)] += 1;
     return c;
   }, [joins]);
@@ -209,7 +221,7 @@ export function LearnedSection({
   }
 
   const about =
-    "Join keys from queries you and your jobs ran. The AI gets a join once it is in 2 different queries or used on 2 days; its own queries never count. Reject a join that is wrong to keep it from the AI. Most used tables rank higher when the AI looks for tables.";
+    "Join keys from queries you and your jobs ran. The AI gets a join once you approve it, or once it is in 2 different queries or used on 2 different days (your computer's dates); its own queries never count. Reject a join that is wrong to keep it from the AI. Most used tables rank higher when the AI looks for tables.";
   return (
     <div className="flex min-h-0 flex-col gap-2">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -330,9 +342,16 @@ export function LearnedSection({
                             <RotateCcw size={11} />
                           </button>
                         ) : (
-                          <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "rejected")} title="Reject: a wrong join, never give it to the AI" aria-label="Reject">
-                            <X size={12} />
-                          </button>
+                          <>
+                            {j.status === "learned" && !j.shown && (
+                              <button className="icon-btn h-5 w-5 text-success" onClick={() => void setStatus(j, "confirmed")} title="Approve: give it to the AI now" aria-label="Approve">
+                                <Check size={12} />
+                              </button>
+                            )}
+                            <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "rejected")} title="Reject: a wrong join, never give it to the AI" aria-label="Reject">
+                              <X size={12} />
+                            </button>
+                          </>
                         )}
                       </div>
                     </div>
@@ -351,7 +370,10 @@ export function LearnedSection({
                             </span>
                           </div>
                         )}
-                        <div className="text-muted">{j.queries > 0 || !j.documented ? joinUsage(j) : "Not seen in queries yet"}</div>
+                        <div className="text-muted">
+                          {j.queries > 0 || !j.documented ? joinUsage(j) : "Not seen in queries yet"}
+                          {j.status === "confirmed" && " · approved by you"}
+                        </div>
                         <div>
                           {j.shown ? (
                             <span className="rounded bg-success/10 px-1 text-success">Given to the AI</span>
@@ -370,15 +392,20 @@ export function LearnedSection({
                               </button>
                             </>
                           )}
+                          {st !== "review" && j.status === "learned" && !j.shown && (
+                            <button className="btn-primary py-0 text-[11px]" onClick={() => void setStatus(j, "confirmed")} title="A right join: give it to the AI however often it was used">
+                              <Check size={11} /> Approve
+                            </button>
+                          )}
                           {st !== "review" && j.status !== "rejected" && (
                             <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "rejected")} title="A wrong join: never give it to the AI">
                               <X size={11} /> Reject
                             </button>
                           )}
-                          {/* Confirmed by hand in an earlier version: back to measuring. */}
+                          {/* Approved or rejected: back to measuring it from use. */}
                           {j.status !== "learned" && (
                             <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "learned")} title="Decide by how often it is used">
-                              <RotateCcw size={11} /> {j.status === "rejected" ? "Undo reject" : "Measure from use"}
+                              <RotateCcw size={11} /> {j.status === "rejected" ? "Undo reject" : "Undo approve"}
                             </button>
                           )}
                           <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void makeNote(j)} title="Keep it as a note (notes can be exported and shared)">

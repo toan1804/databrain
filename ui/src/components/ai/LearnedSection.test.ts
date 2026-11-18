@@ -35,7 +35,7 @@ describe("learned joins", () => {
   });
 
   it("sorts joins into given, waiting and rejected, and filters them", () => {
-    const waiting = { ...base, id: 2, shown: false, hidden_reason: "Used in 1 query" };
+    const waiting = { ...base, id: 2, queries: 1, shown: false, hidden_reason: "Used in 1 query" };
     const rejected = { ...base, id: 3, status: "rejected" as const, shown: false, left_table: "sales.customers", left_columns: ["id"], right_table: "sales.orders", right_columns: ["customer_id"] };
     expect([base, waiting, rejected].map(joinState)).toEqual(["given", "waiting", "rejected"]);
     // Recorded by the AI from a document: to review until approved.
@@ -43,6 +43,13 @@ describe("learned joins", () => {
     expect(joinState({ ...waiting, documented: doc("proposed") })).toBe("review");
     expect(joinState({ ...base, documented: doc("approved") })).toBe("given");
     expect(joinState({ ...rejected, documented: doc("proposed") })).toBe("rejected");
+    // Approved by the user: given (the server says so), or kept from the AI
+    // for another reason — then "Not given", not waiting for use.
+    expect(joinState({ ...waiting, status: "confirmed", shown: true })).toBe("given");
+    expect(joinState({ ...waiting, status: "confirmed" })).toBe("hidden");
+    // Used on 2 days but not given (a declared FK, table access): not "waiting".
+    expect(joinState({ ...waiting, queries: 1, days: 2 })).toBe("hidden");
+    expect(joinState({ ...waiting, queries: 1, days: 1 })).toBe("waiting");
     expect(filterJoins([base, waiting, rejected], "", "waiting").map((j) => j.id)).toEqual([2]);
     // Every word must match a table or column, in any case.
     expect(filterJoins([base, waiting, rejected], "ORDERS line_no", "all").map((j) => j.id)).toEqual([1, 2]);
