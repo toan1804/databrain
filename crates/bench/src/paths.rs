@@ -309,6 +309,7 @@ fn export_and_load(s: &mut Suite) {
     });
     let (stage_schema, stage_data) = (copy_schema.clone(), copy_data.clone());
     let (bq_schema, bq_data) = (copy_schema.clone(), copy_data.clone());
+    let (tsv_schema, tsv_data) = (copy_schema.clone(), copy_data.clone());
     let (array_schema, array_data) = (copy_schema.clone(), copy_data.clone());
     s.add("pg_copy_100k_rows", "a Postgres load writes its COPY data", 1500, rows, move || {
         let c = databrain_export::load::PgCopy::new("app.orders", &copy_schema);
@@ -342,6 +343,18 @@ fn export_and_load(s: &mut Suite) {
         for b in &bq_data {
             let mut at = 0;
             while let Some((d, n)) = j.next(b, at, 64 << 20).expect("json") {
+                bytes += d.len();
+                at += n;
+            }
+        }
+        bytes
+    });
+    s.add("ch_tsv_100k_rows", "a ClickHouse load writes its TabSeparated rows", 1500, rows, move || {
+        let t = databrain_export::load::ChTsv::new("app.orders", &tsv_schema);
+        let mut bytes = 0;
+        for b in &tsv_data {
+            let mut at = 0;
+            while let Some((d, n)) = t.next(b, at, usize::MAX, 16 << 20).expect("tsv") {
                 bytes += d.len();
                 at += n;
             }

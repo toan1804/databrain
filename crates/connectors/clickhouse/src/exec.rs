@@ -75,6 +75,32 @@ impl Inner {
         Err(server_error(code, status.as_u16(), &text))
     }
 
+    /// An INSERT whose rows are `data` (`INSERT … FORMAT TabSeparated` in the
+    /// URL, the rows as the body), in the session; Stop kills it.
+    pub(crate) async fn insert_data(&self, sql: &str, data: Vec<u8>, cancel: &databrain_connector_core::CancellationToken) -> Result<()> {
+        let _guard = self.lock.clone().lock_owned().await;
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let req = self.request("", &query_id, true).query(&[("query", sql)]).body(data);
+        let send = async {
+            let resp = req.send().await.map_err(net_err)?;
+            if resp.status().is_success() {
+                let _ = resp.bytes().await;
+                return Ok(());
+            }
+            let status = resp.status();
+            let code = resp.headers().get("X-ClickHouse-Exception-Code").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u32>().ok());
+            let text = resp.text().await.unwrap_or_default();
+            Err(server_error(code, status.as_u16(), &text))
+        };
+        tokio::select! {
+            r = send => r,
+            _ = cancel.cancelled() => {
+                self.kill(&query_id).await;
+                Err(ConnectorError::cancelled())
+            }
+        }
+    }
+
     /// Ask the server to stop a query (from outside its session, which is busy).
     pub(crate) async fn kill(&self, query_id: &str) {
         let sql = format!("KILL QUERY WHERE query_id = {} ASYNC", lit(query_id));
