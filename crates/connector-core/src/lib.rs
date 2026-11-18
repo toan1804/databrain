@@ -315,6 +315,27 @@ pub trait Session: Send + Sync {
         None
     }
 
+    /// Rows of `batch` added to `table` through the database's appender
+    /// (DuckDB), when the session has one: `columns` are the table's columns
+    /// for the batch's, by position; the database converts each value to its
+    /// column's type with its own casts, as for an INSERT. Rows added;
+    /// `Ok(None)` when it can't. A call that fails adds none of its rows.
+    async fn append_rows(&self, _table: &str, _columns: &[String], _batch: arrow::array::RecordBatch, _cancel: CancellationToken) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Whether [`Self::append_rows`] may add rows.
+    fn append_rows_possible(&self) -> bool {
+        false
+    }
+
+    /// Why [`Self::append_rows`] can't add rows of `schema` to `table`'s
+    /// `columns` (`Some`), asked before the first call so the load can say
+    /// why it uses INSERTs instead; `None`: it can.
+    async fn append_rows_refused(&self, _table: &str, _columns: &[String], _schema: &arrow::datatypes::SchemaRef) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Whether [`Self::insert_array`] may insert, so a load doesn't prepare
     /// its rows for a session that can't.
     fn insert_array_possible(&self) -> bool {
