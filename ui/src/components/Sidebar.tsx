@@ -3,6 +3,7 @@ import { Bookmark, Database, NotebookPen, Sparkles, History, Layers, Workflow } 
 import { useAi } from "../aiStore";
 import { OutputsPanel } from "./OutputsPanel";
 import { useJobs } from "../jobsStore";
+import { useActivity } from "../activityStore";
 import { useStore, type SidebarPanel } from "../store";
 import { kbd } from "../lib/platform";
 import { ConnectionsPanel } from "./sidebar/ConnectionsPanel";
@@ -45,7 +46,7 @@ function ActivityRail() {
       onClick={() => {
         setPanel(p);
         // Work hidden from the activity bar (×) shows there again.
-        if (p === "jobs") useJobs.getState().showBar();
+        if (p === "jobs") useActivity.getState().showAll();
       }}
       className={`relative flex h-10 w-10 items-center justify-center rounded-lg transition-colors ${
         panel === p ? "bg-hover text-fg" : "text-muted hover:text-fg"

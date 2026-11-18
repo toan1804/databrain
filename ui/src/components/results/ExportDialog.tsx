@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Download, Loader2, Square } from "lucide-react";
 import { useExports } from "../../exportsStore";
-import { ExportCard } from "../ExportsTray";
+import { ExportCard } from "../ExportCard";
 import { api, toError } from "../../lib/api";
 import type { ExportFormat, ResultInfo, ViewSpec } from "../../lib/types";
 import { emptyView, formatCount } from "../../lib/util";

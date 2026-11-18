@@ -2,12 +2,13 @@ import { create } from "zustand";
 import { api, onExportProgress, toError, type ExportPhase } from "./lib/api";
 import type { ExportOptions } from "./lib/types";
 import { useStore } from "./store";
-import { uid } from "./lib/util";
+import { formatCount, uid } from "./lib/util";
+import { useActivity } from "./activityStore";
 
 /**
  * Full exports ("All rows of the query") run in the background: the query
  * runs again on its own session and every row goes straight to the file, so
- * the app stays usable while a slow query exports. Shown in the exports tray.
+ * the app stays usable while a slow query exports. Shown in the activity bar.
  */
 export type ExportStatus = "running" | "done" | "failed";
 
@@ -31,7 +32,7 @@ export interface BackgroundExport {
 
 interface ExportsState {
   items: BackgroundExport[];
-  /** Export shown in the export dialog (the tray leaves it out meanwhile). */
+  /** Export shown in the export dialog (the activity bar leaves it out meanwhile). */
   inDialog: string | null;
   setInDialog: (id: string | null) => void;
   /** Start a full export; resolves with its id once it is running. */
@@ -41,8 +42,8 @@ interface ExportsState {
   reveal: (id: string) => void;
 }
 
-/** Finished exports leave the tray on their own after this long. */
-export const DONE_VISIBLE_MS = 30_000;
+/** Finished exports leave the activity bar on their own after this long (time to click "Show file"). */
+export const DONE_VISIBLE_MS = 15_000;
 
 let listening: Promise<unknown> | null = null;
 
@@ -79,6 +80,12 @@ export const useExports = create<ExportsState>((set, get) => {
       void api
         .exportFullResult(resultId, options, path, id)
         .then((rows) => {
+          // Hidden from the bar (×): a toast, not the bar again.
+          if (useActivity.getState().ended(`export:${id}`) && get().inDialog !== id) {
+            get().dismiss(id);
+            useStore.getState().toast(`Exported ${formatCount(rows)} rows to ${item.fileName}`, "success");
+            return;
+          }
           patch(id, { status: "done", rows, finished: Date.now(), stopping: false });
           setTimeout(() => {
             if (get().items.find((x) => x.id === id)?.status === "done") get().dismiss(id);
@@ -86,6 +93,7 @@ export const useExports = create<ExportsState>((set, get) => {
         })
         .catch((e) => {
           const err = toError(e);
+          useActivity.getState().ended(`export:${id}`);
           if (err.kind === "cancelled") {
             get().dismiss(id);
             useStore.getState().toast(`Export of ${item.fileName} stopped`, "info");

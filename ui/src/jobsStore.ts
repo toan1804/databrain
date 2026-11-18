@@ -6,6 +6,7 @@ import { useStore } from "./store";
 import { uid } from "./lib/util";
 import { cellStepBase, stepsFromCells, uniqueName, type CellSource } from "./lib/jobGraph";
 import { runLine } from "./components/job/shared";
+import { useActivity } from "./activityStore";
 
 /**
  * A step name no other job's step or named output uses (`step`, `step_2`…).
@@ -35,19 +36,8 @@ interface JobsState {
   logs: Record<number, RunLogEntry[]>;
   /** Runs seen running in this window (the activity bar follows them; their end is told). */
   seen: Record<number, true>;
-  /**
-   * Work the user hid from the activity bar (×) while it ran: `run:<id>`,
-   * or `bg:<job id>` for the background runner's. Per run: new work shows
-   * in the bar without bringing these back, and a hidden run that fails
-   * shows its failure there (outcomes go by `barDismissed`).
-   */
-  barHidden: Record<string, true>;
   /** Finished runs whose outcome left the bar (dismissed, or shown a while). */
   barDismissed: Record<number, true>;
-  /** Hide the work running now from the bar (×). */
-  hideBar: (keys: string[]) => void;
-  /** Show everything hidden again (the Jobs icon, the command palette). */
-  showBar: () => void;
   /** A finished run's outcome leaves the bar. */
   dismissRun: (id: number) => void;
   refresh: () => Promise<void>;
@@ -135,10 +125,7 @@ export const useJobs = create<JobsState>((set, get) => ({
   elsewhere: {},
   logs: {},
   seen: {},
-  barHidden: {},
   barDismissed: {},
-  hideBar: (keys) => set((s) => ({ barHidden: { ...s.barHidden, ...Object.fromEntries(keys.map((k) => [k, true as const])) } })),
-  showBar: () => set((s) => (Object.keys(s.barHidden).length ? { barHidden: {} } : {})),
   dismissRun: (id) => set((s) => (s.barDismissed[id] ? {} : { barDismissed: { ...s.barDismissed, [id]: true as const } })),
   refresh: async () => {
     if (!isTauri()) return;
@@ -336,7 +323,8 @@ export function runEvent({ job_id, run }: { job_id: string; run: JobRun }) {
   const key = `run:${run.id}`;
   const before = useJobs.getState();
   const isNew = run.status === "running" && !before.seen[run.id];
-  const wasHidden = !!before.barHidden[key];
+  // Ended: its key leaves the hidden ones (the outcome is kept or dismissed below).
+  const wasHidden = run.status !== "running" ? useActivity.getState().ended(key) : !!useActivity.getState().hidden[key];
   // Its job's tab is shown: the tab tells how it ended, the bar needn't.
   const st = useStore.getState();
   const inView = st.tabs.find((t) => t.id === st.activeTabId)?.job_id === job_id;
@@ -344,8 +332,6 @@ export function runEvent({ job_id, run }: { job_id: string; run: JobRun }) {
     runs: { ...s.runs, [job_id]: run },
     running: { ...s.running, [job_id]: run.status === "running" },
     ...(isNew ? { seen: { ...s.seen, [run.id]: true as const } } : {}),
-    // Ended: its key goes (the outcome is kept or dismissed below).
-    ...(run.status !== "running" && wasHidden ? { barHidden: Object.fromEntries(Object.entries(s.barHidden).filter(([k]) => k !== key)) } : {}),
     ...(run.status !== "running" && (inView || (wasHidden && run.status !== "error")) ? { barDismissed: { ...s.barDismissed, [run.id]: true as const } } : {}),
   }));
   const seen = !!useJobs.getState().seen[run.id];
