@@ -200,6 +200,27 @@ impl Session for DuckSession {
         true
     }
 
+    /// The pairs DuckDB's casts convert differently from an INSERT's
+    /// literal ([`appender_refused`]), from the table's column types.
+    async fn append_rows_refused(
+        &self,
+        table: &str,
+        columns: &[String],
+        schema: &databrain_connector_core::arrow::datatypes::SchemaRef,
+    ) -> Result<Option<String>> {
+        let sql = format!("DESCRIBE SELECT * FROM {}", databrain_connector_core::quote_path(ConnectorKind::Duckdb, table));
+        let types: Vec<(String, String)> =
+            self.strings(sql, vec![]).await?.into_iter().filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?))).collect();
+        for (f, c) in schema.fields().iter().zip(columns) {
+            // DuckDB's names are case-insensitive.
+            let target = types.iter().find(|(n, _)| n == c).or_else(|| types.iter().find(|(n, _)| n.eq_ignore_ascii_case(c)));
+            if let Some(why) = target.and_then(|(_, t)| appender_refused(f.data_type(), t)) {
+                return Ok(Some(format!("{c}: {why}")));
+            }
+        }
+        Ok(None)
+    }
+
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
         let sql = stmt.sql();
         let state = self.state.clone();
@@ -540,6 +561,26 @@ impl DuckSession {
     }
 }
 
+/// Why a value of Arrow type `source` doesn't go through the appender into
+/// a column of DuckDB type `target`: the appender's cast would write
+/// something other than the INSERT's literal. Floats are cast as binary
+/// floats (a double `2.5` into an INTEGER rounds half to even, `1.005` into
+/// DECIMAL(5,2) is `1.00`; a FLOAT `0.1` into a DOUBLE is `0.100000001…`),
+/// where the literal's decimal text rounds half away from zero; an instant
+/// with a time zone into anything but TIMESTAMPTZ is converted in the
+/// session's time zone, where the literal carries its offset.
+pub(crate) fn appender_refused(source: &databrain_connector_core::arrow::datatypes::DataType, target: &str) -> Option<String> {
+    use databrain_connector_core::arrow::datatypes::DataType as D;
+    let t = target.trim().to_ascii_uppercase();
+    let fine = match source {
+        D::Float64 => matches!(t.as_str(), "DOUBLE" | "FLOAT" | "VARCHAR"),
+        D::Float32 => matches!(t.as_str(), "FLOAT" | "VARCHAR"),
+        D::Timestamp(_, Some(_)) => t == "TIMESTAMP WITH TIME ZONE",
+        _ => true,
+    };
+    (!fine).then(|| format!("{source} into {target} would be converted differently from an INSERT's value"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +618,34 @@ mod tests {
         let e = tokio::time::timeout(t, running.collect()).await.expect("stopped quickly").unwrap_err();
         assert!(e.is_cancelled(), "{e:?}");
         assert_eq!(tokio::time::timeout(t, q(&*s, "select 1")).await.expect("no hang").num_rows(), 1, "still usable");
+    }
+
+    /// The appender is refused for the pairs its casts convert differently
+    /// from an INSERT's literal, read from the table's column types.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn appender_refuses_pairs_converted_differently() {
+        use databrain_connector_core::arrow::datatypes::{DataType as D, Field, Schema, TimeUnit};
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        q(&*s, "create table \"T\" (i integer, d decimal(5,2), f float, x double, v varchar, ts timestamp, tz timestamptz, tm time)").await;
+        let schema = |dt: D| Arc::new(Schema::new(vec![Field::new("c", dt, true)]));
+        let tz = D::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        for (dt, col) in [(D::Float64, "i"), (D::Float64, "d"), (D::Float32, "x"), (D::Float32, "D"), (tz.clone(), "ts"), (tz.clone(), "v"), (tz.clone(), "tm")]
+        {
+            let why = s.append_rows_refused("T", &[col.into()], &schema(dt.clone())).await.unwrap();
+            assert!(why.as_deref().is_some_and(|w| w.starts_with(&format!("{col}: "))), "{dt:?} into {col}: {why:?}");
+        }
+        for (dt, col) in [
+            (D::Float64, "x"),
+            (D::Float64, "f"),
+            (D::Float64, "v"),
+            (D::Float32, "f"),
+            (D::Float32, "V"),
+            (tz, "tz"),
+            (D::Int64, "x"),
+            (D::Decimal128(38, 10), "i"),
+        ] {
+            assert_eq!(s.append_rows_refused("T", &[col.into()], &schema(dt.clone())).await.unwrap(), None, "{dt:?} into {col}");
+        }
     }
 
     /// The interrupt reaches a statement only while it holds the connection.

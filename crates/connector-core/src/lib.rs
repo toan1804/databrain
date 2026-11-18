@@ -329,6 +329,13 @@ pub trait Session: Send + Sync {
         false
     }
 
+    /// Why [`Self::append_rows`] can't add rows of `schema` to `table`'s
+    /// `columns` (`Some`), asked before the first call so the load can say
+    /// why it uses INSERTs instead; `None`: it can.
+    async fn append_rows_refused(&self, _table: &str, _columns: &[String], _schema: &arrow::datatypes::SchemaRef) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Whether [`Self::insert_array`] may insert, so a load doesn't prepare
     /// its rows for a session that can't.
     fn insert_array_possible(&self) -> bool {

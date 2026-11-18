@@ -2143,15 +2143,28 @@ async fn run_plan(
                     .then(|| sqlgen::ArrayInsert::new(p.dialect, table, &schema))
                     .flatten();
                 // No bulk load or array INSERTs: the appender where the session has one (DuckDB).
-                let appender = (writer.is_none() && array_insert.is_none() && !p.insert_only && p.session.append_rows_possible())
-                    .then(|| appender_fits(&schema))
-                    .and_then(|fits| match fits {
+                // The columns' types, then the table's (`append_rows_refused`).
+                let appender = if writer.is_none() && array_insert.is_none() && !p.insert_only && p.session.append_rows_possible() {
+                    let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                    let fits = match appender_fits(&schema) {
+                        Ok(()) => match p.session.append_rows_refused(table, &columns, &schema).await {
+                            Ok(None) => Ok(()),
+                            Ok(Some(why)) => Err(why),
+                            Err(e) if e.is_cancelled() => return Err(labelled(label, EngineError::from(e))),
+                            Err(e) => Err(format!("the table's columns couldn't be read: {}", e.message)),
+                        },
+                        e => e,
+                    };
+                    match fits {
                         Ok(()) => Some(()),
                         Err(why) => {
                             obs.event(LoadEvent::Info(format!("{label}: INSERTs, not the appender ({why})")));
                             None
                         }
-                    });
+                    }
+                } else {
+                    None
+                };
                 let bulk_word = if p.dialect == ConnectorKind::Databricks { "a bulk load" } else { "COPY" };
                 let how = match (&writer, &why_not) {
                     // Array INSERTs say so once a call went in (`array_rows`).

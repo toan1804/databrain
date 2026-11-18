@@ -544,7 +544,9 @@ async fn snowflake_array_loads_write_what_inserts_do() {
 /// up exactly as with INSERTs: the same rows of every kind loaded both ways
 /// and compared, into tables the load creates and into existing ones whose
 /// column types differ from the rows' (DuckDB converts each value the same
-/// way for both).
+/// way for both), in a session time zone other than UTC. A table with a
+/// pair the appender would convert differently (an instant with a time
+/// zone into a TIMESTAMP) goes by INSERTs.
 #[tokio::test(flavor = "multi_thread")]
 async fn duckdb_appended_loads_write_what_inserts_do() {
     guarded(async {
@@ -565,26 +567,27 @@ async fn duckdb_appended_loads_write_what_inserts_do() {
         // Existing tables whose types differ from the rows': a number into
         // text, a timestamp into a date, text into a decimal.
         let existing = "(id bigint, name varchar, ok boolean, f double, amount varchar, d varchar, ts date, tz timestamptz, b blob, num_text decimal(18, 2))";
-        for (pre, label) in [(false, "created"), (true, "existing")] {
+        let zoned_into_naive =
+            "(id bigint, name varchar, ok boolean, f double, amount varchar, d varchar, ts date, tz timestamp, b blob, num_text decimal(18, 2))";
+        for (pre, label) in [(None, "created"), (Some(existing), "existing"), (Some(zoned_into_naive), "refused")] {
             for (table, insert_only) in [("app_a", false), ("app_i", true)] {
                 rows(&st, &dst, &format!("drop table if exists {table}; select 1")).await;
-                if pre {
-                    rows(&st, &dst, &format!("create table {table} {existing}; select 1")).await;
+                if let Some(cols) = pre {
+                    rows(&st, &dst, &format!("create table {table} {cols}; select 1")).await;
                 }
                 let job = load_job(&st, &dst, table, src, |n| {
                     n.load_mode = LoadMode::Append;
                     n.load_insert_only = insert_only;
+                    n.load_before_sql = Some("SET TimeZone = 'Asia/Ho_Chi_Minh'".into());
                 });
                 let run = run_all(&st, &job).await;
                 assert_eq!(run.status, "success", "{label} {table}: {run:?}");
                 assert_eq!(step(&run, "loaded").rows, Some(250_000), "{label} {table}");
                 let log = api::job_run_log(&st, &job.id, run.id).unwrap();
-                assert_eq!(
-                    log.iter().any(|l| l.message.contains("the appender")),
-                    !insert_only,
-                    "{label} {table}: {:#?}",
-                    log.iter().map(|l| &l.message).collect::<Vec<_>>()
-                );
+                let messages = log.iter().map(|l| &l.message).collect::<Vec<_>>();
+                let refused = label == "refused" && !insert_only;
+                assert_eq!(messages.iter().any(|m| m.contains("the appender, up to")), !insert_only && !refused, "{label} {table}: {messages:#?}");
+                assert_eq!(messages.iter().any(|m| m.contains("INSERTs, not the appender (tz: ")), refused, "{label} {table}: {messages:#?}");
             }
             let differ = rows(
                 &st,
