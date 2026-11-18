@@ -42,7 +42,11 @@ function ActivityRail() {
       title={label}
       aria-label={label}
       aria-pressed={panel === p}
-      onClick={() => setPanel(p)}
+      onClick={() => {
+        setPanel(p);
+        // Work hidden from the activity bar (×) shows there again.
+        if (p === "jobs") useJobs.getState().showBar();
+      }}
       className={`relative flex h-10 w-10 items-center justify-center rounded-lg transition-colors ${
         panel === p ? "bg-hover text-fg" : "text-muted hover:text-fg"
       }`}

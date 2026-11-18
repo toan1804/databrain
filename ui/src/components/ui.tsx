@@ -4,7 +4,6 @@ import { AlertTriangle, CheckCircle2, ChevronDown, Info, X, XCircle } from "luci
 import { useStore } from "../store";
 import { comboMatches, placeComboList } from "../lib/util";
 import { ExportsTray } from "./ExportsTray";
-import { JobsTray } from "./JobsTray";
 
 const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable]:not([contenteditable="false"])';
 
@@ -484,7 +483,6 @@ export function Toasts() {
   const dismiss = useStore((s) => s.dismissToast);
   return (
     <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-[360px] flex-col gap-2" aria-live="polite">
-      <JobsTray />
       <ExportsTray />
       {toasts.map((t) => (
         <div

@@ -78,6 +78,7 @@ function Palette() {
       { id: "new-nb", group: "Actions", label: "New notebook", icon: <NotebookPen size={14} />, run: () => void st.newNotebook() },
       { id: "new-job", group: "Actions", label: "New job", icon: <Workflow size={14} />, run: () => void useJobs.getState().create() },
       { id: "jobs", group: "Actions", label: "Show jobs", icon: <Workflow size={14} />, run: () => st.setSidebarPanel("jobs") },
+      { id: "activity", group: "Actions", label: "Show background activity", icon: <Workflow size={14} />, run: () => useJobs.getState().showBar() },
       { id: "file", group: "Actions", label: "Query a local file (CSV, Parquet, JSON, Excel)…", icon: <FileSearch size={14} />, run: () => void queryLocalFile() },
       { id: "import-file", group: "Actions", label: "Import a file (CSV, Excel, Parquet, JSON) into a table…", icon: <FileSearch size={14} />, run: () => void queryLocalFile(true) },
       { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: kbd("⌘L"), run: () => useAi.getState().setOpen(true, "chat") },
