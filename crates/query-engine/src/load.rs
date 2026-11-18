@@ -163,8 +163,9 @@ pub enum LoadEvent {
     Info(String),
     /// One statement finished (before/after SQL, DDL, update/merge…).
     Statement { label: String, sql: String, rows: Option<u64>, duration_ms: u64, error: Option<String> },
-    /// Rows written so far by a group of INSERTs (sent after each statement).
-    Progress { phase: String, done: u64, total: u64 },
+    /// Rows written so far by a group of INSERTs (sent after each
+    /// statement), and the ms since the group started.
+    Progress { phase: String, done: u64, total: u64, elapsed_ms: u64 },
     /// A group of INSERTs finished (or failed: `error`, `sql` = the failing one).
     Inserted { label: String, table: String, rows: u64, statements: usize, sql: String, duration_ms: u64, error: Option<String> },
     /// The load failed (sent once, by every failure of a load). `kept_nothing`:
@@ -510,7 +511,8 @@ impl QueryEngine {
         // A result on disk is streamed: its rows are never all in memory.
         let o = self.outputs.ensure_loaded(reference).map_err(unwritten)?;
         if let Some(stream) = self.disk_stream(&o.result_id).map_err(unwritten)? {
-            return self.load_stream(stream, connection_id, tab, spec, cancel, obs).await;
+            // Its row count is known: the progress has a total.
+            return self.load_stream(stream, Some(o.rows as u64), connection_id, tab, spec, cancel, obs).await;
         }
         let rows = self.output_rows(reference).map_err(unwritten)?;
         self.load_rows(&rows, connection_id, tab, spec, cancel, obs).await
@@ -526,7 +528,7 @@ impl QueryEngine {
         cancel: &CancellationToken,
         obs: &dyn LoadObserver,
     ) -> Result<LoadReport> {
-        self.load_with(rows, None, connection_id, tab, spec, cancel, obs).await
+        self.load_with(rows, None, None, connection_id, tab, spec, cancel, obs).await
     }
 
     /// Run `sql` (one read) on the session `session` of connection `source`
@@ -561,13 +563,17 @@ impl QueryEngine {
         let src = self.session_for(source, session, databrain_workspace::Origin::User).await.map_err(unwritten)?;
         let opts = ExecOptions { batch_size: 2000, cancel: cancel.clone(), max_rows: None, output_masks: None };
         let stream = src.execute(sql.statement(), opts).await.map_err(|e| unwritten(e.into()))?;
-        self.load_stream(stream, connection_id, tab, spec, cancel, obs).await
+        self.load_stream(stream, None, connection_id, tab, spec, cancel, obs).await
     }
 
     /// Write every row of `stream` as `spec` says, as they arrive.
+    /// `expected`: how many rows the stream has, when known (a result on
+    /// disk), for the progress.
+    #[allow(clippy::too_many_arguments)]
     async fn load_stream(
         &self,
         mut stream: QueryStream,
+        expected: Option<u64>,
         connection_id: &str,
         tab: &str,
         spec: &LoadSpec,
@@ -590,15 +596,17 @@ impl QueryEngine {
             .ok_or_else(|| before_writing(obs, EngineError::new("invalid", "The query returns no rows to load")))?;
         let more = first.is_some();
         let rows = LoadRows { schema, batches: first.into_iter().collect() };
-        self.load_with(&rows, more.then_some(&mut stream), connection_id, tab, spec, cancel, obs).await
+        self.load_with(&rows, more.then_some(&mut stream), expected, connection_id, tab, spec, cancel, obs).await
     }
 
-    /// Write `rows`, then the batches still to come from `rest`.
+    /// Write `rows`, then the batches still to come from `rest` (`expected`
+    /// rows in all, when known).
     #[allow(clippy::too_many_arguments)]
     async fn load_with(
         &self,
         rows: &LoadRows,
         mut rest: Option<&mut QueryStream>,
+        expected: Option<u64>,
         connection_id: &str,
         tab: &str,
         spec: &LoadSpec,
@@ -609,7 +617,11 @@ impl QueryEngine {
         let p = self.prepare_load(connection_id, tab, spec, Some(rows), false).await.map_err(|e| before_writing(obs, e))?;
         obs.event(LoadEvent::Info(format!(
             "Writing {} rows into {} on {} ({}, in batches of up to {} rows / {} KB): {}",
-            if rest.is_some() { "every".to_string() } else { rows.count().to_string() },
+            match (&rest, expected) {
+                (None, _) => rows.count().to_string(),
+                (Some(_), Some(n)) => n.to_string(),
+                (Some(_), None) => "every".to_string(),
+            },
             p.table,
             p.connection,
             mode_text(spec.mode),
@@ -629,7 +641,7 @@ impl QueryEngine {
         // after the server committed.
         let mut committing = false;
         let result = async {
-            let n = run_plan(&p, rows, rest.as_deref_mut(), cancel, None, obs).await?;
+            let n = run_plan(&p, rows, rest.as_deref_mut(), expected, cancel, None, obs).await?;
             if let Some(tx) = &p.tx {
                 committing = true;
                 timed(&p.session, "Commit", Statement::internal(tx.commit), cancel, obs).await.map_err(|e| labelled("Commit", e))?;
@@ -722,7 +734,7 @@ impl QueryEngine {
                 report.method = "transaction".into();
                 match exec(&p.session, Statement::internal(tx.begin), &cancel).await {
                     Ok(_) => {
-                        let _ = run_plan(&p, data, None, &cancel, Some(&mut checks), &NoLoadObserver).await;
+                        let _ = run_plan(&p, data, None, None, &cancel, Some(&mut checks), &NoLoadObserver).await;
                         if let Err(e) = exec(&p.session, Statement::internal(tx.rollback), &cancel).await {
                             checks.push(LoadCheck { label: "Roll back".into(), sql: tx.rollback.into(), status: "error".into(), message: Some(e.message) });
                         }
@@ -2199,10 +2211,12 @@ async fn staged_rows(
     w
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_plan(
     p: &Prepared,
     rows: &LoadRows,
     mut rest: Option<&mut QueryStream>,
+    expected: Option<u64>,
     cancel: &CancellationToken,
     mut record: Option<&mut Vec<LoadCheck>>,
     obs: &dyn LoadObserver,
@@ -2244,8 +2258,9 @@ async fn run_plan(
             }
             Act::Insert { label, table, target } => {
                 let schema = p.schema.clone().unwrap_or_else(|| rows.schema.clone());
-                // Rows still streaming in: the total isn't known (0).
-                let total = if rest.is_some() { 0 } else { rows.count() };
+                // Rows still streaming in: the total is known for a result
+                // on disk, not for a query read as it runs (0).
+                let total = if rest.is_some() { expected.unwrap_or(0) } else { rows.count() };
                 let started = std::time::Instant::now();
                 let phase = if *target { "Inserting rows" } else { "Staging rows" };
                 let mut why_not = None;
@@ -2334,9 +2349,10 @@ async fn run_plan(
                     // The dry run says which one the load would use.
                     push(&mut record, &format!("{label}: how"), "", &Ok(()), Some(how));
                 }
-                obs.event(LoadEvent::Progress { phase: phase.into(), done: 0, total });
+                obs.event(LoadEvent::Progress { phase: phase.into(), done: 0, total, elapsed_ms: 0 });
                 let feed = Feed { held: rows.batches.iter(), rest: rest.as_deref_mut() };
-                let progress = |done: u64| obs.event(LoadEvent::Progress { phase: phase.into(), done, total });
+                let progress =
+                    |done: u64| obs.event(LoadEvent::Progress { phase: phase.into(), done, total, elapsed_ms: started.elapsed().as_millis() as u64 });
                 let w = match writer {
                     Some((Bulk::Copy(c), writer)) => copy_rows(p, c, writer, feed, &progress).await,
                     Some((b @ (Bulk::Staged(_) | Bulk::Json(_)), writer)) => staged_rows(b, writer, feed, &progress).await,

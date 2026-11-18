@@ -606,7 +606,7 @@ async fn unfinished_statement_results_are_removed_from_the_store() {
             }
         });
         let (engine, r, stmt) = (f.engine.clone(), r.clone(), stmt.clone());
-        async move { engine.collect_stream(job, &r, &stmt, None, CancellationToken::new(), stream, Instant::now()).await }
+        async move { engine.collect_stream(job, &r, &stmt, None, CancellationToken::new(), stream, Instant::now(), None).await }
     };
 
     let ok = run("done", Some(Ok(StreamEvent::Done(ExecSummary::default())))).await.unwrap();
@@ -625,7 +625,7 @@ async fn unfinished_statement_results_are_removed_from_the_store() {
     tx.send(StreamEvent::Schema(schema.clone())).await;
     let engine = f.engine.clone();
     let (r2, s2) = (r.clone(), stmt.clone());
-    let reading = tokio::spawn(async move { engine.collect_stream("dropped", &r2, &s2, None, CancellationToken::new(), stream, Instant::now()).await });
+    let reading = tokio::spawn(async move { engine.collect_stream("dropped", &r2, &s2, None, CancellationToken::new(), stream, Instant::now(), None).await });
     for _ in 0..100 {
         if f.engine.results().contains("dropped:0") {
             break;
@@ -1453,4 +1453,49 @@ fn a_revealed_flavor_is_recorded_on_the_connection() {
     // Again: nothing to save.
     f.engine.remember_flavor(&f.conn_id, "redshift");
     assert_eq!(f.engine.workspace().get_connection(&f.conn_id).unwrap().updated_at, after.updated_at);
+}
+
+/// A load of a result on disk (a large job step's) is streamed, and its
+/// progress still has the result's row count as total, not 0 ("running"
+/// with no end in sight); the rows the step's query read go to its waiter
+/// as they come.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_of_a_result_on_disk_knows_its_total() {
+    #[derive(Default)]
+    struct Seen(parking_lot::Mutex<Vec<(u64, u64)>>);
+    impl crate::load::LoadObserver for Seen {
+        fn event(&self, e: crate::load::LoadEvent) {
+            if let crate::load::LoadEvent::Progress { done, total, .. } = e {
+                self.0.lock().push((done, total));
+            }
+        }
+    }
+    let f = fixture(EnvTag::Dev);
+    let dir = tempfile::tempdir().unwrap();
+    f.engine.results().set_spill_root(dir.path().to_path_buf());
+    f.engine.outputs().set_budget(0); // 16 MB: a job step keeps 4 MB in memory
+    let mut r = req(&f, "with recursive n(i) as (select 1 union all select i + 1 from n where i < 300000) select i, hex(randomblob(40)) as b from n");
+    (r.row_limit, r.confirmed, r.tab_id, r.output_name) = (None, true, "job:j1:n1".into(), Some("big".into()));
+    let read = parking_lot::Mutex::new(vec![]);
+    let hub = crate::EventHub::new(f.sink.clone());
+    let out = f.engine.run_and_watch(&hub, r, None, &|rows, _| read.lock().push(rows)).await.unwrap();
+    let info = out[0].result.clone().expect("a result");
+    assert!(info.on_disk && info.total_rows == 300_000, "{info:?}");
+    let read = read.into_inner();
+    assert!(read.windows(2).all(|w| w[0] <= w[1]) && read.iter().all(|n| *n <= 300_000), "{read:?}");
+
+    let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
+    s.execute(databrain_connector_core::Statement::internal("create table big_copy (i integer, b text)"), Default::default())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let spec = crate::load::LoadSpec { table: "big_copy".into(), create_table: false, ..Default::default() };
+    let seen = Seen::default();
+    let report = f.engine.write_output("big", &f.conn_id, "l", &spec, &Default::default(), &seen).await.unwrap();
+    assert_eq!(report.rows, 300_000);
+    let seen = seen.0.into_inner();
+    assert!(seen.len() > 2 && seen.iter().all(|(_, total)| *total == 300_000), "{:?}", &seen[..seen.len().min(5)]);
+    assert_eq!(seen.last().unwrap().0, 300_000);
 }

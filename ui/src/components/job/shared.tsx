@@ -75,7 +75,7 @@ export function statusText(s: NodeRunSummary | null): string {
   switch (s.status) {
     case "running": {
       const tries = attemptText(s, true);
-      const doing = s.progress ? `${s.progress.phase}: ${formatCount(s.progress.done)} / ${formatCount(s.progress.total)}` : "Running…";
+      const doing = s.progress ? `${s.progress.phase}: ${progressDetail(s.progress)}` : "Running…";
       return tries ? `${doing} (${tries})` : doing;
     }
     case "pending":
@@ -98,9 +98,37 @@ export function statusText(s: NodeRunSummary | null): string {
 export const field = "w-full rounded-md border border-line bg-bg px-2 py-1 text-[12px] focus:border-accent focus:outline-none";
 export const label = "mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted";
 
-/** Rows written so far by a running load step. */
+/** A time estimate, to the second: "45s", "3m 05s", "1h 20m". */
+export function roughTime(ms: number): string {
+  const s = Math.max(1, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+}
+
+/**
+ * How far a running step got: rows out of the total with the rate and the
+ * time left; rows so far and the time taken when the total isn't known
+ * (rows read as the query runs); every row sent while the database still
+ * works on them (a commit, a COPY INTO, a load job).
+ */
+export function progressDetail(p: StepProgress): string {
+  const secs = (p.elapsed_ms ?? 0) / 1000;
+  const rate = secs >= 1 && p.done > 0 ? p.done / secs : 0;
+  const perSec = rate > 0 ? ` · ${formatCount(Math.round(rate))} rows/s` : "";
+  if (p.total <= 0) return `${formatCount(p.done)} rows${perSec}${secs >= 1 ? ` · ${roughTime(secs * 1000)}` : ""}`;
+  if (p.done >= p.total) return `all ${formatCount(p.total)} rows sent, waiting for the database to finish`;
+  const pct = Math.floor((p.done / p.total) * 100);
+  const left = rate > 0 ? ` · about ${roughTime(((p.total - p.done) / rate) * 1000)} left` : "";
+  return `${formatCount(p.done)} / ${formatCount(p.total)} rows · ${pct}%${perSec}${left}`;
+}
+
+/** Rows written (or read) so far by a running step. */
 export function ProgressBar({ p, compact = false }: { p: StepProgress; compact?: boolean }) {
-  const pct = p.total > 0 ? Math.min(100, (p.done / p.total) * 100) : 100;
+  // Unknown total, or every row sent and the database still at work: a
+  // full bar that pulses, not one stuck at 100% as if it were done.
+  const busy = p.total <= 0 || p.done >= p.total;
+  const pct = busy ? 100 : Math.min(100, (p.done / p.total) * 100);
   return (
     <div className={compact ? "" : "space-y-0.5"}>
       <div
@@ -108,17 +136,16 @@ export function ProgressBar({ p, compact = false }: { p: StepProgress; compact?:
         role="progressbar"
         aria-label={p.phase}
         aria-valuemin={0}
-        aria-valuemax={p.total}
-        aria-valuenow={p.done}
+        aria-valuemax={busy ? undefined : p.total}
+        aria-valuenow={busy ? undefined : p.done}
+        aria-valuetext={`${p.phase}: ${progressDetail(p)}`}
       >
-        <div className="h-full rounded-full bg-accent transition-[width] duration-200" style={{ width: `${pct}%` }} />
+        <div className={`h-full rounded-full bg-accent transition-[width] duration-200 ${busy ? "animate-pulse opacity-60" : ""}`} style={{ width: `${pct}%` }} />
       </div>
       {!compact && (
         <div className="flex justify-between text-[11px] text-muted">
-          <span>{p.phase}</span>
-          <span>
-            {formatCount(p.done)} / {formatCount(p.total)} rows · {Math.floor(pct)}%
-          </span>
+          <span className="shrink-0">{p.phase}</span>
+          <span className="min-w-0 truncate pl-2 text-right">{progressDetail(p)}</span>
         </div>
       )}
     </div>
