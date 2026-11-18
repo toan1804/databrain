@@ -4,7 +4,7 @@ import { useEvent } from "../../lib/hooks";
 import { useEffect, useState } from "react";
 import { AlertTriangle, FlaskConical, Info, CheckCircle2, CircleDashed, Loader2, Plus, XCircle } from "lucide-react";
 import { api, toError } from "../../lib/api";
-import type { BatchLimits, Job, JobNode, LoadDryRun, LoadMode, LoadReport, LoadResultArgs, LoadTarget } from "../../lib/types";
+import type { BatchLimits, ConnectionView, Job, JobNode, LoadDryRun, LoadMode, LoadReport, LoadResultArgs, LoadTarget } from "../../lib/types";
 import { copyText } from "../CatalogMenus";
 import { parseKeyColumns, batchValue } from "../../lib/jobGraph";
 import { formatCount } from "../../lib/util";
@@ -12,6 +12,121 @@ import { traitsOf } from "../../lib/sourceTraits";
 import { useStore } from "../../store";
 import { CellEditor } from "../Notebook";
 import { EDITOR_KEY, field, label } from "./shared";
+
+/** A connection setting a database's bulk load depends on. */
+export interface BulkSetting {
+  /** The connection option it is saved as. */
+  option: string;
+  label: string;
+  /** `path`: a text value (empty: off); `toggle`: on or off. */
+  type: "path" | "toggle";
+  placeholder?: string;
+  /** What the setting does, shown under it. */
+  help: string;
+}
+
+/** How a load into a `kind` connection bulk loads, and the connection
+ *  setting it needs, if any (`setting`). */
+export function bulkLoadInfo(kind: string | undefined): { text: string; setting?: BulkSetting } {
+  switch (kind) {
+    case "postgres":
+      return { text: "PostgreSQL gets the rows by COPY (not Redshift), when it writes the same as the INSERTs." };
+    case "clickhouse":
+      return { text: "ClickHouse gets the rows as the body of INSERT … FORMAT TabSeparated, when each column parses as its VALUES literal." };
+    case "duckdb":
+      return { text: "DuckDB gets the rows through its appender (a temporary table, then one INSERT … SELECT), when each column converts as its literal." };
+    case "mssql":
+      return {
+        text: "SQL Server gets the rows by bulk copy (INSERT BULK, firing triggers and checking constraints as INSERTs do), when each column converts as its literal.",
+      };
+    case "oracle":
+      return { text: "Oracle gets the rows as arrays bound to one INSERT (array DML), up to 10,000 rows a round trip." };
+    case "databricks":
+      return {
+        text: "Databricks gets the rows as Parquet files in a staging volume, read by one INSERT … SELECT, when each column casts as its literal.",
+        setting: {
+          option: "staging_volume",
+          label: "Staging volume",
+          type: "path",
+          placeholder: "/Volumes/main/default/staging",
+          help: "A Unity Catalog volume (or a folder in it) the connection's user can read and write (READ VOLUME, WRITE VOLUME); the files are deleted after each load. Empty: INSERTs.",
+        },
+      };
+    case "bigquery":
+      return {
+        text: "BigQuery uploads the rows and makes one load job (all rows or none, no query cost), when each column loads as its literal.",
+        setting: {
+          option: "load_jobs",
+          label: "Load jobs (beta)",
+          type: "toggle",
+          help: "Off by default until tried against live projects. Every load job counts toward the table's daily modification limit.",
+        },
+      };
+    case "snowflake":
+      return {
+        text: "Snowflake gets the rows as arrays bound to one INSERT, as its drivers send executemany.",
+        setting: { option: "array_binds", label: "Array binds (beta)", type: "toggle", help: "Off by default until tried against live accounts." },
+      };
+    case undefined:
+      return { text: "Bulk loads where the target database has one; others get INSERTs." };
+    default:
+      return { text: "This database has no bulk load here: the rows go in INSERTs." };
+  }
+}
+
+const isOn = (v: string | undefined) => ["on", "true", "yes", "1"].includes((v ?? "").trim().toLowerCase());
+
+/** The connection setting a bulk load needs, shown and changed in place:
+ *  saved into the connection, so every load into it uses it. */
+export function BulkSettingField({ target, setting }: { target: ConnectionView; setting: BulkSetting }) {
+  const toast = useStore((s) => s.toast);
+  const saved = target.config.options?.[setting.option] ?? "";
+  const [value, setValue] = useState(setting.type === "toggle" ? (isOn(saved) ? "on" : "off") : saved);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setValue(setting.type === "toggle" ? (isOn(saved) ? "on" : "off") : saved), [target.id, saved, setting.type]);
+  const current = setting.type === "toggle" ? (isOn(saved) ? "on" : "off") : saved;
+  const changed = value.trim() !== current.trim();
+  const save = async () => {
+    setBusy(true);
+    try {
+      const { connected: _connected, ...profile } = target;
+      const options = { ...(profile.config.options ?? {}) };
+      if (value.trim() && !(setting.type === "toggle" && value === "off")) options[setting.option] = value.trim();
+      else delete options[setting.option];
+      await api.saveConnection({ ...profile, config: { ...profile.config, options } }, null);
+      await useStore.getState().refreshConnections();
+      toast(`${setting.label} saved in ${target.name}`, "info");
+    } catch (e) {
+      toast(toError(e).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const id = `bulk-setting-${target.id}`;
+  return (
+    <div className="mt-1.5">
+      <label className={label} htmlFor={id}>
+        {setting.label} (in {target.name}'s settings)
+      </label>
+      <div className="flex items-center gap-1.5">
+        {setting.type === "path" ? (
+          <input id={id} className={`${field} font-mono`} placeholder={setting.placeholder} value={value} onChange={(e) => setValue(e.target.value)} />
+        ) : (
+          <select id={id} className={field} value={value} onChange={(e) => setValue(e.target.value)}>
+            <option value="off">Off: INSERTs</option>
+            <option value="on">On</option>
+          </select>
+        )}
+        <button className="btn-ghost shrink-0 border border-line py-1 text-[12px]" disabled={!changed || busy} onClick={() => void save()}>
+          {busy ? <Loader2 size={12} className="animate-spin" /> : null} Save
+        </button>
+      </div>
+      <div className="mt-0.5 text-[11px] text-muted">
+        {setting.help} Saved in the connection: every load into {target.name} uses it, and its open sessions reconnect.
+      </div>
+    </div>
+  );
+}
 
 /** Rows and KB per INSERT, within what the target connection allows. */
 function BatchFields({ node, kind, onChange }: { node: JobNode; kind?: string; onChange: (patch: Partial<JobNode>) => void }) {
@@ -149,6 +264,7 @@ export function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; o
   const connections = useStore((s) => s.connections);
   const target = connections.find((c) => c.id === node.target_connection_id);
   const modes = loadModesFor(target?.config.kind, node.load_mode);
+  const bulk = bulkLoadInfo(target?.config.kind);
   const mode = modes.find((m) => m.mode === node.load_mode) ?? LOAD_MODES[0];
   const keyed = isKeyedMode(node.load_mode);
   const [keys, setKeys] = useState((node.key_columns ?? []).join(", "));
@@ -261,9 +377,8 @@ export function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; o
           <input type="checkbox" checked={!node.load_insert_only} onChange={(e) => onChange({ load_insert_only: !e.target.checked })} />
           Bulk load when the database supports it
         </label>
-        <div className="mt-0.5 text-[11px] text-muted">
-          PostgreSQL gets the rows by COPY when it writes the same as the INSERTs. Off: always INSERTs.
-        </div>
+        <div className="mt-0.5 text-[11px] text-muted">{bulk.text} Off: always INSERTs.</div>
+        {target && bulk.setting && !node.load_insert_only && <BulkSettingField target={target} setting={bulk.setting} />}
       </div>
       <BatchFields node={node} kind={target?.config.kind} onChange={onChange} />
       <div className="flex flex-wrap gap-1.5">

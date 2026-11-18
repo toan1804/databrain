@@ -15,6 +15,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Job load steps say how the target database bulk loads (COPY, bulk copy, the appender, TabSeparated, array binds, staged files, load jobs) instead of always PostgreSQL's COPY, and show the connection setting a bulk load needs (Databricks' staging volume, BigQuery load jobs, Snowflake array binds) with its current value, to set or change it there; it is saved in the connection.
 - DuckDB: binary values loaded by INSERTs (job loads, "Load into…", test data) or saved from a grid edit were written as the text of their hex (`X'00ff'` is text in DuckDB): they are now the bytes (`from_hex('00ff')`).
 
 ## 0.4.4 - 2026-11-18
