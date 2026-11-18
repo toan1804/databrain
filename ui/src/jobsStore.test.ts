@@ -84,19 +84,15 @@ describe("jobs store", () => {
 });
 
 describe("scheduled runs", () => {
-  it("announces a scheduled run once, and not manual or finished ones", async () => {
-    const { announceScheduled } = await import("./jobsStore");
-    const toasts: string[] = [];
-    const orig = useStore.getState().toast;
-    useStore.setState({ toast: (m: string) => void toasts.push(m) });
+  it("toast a failure only when the jobs tray has no card for it (never seen running here)", async () => {
+    const { failureToast } = await import("./jobsStore");
     const jobs = [{ id: "j1", name: "Nightly", node_count: 1, step_names: [], schedule: { enabled: true, mode: "interval" as const, minutes: 60, at: "08:00", weekdays: [] }, updated_at: 0 }];
-    const run = { id: 7, job_id: "j1", trigger: "schedule" as const, started_at: 0, status: "running" as const, nodes: [] };
-    announceScheduled(jobs, run);
-    announceScheduled(jobs, { ...run, nodes: [] });
-    announceScheduled(jobs, { ...run, id: 8, trigger: "manual" });
-    announceScheduled(jobs, { ...run, id: 9, status: "success" });
-    expect(toasts).toEqual(['Starting scheduled job "Nightly"…']);
-    useStore.setState({ toast: orig });
+    const run = { id: 7, job_id: "j1", trigger: "schedule" as const, started_at: 0, status: "error" as const, nodes: [], error: "can't connect" };
+    expect(failureToast(jobs, run, false)).toBe('Scheduled job "Nightly" failed: can\'t connect');
+    expect(failureToast(jobs, { ...run, trigger: "after:Load" }, false)).toBe('"Nightly" (run after "Load" succeeded) failed: can\'t connect');
+    expect(failureToast(jobs, run, true)).toBeNull();
+    expect(failureToast(jobs, { ...run, trigger: "manual" }, false)).toBeNull();
+    expect(failureToast(jobs, { ...run, status: "success" }, false)).toBeNull();
   });
 });
 

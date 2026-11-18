@@ -1,7 +1,7 @@
 // Pieces the job editor's parts share: status icon and text, progress bar,
 // step lists, field styles.
 import { FileDown, ArrowDownToLine, CheckCircle2, CircleDashed, Database, Hourglass, Loader2, XCircle } from "lucide-react";
-import type { JobNode, NodeRunSummary, StepProgress } from "../../lib/types";
+import type { JobNode, JobRun, NodeRunSummary, StepProgress } from "../../lib/types";
 import { formatCount, formatDuration, relativeTime } from "../../lib/util";
 import { useLayoutEffect, useRef } from "react";
 import { useStore } from "../../store";
@@ -97,6 +97,33 @@ export function statusText(s: NodeRunSummary | null): string {
 
 export const field = "w-full rounded-md border border-line bg-bg px-2 py-1 text-[12px] focus:border-accent focus:outline-none";
 export const label = "mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted";
+
+/**
+ * What a run is doing, in one line: its running step and how far it got
+ * (or how many run at once), or how it ended.
+ */
+export function runLine(run: JobRun, now: number): string {
+  const total = run.nodes.length;
+  const done = run.nodes.filter((n) => n.status === "success").length;
+  const took = formatDuration(Math.max(0, (run.finished_at ?? now) - run.started_at));
+  switch (run.status) {
+    case "running": {
+      const active = run.nodes.filter((n) => n.status === "running");
+      const steps = total > 1 ? `${done} of ${total} steps done · ` : "";
+      if (active.length === 1) return `${steps}${active[0].name}: ${statusText(active[0])} · ${took}`;
+      if (active.length > 1) return `${steps}${active.length} steps running · ${took}`;
+      return `${steps}${took}`;
+    }
+    case "success":
+      return `Finished in ${took} · ${total} step${total === 1 ? "" : "s"}`;
+    case "cancelled":
+      return `Stopped after ${took}`;
+    default: {
+      const failed = run.nodes.find((n) => n.status === "error");
+      return failed ? `Failed at ${failed.name}: ${failed.error ?? "see its runs"}` : `Failed: ${run.error ?? "see its runs"}`;
+    }
+  }
+}
 
 /** A time estimate, to the second: "45s", "3m 05s", "1h 20m". */
 export function roughTime(ms: number): string {

@@ -5,6 +5,7 @@ import type { RunParams, Job, JobRun, JobSummary, RunLogEntry } from "./lib/type
 import { useStore } from "./store";
 import { uid } from "./lib/util";
 import { cellStepBase, stepsFromCells, uniqueName, type CellSource } from "./lib/jobGraph";
+import { runLine } from "./components/job/shared";
 
 /**
  * A step name no other job's step or named output uses (`step`, `step_2`…).
@@ -32,6 +33,8 @@ interface JobsState {
   elsewhere: Record<string, boolean>;
   /** Log lines of runs seen live in this session, by run id. */
   logs: Record<number, RunLogEntry[]>;
+  /** Runs seen running in this window (the jobs tray follows them; their end is told). */
+  seen: Record<number, true>;
   refresh: () => Promise<void>;
   init: () => Promise<void>;
   open: (id: string, name: string) => void;
@@ -49,16 +52,41 @@ interface JobsState {
 }
 
 let started = false;
-/** Scheduled runs already announced ("Starting job …"). */
-const announced = new Set<number>();
 /** Finished runs whose notices were shown. */
 const noticed = new Set<number>();
+/** Finished runs whose end was told on the desktop. */
+const told = new Set<number>();
 
-export function announceScheduled(jobs: JobSummary[], run: JobRun) {
-  if (run.trigger !== "schedule" || run.status !== "running" || announced.has(run.id)) return;
-  announced.add(run.id);
-  const name = jobs.find((j) => j.id === run.job_id)?.name ?? "a scheduled job";
-  useStore.getState().toast(`Starting scheduled job "${name}"…`, "info");
+/** Notification text past this is cut (a server's error can be pages long). */
+export const NOTIFY_MAX = 200;
+
+/**
+ * Tell on the desktop that a run ended, when the window isn't focused (the
+ * user went to another app during a long run). The jobs tray says it in the
+ * window.
+ */
+export function notifyIfAway(jobs: JobSummary[], run: JobRun, focused: boolean) {
+  if (focused) return;
+  const name = jobs.find((j) => j.id === run.job_id)?.name ?? "A job";
+  const how = run.status === "success" ? "finished" : run.status === "cancelled" ? "stopped" : "failed";
+  const line = runLine(run, Date.now());
+  // By code points: a cut through an emoji's surrogate pair would be text
+  // the app refuses (the notification lost without a sign).
+  const chars = Array.from(line);
+  const body = chars.length > NOTIFY_MAX ? `${chars.slice(0, NOTIFY_MAX - 1).join("")}…` : line;
+  void api.notifyJobRun(`Job "${name}" ${how}`, body, run.status === "error").catch(() => {});
+}
+
+/**
+ * The toast for a failed scheduled or "run after" run, when the jobs tray
+ * has no card for it (it never was seen running here). A run seen running
+ * has its card (or its tab shown), which says it already.
+ */
+export function failureToast(jobs: JobSummary[], run: JobRun, seen: boolean): string | null {
+  if (seen || run.status !== "error" || !(run.trigger === "schedule" || run.trigger.startsWith("after:"))) return null;
+  const name = jobs.find((j) => j.id === run.job_id)?.name ?? "A job";
+  const what = run.trigger === "schedule" ? `Scheduled job "${name}" failed` : `"${name}" (run after "${run.trigger.slice(6)}" succeeded) failed`;
+  return `${what}: ${run.error ?? "see its runs"}`;
 }
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -91,6 +119,7 @@ export const useJobs = create<JobsState>((set, get) => ({
   running: {},
   elsewhere: {},
   logs: {},
+  seen: {},
   refresh: async () => {
     if (!isTauri()) return;
     const { jobs, running, elsewhere } = await api.listJobs();
@@ -126,25 +155,7 @@ export const useJobs = create<JobsState>((set, get) => ({
         return logs === s.logs ? {} : { logs };
       }),
     );
-    await onJobRun(({ job_id, run }) => {
-      set((s) => ({ runs: { ...s.runs, [job_id]: run }, running: { ...s.running, [job_id]: run.status === "running" } }));
-      announceScheduled(get().jobs, run);
-      if (run.status !== "running") {
-        // Tell what a step did that the user didn't set up by hand (a created table).
-        if (!noticed.has(run.id)) {
-          noticed.add(run.id);
-          for (const n of run.nodes) for (const msg of n.notices ?? []) if (msg.startsWith("Created table")) useStore.getState().toast(`${n.name}: ${msg}`, "info");
-        }
-        // Next run time and last status in the list.
-        clearTimeout(refreshTimer);
-        refreshTimer = setTimeout(() => void get().refresh().catch(() => {}), 200);
-        if ((run.trigger === "schedule" || run.trigger.startsWith("after:")) && run.status === "error") {
-          const name = get().jobs.find((j) => j.id === job_id)?.name ?? "A job";
-          const what = run.trigger === "schedule" ? `Scheduled job "${name}" failed` : `"${name}" (run after "${run.trigger.slice(6)}" succeeded) failed`;
-          useStore.getState().toast(`${what}: ${run.error ?? "see its runs"}`, "error");
-        }
-      }
-    });
+    await onJobRun(runEvent);
     // Runs of the background runner (another process) send no events: look
     // again now and then. Set up before the first look, which may fail (and
     // is then tried again by these).
@@ -153,8 +164,16 @@ export const useJobs = create<JobsState>((set, get) => ({
       window.addEventListener("focus", () => void get().refresh().catch(() => {}));
     }
     await get().refresh();
-    // Scheduled runs started at launch, before this listener existed.
-    for (const j of get().jobs) if (j.last_run && get().running[j.id]) announceScheduled(get().jobs, j.last_run);
+    // Runs started at launch (a scheduled one), before this listener
+    // existed: the jobs tray follows them too.
+    set((s) => {
+      const started = get().jobs.flatMap((j) => (j.last_run?.status === "running" && s.running[j.id] && !s.runs[j.id] ? [j.last_run] : []));
+      if (!started.length) return {};
+      return {
+        runs: { ...s.runs, ...Object.fromEntries(started.map((r) => [r.job_id, r])) },
+        seen: { ...s.seen, ...Object.fromEntries(started.map((r) => [r.id, true as const])) },
+      };
+    });
   },
   open: (id, name) => {
     const st = useStore.getState();
@@ -286,3 +305,33 @@ export const useJobs = create<JobsState>((set, get) => ({
     }
   },
 }));
+
+/**
+ * A "job-run" event: the run's latest state. Keeps the runs seen running
+ * (the jobs tray follows them), tells on the desktop when one ends while
+ * the window isn't focused, and toasts what has no card.
+ */
+export function runEvent({ job_id, run }: { job_id: string; run: JobRun }) {
+  useJobs.setState((s) => ({
+    runs: { ...s.runs, [job_id]: run },
+    running: { ...s.running, [job_id]: run.status === "running" },
+    ...(run.status === "running" && !s.seen[run.id] ? { seen: { ...s.seen, [run.id]: true as const } } : {}),
+  }));
+  const seen = !!useJobs.getState().seen[run.id];
+  if (run.status !== "running" && seen && !told.has(run.id)) {
+    told.add(run.id);
+    notifyIfAway(useJobs.getState().jobs, run, typeof document === "undefined" || document.hasFocus());
+  }
+  if (run.status !== "running") {
+    // Tell what a step did that the user didn't set up by hand (a created table).
+    if (!noticed.has(run.id)) {
+      noticed.add(run.id);
+      for (const n of run.nodes) for (const msg of n.notices ?? []) if (msg.startsWith("Created table")) useStore.getState().toast(`${n.name}: ${msg}`, "info");
+    }
+    // Next run time and last status in the list.
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => void useJobs.getState().refresh().catch(() => {}), 200);
+    const failed = failureToast(useJobs.getState().jobs, run, seen);
+    if (failed) useStore.getState().toast(failed, "error");
+  }
+}

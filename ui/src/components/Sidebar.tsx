@@ -34,7 +34,9 @@ function ActivityRail() {
   const aiOpen = useAi((s) => s.open);
   const setAiOpen = useAi((s) => s.setOpen);
   const scheduled = useJobs((s) => s.jobs.filter((j) => j.schedule.enabled).length);
-  const item = (p: SidebarPanel, icon: ReactNode, label: string, dot = false) => (
+  // Run by the app, or by the background runner (another process).
+  const runningJobs = useJobs((s) => new Set([...Object.values(s.runs).filter((r) => r.status === "running").map((r) => r.job_id), ...Object.keys(s.elsewhere).filter((id) => s.elsewhere[id])]).size);
+  const item = (p: SidebarPanel, icon: ReactNode, label: string, dot = false, dotClass = "bg-danger") => (
     <button
       key={p}
       title={label}
@@ -47,7 +49,7 @@ function ActivityRail() {
     >
       {panel === p && <span className="absolute left-[-6px] h-5 w-[3px] rounded-r bg-accent" />}
       {icon}
-      {dot && <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-danger ring-2 ring-bg" aria-hidden />}
+      {dot && <span className={`absolute right-2 top-2 h-2 w-2 rounded-full ring-2 ring-bg ${dotClass}`} aria-hidden />}
     </button>
   );
   return (
@@ -55,7 +57,14 @@ function ActivityRail() {
       {item("connections", <Database size={18} />, "Connections")}
       {item("saved", <Bookmark size={18} />, "Saved queries")}
       {item("notebooks", <NotebookPen size={18} />, "Notebooks")}
-      {item("jobs", <Workflow size={18} />, scheduled ? `Jobs · ${scheduled} scheduled` : "Jobs", scheduled > 0)}
+      {item(
+        "jobs",
+        <Workflow size={18} />,
+        ["Jobs", runningJobs ? `${runningJobs} running` : "", scheduled ? `${scheduled} scheduled` : ""].filter(Boolean).join(" · "),
+        runningJobs > 0 || scheduled > 0,
+        // Running: the accent, pulsing; else the scheduled jobs' dot.
+        runningJobs > 0 ? "animate-pulse bg-accent" : "bg-danger",
+      )}
       {item("outputs", <Layers size={18} />, "Outputs")}
       {item("history", <History size={18} />, "History")}
       <div className="flex-1" />

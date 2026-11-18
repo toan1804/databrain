@@ -360,6 +360,8 @@ export const api = {
   /** Run again the steps that did not succeed last time, and what follows them. */
   resumeJob: (id: string) => call<JobRun>("resume_job", { id }),
   cancelJob: (id: string) => call<boolean>("cancel_job", { id }),
+  /** A desktop notification that a run ended (sent while the window isn't focused). */
+  notifyJobRun: (title: string, body: string, failed: boolean) => call<void>("notify_job_run", { title, body, failed }),
   cancelJobStep: (id: string, nodeId: string) => call<boolean>("cancel_job_step", { id, nodeId }),
   /** Check a load step of `job` (as edited) without keeping any change. */
   dryRunJobStep: (job: Job, nodeId: string) => call<LoadDryRun>("dry_run_job_step", { job, nodeId }),

@@ -4,6 +4,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **Running jobs are no longer silent outside their tab:** while a job runs and its tab isn't the one shown (you went to an editor), a card at the bottom right shows its running step, how far it got (rows, rate, time left) and the time so far, with Open and Stop; when the run ends the card says it finished, failed (at which step, and why) or was stopped. A finished card goes after 15 s; a failed or stopped one stays until dismissed. It replaces the "Starting scheduled job…" and "Scheduled job … failed" toasts (still shown for a failed run the window didn't see run). The Jobs icon in the sidebar has a pulsing dot while a job runs, in the app or the background runner ("Jobs · 2 running"). When a run ends while DataBrain isn't the focused window, a desktop notification says so.
+- Desktop notifications (the background runner's, and now the app's) pass their text to the OS as arguments or environment variables, never inside a script: a database error with a curly quote could end PowerShell's string and run what followed.
+
 ### Changed
 
 - **BigQuery load jobs (beta, off by default):** with "Load jobs for loads" on in a BigQuery connection's settings, job loads, "Load into…" and "Generate and load" upload the rows as newline-delimited JSON and make one load job (all rows or none, no query cost) instead of an INSERT job per 10,000 rows. Each value is the text its INSERT literal holds, and only columns that BigQuery reads the same way go like this (a decimal of more than 9 places into NUMERIC, a timestamp with nanoseconds, repeated and record columns, … get INSERTs, and the run log says why). Each job counts toward the table's daily modification limit.
