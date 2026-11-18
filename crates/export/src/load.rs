@@ -1581,8 +1581,6 @@ mod tests {
         assert!(st.next(&batch, 3, 1).unwrap().is_none());
     }
 
-    /// Which columns a Databricks bulk load takes (the cast gives what the
-    /// INSERT literal would), and which go by INSERTs.
     /// BigQuery load jobs: each value the INSERT literal's text, as JSON
     /// (numbers bare into INT64/FLOAT64, strings otherwise), NaN/±inf null,
     /// binary base64, keyed by the table's own column names.
@@ -1666,6 +1664,8 @@ mod tests {
         }
     }
 
+    /// Which columns a Databricks bulk load takes (the cast gives what the
+    /// INSERT literal would), and which go by INSERTs.
     #[test]
     fn dbx_fits_per_type() {
         let f = |t: DataType| Field::new("c", t, true);

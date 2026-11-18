@@ -730,10 +730,15 @@ const UPLOAD_CHUNK: usize = 32 * 256 * 1024;
 
 impl Inner {
     /// `(project, dataset, table)` of a load's table: `project.dataset.table`,
-    /// `dataset.table` (this project) or `table` (the default dataset).
+    /// `dataset.table` (this project) or `table` (the default dataset). A
+    /// domain-scoped project (`example.com:project`) has a dot of its own.
     fn table_ref(&self, table: &str) -> Result<(String, String, String)> {
         let plain = table.replace('`', "");
-        let parts: Vec<&str> = plain.split('.').collect();
+        let mut parts: Vec<&str> = plain.rsplitn(3, '.').collect();
+        parts.reverse();
+        if parts.len() == 3 && parts[0].contains('.') && !parts[0].contains(':') {
+            return Err(ConnectorError::query(format!("not a BigQuery table: {}", crate::common::truncate(table, 120))));
+        }
         let name = |n: &str| !n.is_empty() && !n.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\\' | '/' | '?' | '#' | '\'' | '"' | ';'));
         let r = match parts.as_slice() {
             [p, d, t] => (p.to_string(), d.to_string(), t.to_string()),
@@ -838,18 +843,42 @@ impl LoadWriter {
         let url = self.upload.clone().expect("started");
         let total = if last { (self.sent + len as u64).to_string() } else { "*".into() };
         let range = if len == 0 { format!("bytes */{total}") } else { format!("bytes {}-{}/{total}", self.sent, self.sent + len as u64 - 1) };
-        let resp = self.inner.http.put(&url).header("Content-Range", range).body(self.buf[..len].to_vec()).send().await.map_err(net_err)?;
+        let resp = self
+            .inner
+            .http
+            .put(&url)
+            .bearer_auth(self.inner.token().await?)
+            .header("Content-Range", range)
+            .body(self.buf[..len].to_vec())
+            .send()
+            .await
+            .map_err(net_err)?;
         Self::uploaded(resp).await
     }
 
     /// How far the upload got (after a failed request).
     async fn status(&self) -> Result<Uploaded> {
         let url = self.upload.clone().expect("started");
-        let resp = self.inner.http.put(&url).header("Content-Range", "bytes */*").body(Vec::new()).send().await.map_err(net_err)?;
+        let resp = self
+            .inner
+            .http
+            .put(&url)
+            .bearer_auth(self.inner.token().await?)
+            .header("Content-Range", "bytes */*")
+            .body(Vec::new())
+            .send()
+            .await
+            .map_err(net_err)?;
         Self::uploaded(resp).await
     }
 
+    /// A 308 (more wanted), the job, or an error; 429 (too many requests)
+    /// is a `Connection` error, retried as a 5xx is.
     async fn uploaded(resp: reqwest::Response) -> Result<Uploaded> {
+        if resp.status().as_u16() == 429 {
+            let e = json_body(resp, "BigQuery load").await.err().unwrap_or_else(|| ConnectorError::query("BigQuery load (429)"));
+            return Err(ConnectorError::new(databrain_connector_core::ErrorKind::Connection, e.message));
+        }
         if resp.status().as_u16() == 308 {
             // `Range: bytes=0-N`: N + 1 bytes received; none without it.
             let got = resp
@@ -924,20 +953,23 @@ impl LoadWriter {
                 }
                 return Ok(job.pointer("/statistics/load/outputRows").and_then(|n| n.as_str()).and_then(|n| n.parse().ok()));
             }
-            tokio::select! {
-                _ = backoff.wait() => {}
-                _ = self.cancel.cancelled() => {
-                    i.cancel_job(&r).await;
-                    return Err(ConnectorError::cancelled());
-                }
-            }
             let mut url = format!("{}/projects/{}/jobs/{}", i.api, i.project, r.id);
             let loc = r.loc_param();
             if !loc.is_empty() {
                 url.push('?');
                 url.push_str(&loc);
             }
-            job = i.call(reqwest::Method::GET, url, None).await?;
+            // Stop also ends a poll in flight.
+            tokio::select! {
+                got = async {
+                    backoff.wait().await;
+                    i.call(reqwest::Method::GET, url, None).await
+                } => job = got?,
+                _ = self.cancel.cancelled() => {
+                    i.cancel_job(&r).await;
+                    return Err(ConnectorError::cancelled());
+                }
+            }
         }
     }
 }
@@ -1084,15 +1116,27 @@ mod tests {
     }
 
     /// A scripted upload server: the first non-final chunk is kept only in
-    /// part (`partial`), one request is dropped (`drop_put`), and the job
-    /// ends as `outcome` (its status once polled).
-    async fn load_server(partial: bool, drop_put: Option<usize>, outcome: &'static str) -> (String, crate::mock_http::FullLog, Arc<std::sync::Mutex<Vec<u8>>>) {
+    /// part (`partial`), one request is answered with a status (`drop_put`:
+    /// its index and status, 0 dropping the connection), and the job ends
+    /// as `outcome` (its status once polled; `None`: the poll hangs).
+    async fn load_server(
+        partial: bool,
+        drop_put: Option<(usize, u16)>,
+        outcome: Option<&'static str>,
+    ) -> (String, crate::mock_http::FullLog, Arc<std::sync::Mutex<Vec<u8>>>) {
         let got: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
         let origin: Arc<std::sync::Mutex<String>> = Arc::default();
         let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (g, o) = (got.clone(), origin.clone());
         let (url, _, log) = crate::mock_http::serve_full(move |m, p, h, b| {
             let range = h.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-range:").map(|v| v.trim().to_string())).unwrap_or_default();
+            // Before taking the lock: a hanging poll mustn't hold up the cancel.
+            if m == "GET" && p == "/projects/p1/jobs/j9?location=EU" {
+                match outcome {
+                    Some(o) => return (200, vec![], o.to_string()),
+                    None => tokio::task::block_in_place(|| std::thread::sleep(std::time::Duration::from_secs(4))),
+                }
+            }
             let mut got = g.lock().unwrap();
             let received = |n: usize| if n == 0 { vec![] } else { vec![("Range".to_string(), format!("bytes=0-{}", n - 1))] };
             if m == "POST" && p == "/upload/projects/p1/jobs?uploadType=resumable" {
@@ -1103,8 +1147,10 @@ mod tests {
                     return (308, received(got.len()), String::new());
                 }
                 let k = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if drop_put == Some(k) {
-                    return (0, vec![], String::new());
+                if let Some((at, status)) = drop_put
+                    && at == k
+                {
+                    return (status, vec![], json!({"error": {"message": "Too many requests"}}).to_string());
                 }
                 let spec = range.trim_start_matches("bytes ");
                 let (span, total) = spec.split_once('/').unwrap();
@@ -1125,9 +1171,6 @@ mod tests {
                     );
                 }
                 return (308, received(got.len()), String::new());
-            }
-            if m == "GET" && p == "/projects/p1/jobs/j9?location=EU" {
-                return (200, vec![], outcome.to_string());
             }
             (404, vec![], "{}".into())
         })
@@ -1155,7 +1198,7 @@ mod tests {
     /// it runs, and its row count is the load's.
     #[tokio::test]
     async fn a_load_job_uploads_its_rows_then_waits_for_the_job() {
-        let (url, log, got) = load_server(true, None, DONE_3).await;
+        let (url, log, got) = load_server(true, None, Some(DONE_3)).await;
         let rows = ["{\"a\":1}\n", "{\"a\":2}\n", "{\"a\":3}\n"];
         assert_eq!(load(load_inner(&url), &rows, 8).await.unwrap(), Some(3));
         assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), rows.concat());
@@ -1169,17 +1212,41 @@ mod tests {
         );
         assert!(start["jobReference"]["jobId"].as_str().unwrap().starts_with("databrain_load_"));
         assert!(log.iter().any(|(m, p, _, _)| m == "GET" && p == "/projects/p1/jobs/j9?location=EU"));
+        // Every upload request carries the token, not only the first.
+        for (m, _, h, _) in log.iter().filter(|(m, ..)| m == "PUT") {
+            assert!(h.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer tok")), "{m}: {h}");
+        }
     }
 
-    /// A dropped upload request: the writer asks where the upload is and
-    /// goes on from there.
+    /// Stop while the job's status is being asked for ends the load at once
+    /// (the poll in flight isn't waited for).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_ends_a_poll_in_flight() {
+        use databrain_connector_core::BulkWriter;
+        let (url, _, _) = load_server(false, None, None).await;
+        let inner = Arc::new(load_inner(&url));
+        let dest = inner.table_ref("ds.t").unwrap();
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let mut w = Box::new(LoadWriter::new(inner, dest, cancel.clone()));
+        w.write(b"{\"a\":1}\n".to_vec()).await.unwrap();
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            cancel.cancel();
+        });
+        let e = tokio::time::timeout(std::time::Duration::from_secs(3), w.finish()).await.expect("stopped, not waiting for the poll").unwrap_err();
+        assert!(e.is_cancelled(), "{e:?}");
+        stop.await.unwrap();
+    }
+
+    /// A dropped upload request, or one answered 429 or 5xx: the writer asks
+    /// where the upload is and goes on from there.
     #[tokio::test]
     async fn a_dropped_upload_request_resumes() {
-        for drop in [0, 2] {
-            let (url, _, got) = load_server(false, Some(drop), DONE_3).await;
+        for drop in [(0, 0), (2, 0), (1, 429), (0, 503)] {
+            let (url, _, got) = load_server(false, Some(drop), Some(DONE_3)).await;
             let rows = ["{\"a\":1}\n", "{\"a\":2}\n", "{\"a\":3}\n"];
-            assert_eq!(load(load_inner(&url), &rows, 8).await.unwrap(), Some(3), "drop {drop}");
-            assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), rows.concat(), "drop {drop}");
+            assert_eq!(load(load_inner(&url), &rows, 8).await.unwrap(), Some(3), "drop {drop:?}");
+            assert_eq!(String::from_utf8(got.lock().unwrap().clone()).unwrap(), rows.concat(), "drop {drop:?}");
         }
     }
 
@@ -1187,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_load_job_says_why() {
         let failed = r#"{"status": {"state": "DONE", "errorResult": {"message": "Error while reading data"}, "errors": [{"message": "Error while reading data"}, {"message": "Could not parse 'x' as INT64 for field a"}]}}"#;
-        let (url, _, _) = load_server(false, None, failed).await;
+        let (url, _, _) = load_server(false, None, Some(failed)).await;
         let e = load(load_inner(&url), &["{\"a\":\"x\"}\n"], 8).await.unwrap_err();
         assert!(e.message.contains("Error while reading data (Could not parse 'x' as INT64 for field a)"), "{}", e.message);
     }
@@ -1195,7 +1262,7 @@ mod tests {
     /// No rows: no upload and no job.
     #[tokio::test]
     async fn an_empty_load_makes_no_job() {
-        let (url, log, _) = load_server(false, None, DONE_3).await;
+        let (url, log, _) = load_server(false, None, Some(DONE_3)).await;
         assert_eq!(load(load_inner(&url), &[], 8).await.unwrap(), Some(0));
         assert!(log.lock().unwrap().is_empty());
     }
@@ -1207,6 +1274,8 @@ mod tests {
         assert_eq!(i.table_ref("d.t").unwrap(), ("p1".into(), "d".into(), "t".into()));
         assert_eq!(i.table_ref("t").unwrap(), ("p1".into(), "ds".into(), "t".into()));
         assert!(i.table_ref("a.b.c.d").is_err());
+        // A domain-scoped project has a dot of its own.
+        assert_eq!(i.table_ref("`example.com:p3.d.t`").unwrap(), ("example.com:p3".into(), "d".into(), "t".into()));
         assert!(i.table_ref("d.t?x").is_err());
         assert_eq!(i.upload_api(), "http://x/upload");
         assert_eq!(Inner { api: API.into(), ..load_inner("") }.upload_api(), "https://bigquery.googleapis.com/upload/bigquery/v2");
