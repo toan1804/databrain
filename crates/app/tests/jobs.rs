@@ -544,7 +544,9 @@ async fn snowflake_array_loads_write_what_inserts_do() {
 /// its rows as TabSeparated, and the table ends up exactly as with VALUES
 /// INSERTs: the same rows of every kind loaded both ways and compared, into
 /// tables the load creates and into existing ones with other column types
-/// (Nullable, LowCardinality, Decimal, DateTime).
+/// (Nullable, LowCardinality, Decimal, DateTime). A table whose columns the
+/// text would be refused by (decimals into an integer, signed integers into
+/// an unsigned one, which VALUES truncates and wraps) goes by INSERTs.
 #[ignore = "live: needs DATABRAIN_CLICKHOUSE_HOST (cargo test -- --ignored)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn clickhouse_tsv_loads_write_what_inserts_do() {
@@ -593,11 +595,13 @@ async fn clickhouse_tsv_loads_write_what_inserts_do() {
                    from range(250000) t(i)";
         let existing = "(id Int64, name LowCardinality(Nullable(String)), ok Nullable(Bool), f Nullable(Float64), amount Nullable(Decimal(18, 3)), \
                         d Nullable(Date), ts Nullable(DateTime64(6)), tz Nullable(DateTime64(3, 'UTC')), b Nullable(String)) ENGINE = MergeTree ORDER BY id";
-        for (pre, label) in [(false, "created"), (true, "existing")] {
+        let refused = "(id UInt32, name Nullable(String), ok Nullable(Bool), f Nullable(Float64), amount Nullable(Int64), \
+                       d Nullable(Date), ts Nullable(DateTime64(6)), tz Nullable(DateTime64(3, 'UTC')), b Nullable(String)) ENGINE = MergeTree ORDER BY id";
+        for (pre, label) in [(None, "created"), (Some(existing), "existing"), (Some(refused), "refused")] {
             for (table, insert_only) in [("dbr_ch_tsv", false), ("dbr_ch_ins", true)] {
                 rows(&st, &id, &format!("DROP TABLE IF EXISTS {table}; SELECT 1")).await;
-                if pre {
-                    rows(&st, &id, &format!("CREATE TABLE {table} {existing}; SELECT 1")).await;
+                if let Some(cols) = pre {
+                    rows(&st, &id, &format!("CREATE TABLE {table} {cols}; SELECT 1")).await;
                 }
                 let job = load_job(&st, &id, table, src, |n| {
                     n.load_mode = LoadMode::Append;
@@ -607,12 +611,10 @@ async fn clickhouse_tsv_loads_write_what_inserts_do() {
                 assert_eq!(run.status, "success", "{label} {table}: {run:?}");
                 assert_eq!(step(&run, "loaded").rows, Some(250_000), "{label} {table}");
                 let log = api::job_run_log(&st, &job.id, run.id).unwrap();
-                assert_eq!(
-                    log.iter().any(|l| l.message.contains("TabSeparated, up to")),
-                    !insert_only,
-                    "{label} {table}: {:#?}",
-                    log.iter().map(|l| &l.message).collect::<Vec<_>>()
-                );
+                let messages = log.iter().map(|l| &l.message).collect::<Vec<_>>();
+                let fell_back = label == "refused" && !insert_only;
+                assert_eq!(messages.iter().any(|m| m.contains("TabSeparated, up to")), !insert_only && !fell_back, "{label} {table}: {messages:#?}");
+                assert_eq!(messages.iter().any(|m| m.contains("INSERTs, not TabSeparated (id ")), fell_back, "{label} {table}: {messages:#?}");
             }
             let (a, i) = ("SELECT * FROM dbr_ch_tsv", "SELECT * FROM dbr_ch_ins");
             let differ = rows(&st, &id, &format!("SELECT count() FROM (({a} EXCEPT {i}) UNION ALL ({i} EXCEPT {a}))")).await;

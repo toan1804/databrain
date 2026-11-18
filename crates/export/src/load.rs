@@ -1068,9 +1068,10 @@ impl ChTsv {
         }
     }
 
-    /// Data for rows `start..` of `batch`, up to about `max_bytes` (at least
-    /// one row): the bytes and how many rows they hold. `None` past the end.
-    pub fn next(&self, batch: &RecordBatch, start: usize, max_bytes: usize) -> Result<Option<(Vec<u8>, usize)>> {
+    /// Data for rows `start..` of `batch`, up to `max_rows` rows and about
+    /// `max_bytes` (at least one row): the bytes and how many rows they
+    /// hold. `None` past the end.
+    pub fn next(&self, batch: &RecordBatch, start: usize, max_rows: usize, max_bytes: usize) -> Result<Option<(Vec<u8>, usize)>> {
         if start >= batch.num_rows() {
             return Ok(None);
         }
@@ -1080,7 +1081,7 @@ impl ChTsv {
         let mut out = Vec::new();
         let mut n = 0;
         for r in start..batch.num_rows() {
-            if n > 0 && out.len() >= max_bytes {
+            if n > 0 && (n >= max_rows || out.len() >= max_bytes) {
                 break;
             }
             for (i, ((a, f), k)) in batch.columns().iter().zip(&fmts).zip(&self.kinds).enumerate() {
@@ -1138,7 +1139,9 @@ fn ch_tsv_value(out: &mut Vec<u8>, cell: Option<&str>, kind: Lit) {
 /// text and reading the literal agree: text into strings, numbers into
 /// numbers, booleans into Bool (a literal `true` goes into a `UInt8`, the
 /// text doesn't), binary into strings, dates and times into dates and
-/// times.
+/// times. Into an integer column only integers (the literal `2.5` is
+/// truncated, the text refused), and into an unsigned one only unsigned
+/// integers (the literal `-1` wraps, the text is refused).
 pub fn ch_fits(f: &Field, target: &str) -> std::result::Result<(), String> {
     let mut t = target.trim();
     loop {
@@ -1149,11 +1152,14 @@ pub fn ch_fits(f: &Field, target: &str) -> std::result::Result<(), String> {
         }
     }
     let base = t.split('(').next().unwrap_or_default();
-    let number = |b: &str| b.starts_with("Int") || b.starts_with("UInt") || b.starts_with("Float") || b.starts_with("Decimal");
+    let exact_or_float = base.starts_with("Float") || base.starts_with("Decimal");
+    let dt = f.data_type();
     let ok = match lit_kind(f) {
         Lit::Text => matches!(base, "String" | "FixedString"),
-        Lit::Number => number(base),
-        Lit::Float => base.starts_with("Float") || base.starts_with("Decimal"),
+        Lit::Number if base.starts_with("UInt") => dt.is_unsigned_integer(),
+        Lit::Number if base.starts_with("Int") => dt.is_integer(),
+        Lit::Number => exact_or_float,
+        Lit::Float => exact_or_float,
         Lit::Bool => base == "Bool",
         Lit::Binary => matches!(base, "String" | "FixedString"),
         Lit::Date | Lit::Timestamp | Lit::TimestampTz => matches!(base, "Date" | "Date32" | "DateTime" | "DateTime64"),
@@ -1623,7 +1629,9 @@ mod tests {
         .unwrap();
         let t = ChTsv::new("db.t", &schema);
         assert_eq!(t.sql, "INSERT INTO `db`.`t` (`id`, `name`, `ok`, `f`, `b`) SETTINGS date_time_input_format = 'best_effort' FORMAT TabSeparated");
-        let (data, n) = t.next(&batch, 0, MB).unwrap().unwrap();
+        assert_eq!(t.next(&batch, 0, 1, MB).unwrap().unwrap().1, 1, "a row limit");
+        assert_eq!(t.next(&batch, 0, 10, 1).unwrap().unwrap().1, 1, "a byte limit");
+        let (data, n) = t.next(&batch, 0, 10, MB).unwrap().unwrap();
         assert_eq!(n, 2);
         assert_eq!(String::from_utf8(data).unwrap(), "1\ta\\tb\\nc\\\\d\ttrue\tnan\t\\0\\tA\n2\t\\N\t\\N\t-inf\t\\N\n");
     }
@@ -1634,7 +1642,11 @@ mod tests {
         for (field, target) in [
             (f(DataType::Utf8), "LowCardinality(Nullable(String))"),
             (f(DataType::Int64), "Nullable(Int32)"),
+            (f(DataType::UInt16), "UInt64"),
+            (f(DataType::UInt64), "Int64"),
             (f(DataType::Int64), "Decimal(18, 3)"),
+            (f(DataType::Decimal128(4, 1)), "Decimal(18, 3)"),
+            (f(DataType::Decimal128(4, 1)), "Float64"),
             (f(DataType::Float64), "Float32"),
             (f(DataType::Boolean), "Bool"),
             (f(DataType::Binary), "String"),
@@ -1647,6 +1659,10 @@ mod tests {
             (f(DataType::Boolean), "UInt8"),
             (f(DataType::Utf8), "Int64"),
             (f(DataType::Float64), "Int64"),
+            (f(DataType::Decimal128(4, 1)), "Int64"),
+            (f(DataType::Decimal128(4, 1)), "Nullable(UInt8)"),
+            (f(DataType::Int64), "UInt32"),
+            (f(DataType::Int8), "LowCardinality(UInt8)"),
             (f(DataType::Int64), "String"),
             (f(DataType::Utf8), "Array(String)"),
         ] {

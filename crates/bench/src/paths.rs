@@ -339,7 +339,7 @@ fn export_and_load(s: &mut Suite) {
         let mut bytes = 0;
         for b in &tsv_data {
             let mut at = 0;
-            while let Some((d, n)) = t.next(b, at, 16 << 20).expect("tsv") {
+            while let Some((d, n)) = t.next(b, at, usize::MAX, 16 << 20).expect("tsv") {
                 bytes += d.len();
                 at += n;
             }

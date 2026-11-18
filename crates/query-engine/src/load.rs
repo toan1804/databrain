@@ -1710,29 +1710,7 @@ async fn bulk_plan(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &Cance
 /// the same result ([`sqlgen::dbx_fits`]), read with `DESCRIBE TABLE`.
 /// Whether the connection has a staging volume is the session's to say.
 async fn bulk_staged(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<sqlgen::DbxStage>, CopyCheck> {
-    let sql = format!("DESCRIBE TABLE {}", databrain_connector_core::quote_path(p.dialect, table));
-    let opts = ExecOptions { cancel: cancel.clone(), ..Default::default() };
-    let got = match p.session.execute(Statement::internal(&sql), opts).await {
-        Ok(s) => s.collect().await,
-        Err(e) => Err(e),
-    };
-    let c = match got {
-        Ok(c) => c,
-        Err(e) if e.is_cancelled() => return Err(CopyCheck::Fatal(EngineError::new("cancelled", "Cancelled"))),
-        Err(e) => return Err(CopyCheck::Inserts(format!("the table's column types couldn't be read: {}", e.message))),
-    };
-    // `col_name, data_type, comment` rows; partition and other details after an empty or `#` row.
-    let mut columns: Vec<(String, String)> = Vec::new();
-    'rows: for b in &c.batches {
-        let cell = |col: usize, row: usize| databrain_connector_core::arrow::util::display::array_value_to_string(b.column(col), row).unwrap_or_default();
-        for r in 0..b.num_rows() {
-            let name = cell(0, r);
-            if name.trim().is_empty() || name.starts_with('#') {
-                break 'rows;
-            }
-            columns.push((name, cell(1, r)));
-        }
-    }
+    let columns = described_columns(p, table, cancel).await?;
     let names: Vec<String> = columns.iter().map(|(n, _)| n.clone()).collect();
     let mut types = Vec::with_capacity(schema.fields().len());
     for f in schema.fields() {
@@ -1744,12 +1722,6 @@ async fn bulk_staged(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &Can
     Ok(Some(sqlgen::DbxStage::new(table, schema, &types)))
 }
 
-/// Postgres `COPY … FROM STDIN` for these rows into `table`, when it writes
-/// what the INSERTs would (`Ok(None)` when the session has no COPY, `Err`
-/// says why not): every column's rows fit the table's column type
-/// ([`sqlgen::pg_copy_fits`]), and the table is a plain or partitioned table
-/// without rules (COPY doesn't apply rules) or row-level security (COPY
-/// refuses a table whose policies apply to the user).
 /// A table's columns and types as `DESCRIBE TABLE` lists them (Databricks,
 /// ClickHouse): rows of `name, type, …`, up to an empty or `#` row.
 async fn described_columns(p: &Prepared, table: &str, cancel: &CancellationToken) -> std::result::Result<Vec<(String, String)>, CopyCheck> {
@@ -1815,7 +1787,7 @@ async fn tsv_rows(
             }
         };
         let mut at = 0;
-        while let Some(chunk) = t.next(&batch, at, p.batch.bytes).transpose() {
+        while let Some(chunk) = t.next(&batch, at, p.batch.rows.max(1), p.batch.bytes).transpose() {
             let (data, k) = match chunk {
                 Ok(x) => x,
                 Err(e) => {
@@ -1839,6 +1811,12 @@ async fn tsv_rows(
     w
 }
 
+/// Postgres `COPY … FROM STDIN` for these rows into `table`, when it writes
+/// what the INSERTs would (`Ok(None)` when the session has no COPY, `Err`
+/// says why not): every column's rows fit the table's column type
+/// ([`sqlgen::pg_copy_fits`]), and the table is a plain or partitioned table
+/// without rules (COPY doesn't apply rules) or row-level security (COPY
+/// refuses a table whose policies apply to the user).
 async fn bulk_copy(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<sqlgen::PgCopy>, CopyCheck> {
     if p.dialect != ConnectorKind::Postgres {
         return Ok(None);
