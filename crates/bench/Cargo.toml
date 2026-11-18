@@ -11,16 +11,16 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-databrain-ai = { version = "0.4.4", path = "../ai" }
-databrain-auth = { version = "0.4.4", path = "../auth" }
-databrain-connector-core = { version = "0.4.4", path = "../connector-core" }
-databrain-connector-mssql = { version = "0.4.4", path = "../connectors/mssql" }
-databrain-connector-sqlite = { version = "0.4.4", path = "../connectors/sqlite" }
-databrain-export = { version = "0.4.4", path = "../export" }
-databrain-lineage = { version = "0.4.4", path = "../lineage" }
-databrain-query-engine = { version = "0.4.4", path = "../query-engine" }
-databrain-result-store = { version = "0.4.4", path = "../result-store" }
-databrain-workspace = { version = "0.4.4", path = "../workspace" }
+databrain-ai = { version = "0.4.5", path = "../ai" }
+databrain-auth = { version = "0.4.5", path = "../auth" }
+databrain-connector-core = { version = "0.4.5", path = "../connector-core" }
+databrain-connector-mssql = { version = "0.4.5", path = "../connectors/mssql" }
+databrain-connector-sqlite = { version = "0.4.5", path = "../connectors/sqlite" }
+databrain-export = { version = "0.4.5", path = "../export" }
+databrain-lineage = { version = "0.4.5", path = "../lineage" }
+databrain-query-engine = { version = "0.4.5", path = "../query-engine" }
+databrain-result-store = { version = "0.4.5", path = "../result-store" }
+databrain-workspace = { version = "0.4.5", path = "../workspace" }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "time"] }
 uuid = { version = "1.26.1", features = ["v4"] }

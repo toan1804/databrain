@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-databrain-connector-core = { version = "0.4.4", path = "../connector-core" }
+databrain-connector-core = { version = "0.4.5", path = "../connector-core" }
 parking_lot = "0.12.5"
 # Same version and features as the export crate: no new code in the app.
 parquet = { version = "59.3.0", default-features = false, features = ["arrow", "zstd"] }

@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.4.5 - 2026-11-19
+
 ### Added
 
 - **Approve a learned join:** Knowledge → Learned has Approve on a join waiting for use: the AI gets it at once. A join is given to the AI when you approve it, or when it is used in 2 different queries or on 2 different days. A join kept from the AI for another reason (a declared foreign key, the table access rules, a column gone) is now "Not given" with its reason, not "Waiting".
