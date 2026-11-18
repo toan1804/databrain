@@ -1042,6 +1042,131 @@ pub fn dbx_fits(f: &Field, target: &str) -> std::result::Result<(), String> {
     if ok { Ok(()) } else { Err(format!("{} ({}) into a {t} column", f.name(), f.data_type())) }
 }
 
+/// Rows for a ClickHouse `INSERT … FORMAT TabSeparated` (the rows in the
+/// request's body instead of SQL text): each value the text its VALUES
+/// literal holds, with TabSeparated's escapes (`\\`, `\t`, `\n`, …), `\N` for
+/// NULL, NaN/±inf as ClickHouse's words (NULL in an exact number, as the
+/// INSERT writes them), booleans `true`/`false`, binary as its bytes.
+/// Which columns may go this way: [`ch_fits`].
+pub struct ChTsv {
+    kinds: Vec<Lit>,
+    /// `INSERT INTO table (cols) SETTINGS … FORMAT TabSeparated`.
+    pub sql: String,
+}
+
+impl ChTsv {
+    pub fn new(table: &str, schema: &SchemaRef) -> Self {
+        let d = ConnectorKind::Clickhouse;
+        Self {
+            kinds: schema.fields().iter().map(|f| lit_kind(f)).collect(),
+            sql: format!(
+                "INSERT INTO {} ({}){} FORMAT TabSeparated",
+                quote_path(d, table),
+                schema.fields().iter().map(|f| quote_ident(d, f.name())).collect::<Vec<_>>().join(", "),
+                lt(d).insert_settings
+            ),
+        }
+    }
+
+    /// Data for rows `start..` of `batch`, up to `max_rows` rows and about
+    /// `max_bytes` (at least one row): the bytes and how many rows they
+    /// hold. `None` past the end.
+    pub fn next(&self, batch: &RecordBatch, start: usize, max_rows: usize, max_bytes: usize) -> Result<Option<(Vec<u8>, usize)>> {
+        if start >= batch.num_rows() {
+            return Ok(None);
+        }
+        let fopts = format_options();
+        let fmts: Vec<ArrayFormatter<'_>> =
+            batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
+        let mut out = Vec::new();
+        let mut n = 0;
+        for r in start..batch.num_rows() {
+            if n > 0 && (n >= max_rows || out.len() >= max_bytes) {
+                break;
+            }
+            for (i, ((a, f), k)) in batch.columns().iter().zip(&fmts).zip(&self.kinds).enumerate() {
+                if i > 0 {
+                    out.push(b'\t');
+                }
+                let cell = (!a.is_null(r)).then(|| f.value(r).to_string());
+                ch_tsv_value(&mut out, cell.as_deref(), *k);
+            }
+            out.push(b'\n');
+            n += 1;
+        }
+        Ok(Some((out, n)))
+    }
+}
+
+/// One value in ClickHouse TabSeparated, as its VALUES literal stands for it.
+fn ch_tsv_value(out: &mut Vec<u8>, cell: Option<&str>, kind: Lit) {
+    let Some(s) = cell else {
+        out.extend_from_slice(br"\N");
+        return;
+    };
+    let bytes: std::borrow::Cow<[u8]> = match kind {
+        Lit::Number | Lit::Float => match non_finite(s) {
+            Some(v) if non_finite_literal(v, kind, ConnectorKind::Clickhouse) == "NULL" => {
+                out.extend_from_slice(br"\N");
+                return;
+            }
+            Some(v) => non_finite_literal(v, kind, ConnectorKind::Clickhouse).into_bytes().into(),
+            None => s.as_bytes().into(),
+        },
+        Lit::Bool => s.to_ascii_lowercase().into_bytes().into(),
+        // The bytes `unhex('…')` makes.
+        Lit::Binary => (0..s.len() / 2).filter_map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()).collect::<Vec<u8>>().into(),
+        _ => s.as_bytes().into(),
+    };
+    for b in bytes.iter() {
+        match b {
+            b'\\' => out.extend_from_slice(br"\\"),
+            b'\t' => out.extend_from_slice(br"\t"),
+            b'\n' => out.extend_from_slice(br"\n"),
+            b'\r' => out.extend_from_slice(br"\r"),
+            0 => out.extend_from_slice(br"\0"),
+            0x08 => out.extend_from_slice(br"\b"),
+            0x0c => out.extend_from_slice(br"\f"),
+            _ => out.push(*b),
+        }
+    }
+}
+
+/// Whether column `f` of the rows can go into a ClickHouse column of type
+/// `target` (as `DESCRIBE TABLE` writes it, `Nullable(…)` and
+/// `LowCardinality(…)` read through) by TabSeparated with the same result
+/// as its VALUES literal; `Err` says why not. The pairs where parsing the
+/// text and reading the literal agree: text into strings, numbers into
+/// numbers, booleans into Bool (a literal `true` goes into a `UInt8`, the
+/// text doesn't), binary into strings, dates and times into dates and
+/// times. Into an integer column only integers (the literal `2.5` is
+/// truncated, the text refused), and into an unsigned one only unsigned
+/// integers (the literal `-1` wraps, the text is refused).
+pub fn ch_fits(f: &Field, target: &str) -> std::result::Result<(), String> {
+    let mut t = target.trim();
+    loop {
+        let inner = ["Nullable(", "LowCardinality("].iter().find_map(|w| t.strip_prefix(w).and_then(|r| r.strip_suffix(')')));
+        match inner {
+            Some(i) => t = i.trim(),
+            None => break,
+        }
+    }
+    let base = t.split('(').next().unwrap_or_default();
+    let exact_or_float = base.starts_with("Float") || base.starts_with("Decimal");
+    let dt = f.data_type();
+    let ok = match lit_kind(f) {
+        Lit::Text => matches!(base, "String" | "FixedString"),
+        Lit::Number if base.starts_with("UInt") => dt.is_unsigned_integer(),
+        Lit::Number if base.starts_with("Int") => dt.is_integer(),
+        Lit::Number => exact_or_float,
+        Lit::Float => exact_or_float,
+        Lit::Bool => base == "Bool",
+        Lit::Binary => matches!(base, "String" | "FixedString"),
+        Lit::Date | Lit::Timestamp | Lit::TimestampTz => matches!(base, "Date" | "Date32" | "DateTime" | "DateTime64"),
+    };
+    if ok { Ok(()) } else { Err(format!("{} ({}) into a {target} column", f.name(), f.data_type())) }
+}
+
 /// Whether column `f` of the rows can go into a Postgres column of type
 /// `target` (as `format_type` names it) by COPY with the same result as its
 /// INSERT literal; `Err` says why not. An INSERT writes numbers and
@@ -1476,6 +1601,72 @@ mod tests {
             (f(DataType::Utf8), ""),
         ] {
             assert!(dbx_fits(&field, target).is_err(), "{field:?} into {target}");
+        }
+    }
+
+    /// ClickHouse TabSeparated: the literals' text with TSV escapes, `\N`,
+    /// ClickHouse's NaN/inf words (NULL in an exact number), binary bytes.
+    #[test]
+    fn ch_tsv_text() {
+        use databrain_connector_core::arrow::array::{BinaryArray, Float64Array};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ok", DataType::Boolean, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("b", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("a\tb\nc\\d"), None])),
+                Arc::new(BooleanArray::from(vec![Some(true), None])),
+                Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(f64::NEG_INFINITY)])),
+                Arc::new(BinaryArray::from(vec![Some(&b"\x00\tA"[..]), None])),
+            ],
+        )
+        .unwrap();
+        let t = ChTsv::new("db.t", &schema);
+        assert_eq!(t.sql, "INSERT INTO `db`.`t` (`id`, `name`, `ok`, `f`, `b`) SETTINGS date_time_input_format = 'best_effort' FORMAT TabSeparated");
+        assert_eq!(t.next(&batch, 0, 1, MB).unwrap().unwrap().1, 1, "a row limit");
+        assert_eq!(t.next(&batch, 0, 10, 1).unwrap().unwrap().1, 1, "a byte limit");
+        let (data, n) = t.next(&batch, 0, 10, MB).unwrap().unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(String::from_utf8(data).unwrap(), "1\ta\\tb\\nc\\\\d\ttrue\tnan\t\\0\\tA\n2\t\\N\t\\N\t-inf\t\\N\n");
+    }
+
+    #[test]
+    fn ch_fits_per_type() {
+        let f = |t: DataType| Field::new("c", t, true);
+        for (field, target) in [
+            (f(DataType::Utf8), "LowCardinality(Nullable(String))"),
+            (f(DataType::Int64), "Nullable(Int32)"),
+            (f(DataType::UInt16), "UInt64"),
+            (f(DataType::UInt64), "Int64"),
+            (f(DataType::Int64), "Decimal(18, 3)"),
+            (f(DataType::Decimal128(4, 1)), "Decimal(18, 3)"),
+            (f(DataType::Decimal128(4, 1)), "Float64"),
+            (f(DataType::Float64), "Float32"),
+            (f(DataType::Boolean), "Bool"),
+            (f(DataType::Binary), "String"),
+            (f(DataType::Date32), "Date32"),
+            (f(DataType::Timestamp(TimeUnit::Microsecond, None)), "DateTime64(6, 'UTC')"),
+        ] {
+            assert!(ch_fits(&field, target).is_ok(), "{field:?} into {target}");
+        }
+        for (field, target) in [
+            (f(DataType::Boolean), "UInt8"),
+            (f(DataType::Utf8), "Int64"),
+            (f(DataType::Float64), "Int64"),
+            (f(DataType::Decimal128(4, 1)), "Int64"),
+            (f(DataType::Decimal128(4, 1)), "Nullable(UInt8)"),
+            (f(DataType::Int64), "UInt32"),
+            (f(DataType::Int8), "LowCardinality(UInt8)"),
+            (f(DataType::Int64), "String"),
+            (f(DataType::Utf8), "Array(String)"),
+        ] {
+            assert!(ch_fits(&field, target).is_err(), "{field:?} into {target}");
         }
     }
 

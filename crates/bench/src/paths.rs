@@ -309,6 +309,7 @@ fn export_and_load(s: &mut Suite) {
     });
     let (stage_schema, stage_data) = (copy_schema.clone(), copy_data.clone());
     let ms_data = copy_data.clone();
+    let (tsv_schema, tsv_data) = (copy_schema.clone(), copy_data.clone());
     let (array_schema, array_data) = (copy_schema.clone(), copy_data.clone());
     s.add("pg_copy_100k_rows", "a Postgres load writes its COPY data", 1500, rows, move || {
         let c = databrain_export::load::PgCopy::new("app.orders", &copy_schema);
@@ -336,6 +337,18 @@ fn export_and_load(s: &mut Suite) {
     });
     s.add("mssql_bulk_100k_rows", "a SQL Server load checks and converts its rows for bulk copy", 1500, rows, move || {
         ms_data.iter().map(|b| databrain_connector_mssql::bench_rows(b).expect("bulk rows")).sum::<usize>()
+    });
+    s.add("ch_tsv_100k_rows", "a ClickHouse load writes its TabSeparated rows", 1500, rows, move || {
+        let t = databrain_export::load::ChTsv::new("app.orders", &tsv_schema);
+        let mut bytes = 0;
+        for b in &tsv_data {
+            let mut at = 0;
+            while let Some((d, n)) = t.next(b, at, usize::MAX, 16 << 20).expect("tsv") {
+                bytes += d.len();
+                at += n;
+            }
+        }
+        bytes
     });
     s.add("dbx_stage_100k_rows", "a Databricks bulk load writes its Parquet files", 1500, rows, move || {
         let types: Vec<String> = stage_schema.fields().iter().map(|f| databrain_export::load::column_type(ConnectorKind::Databricks, f).to_string()).collect();
