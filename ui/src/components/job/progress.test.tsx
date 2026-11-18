@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { ProgressBar, progressDetail, roughTime, statusText } from "./shared";
+import { ProgressBar, Warnings, progressDetail, roughTime, statusText } from "./shared";
 
 const p = (done: number, total: number, elapsed_ms: number) => ({ phase: "Inserting rows", done, total, elapsed_ms });
 
@@ -34,5 +34,15 @@ describe("a running step's progress", () => {
     expect(bar.getAttribute("aria-valuenow")).toBeNull();
     expect(bar.getAttribute("aria-valuetext")).toBe("Reading rows: 1,200 rows · 400 rows/s · 3s");
     expect(bar.firstElementChild?.className).toContain("animate-pulse");
+  });
+});
+
+describe("a load's warnings", () => {
+  it("show each as a note, and nothing without any", () => {
+    const w = "Inserting rows: INSERTs, not a bulk load (booking_date (Timestamp(Microsecond, None)) into a date column). To load in bulk, give that column of the rows the table's type in the SQL that selects them (a cast)";
+    const { container, rerender } = render(<Warnings warnings={[w]} />);
+    expect(screen.getByRole("note").textContent).toContain("booking_date");
+    rerender(<Warnings warnings={[]} />);
+    expect(container.textContent).toBe("");
   });
 });

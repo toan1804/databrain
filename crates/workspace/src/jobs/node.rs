@@ -100,6 +100,11 @@ pub struct NodeRunSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<Vec<String>>", optional)]
     pub notices: Vec<String>,
+    /// What the user should change: a load step's rows went by INSERTs
+    /// because a column isn't the table's type (the target bulk loads).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub warnings: Vec<String>,
     /// While running: rows written so far out of the total (load steps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

@@ -11,6 +11,11 @@ file?: string,
  */
 notices?: Array<string>, 
 /**
+ * What the user should change: a load step's rows went by INSERTs
+ * because a column isn't the table's type (the target bulk loads).
+ */
+warnings?: Array<string>, 
+/**
  * While running: rows written so far out of the total (load steps).
  */
 progress?: StepProgress, 

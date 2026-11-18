@@ -3906,3 +3906,38 @@ async fn run_date_examples_give_what_they_say() {
     })
     .await;
 }
+
+/// A load whose target bulk loads but a column of the rows isn't the
+/// table's type goes by INSERTs, and says so as a warning: in the run log
+/// (level warning, with what to change) and on the step (its warnings).
+/// Rows that fit say nothing of the kind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_that_keeps_a_load_from_bulk_is_a_warning() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let dst = duckdb(&st, "dst", &dir.path().join("dst.duckdb"));
+        rows(&st, &dst, "create table money (v decimal(10, 2)); create table plain (v double); select 1").await;
+        // A DOUBLE into DECIMAL: the appender would round it otherwise than the INSERT.
+        let job = load_job(&st, &dst, "money", "select 1.25::double as v", |_| {});
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        let s = step(&run, "loaded");
+        assert_eq!(s.warnings.len(), 1, "{s:?}");
+        assert!(
+            s.warnings[0].contains("INSERTs, not the appender") && s.warnings[0].contains("give that column of the rows the table's type"),
+            "{}",
+            s.warnings[0]
+        );
+        let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+        assert!(log.iter().any(|e| e.level == "warning" && e.message.contains("INSERTs, not the appender")), "{log:?}");
+
+        let job = load_job(&st, &dst, "plain", "select 1.25::double as v", |_| {});
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(step(&run, "loaded").warnings.is_empty());
+        let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+        assert!(!log.iter().any(|e| e.level == "warning"), "{log:?}");
+    })
+    .await;
+}

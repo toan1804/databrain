@@ -505,6 +505,7 @@ impl LoadObserver for Tracer {
     fn event(&self, e: LoadEvent) {
         match e {
             LoadEvent::Info(m) => self.log("info", m, None, None, None),
+            LoadEvent::Warning(m) => self.log("warning", m, None, None, None),
             LoadEvent::Statement { label, sql, rows, duration_ms, error } => match error {
                 None => self.log(
                     "info",
@@ -850,6 +851,7 @@ fn record(node: &JobNode, status: &str, started: Option<Instant>, rows: Option<i
             error,
             file: None,
             notices: vec![],
+            warnings: vec![],
             progress: None,
             attempt: None,
             attempts: None,
@@ -1116,6 +1118,7 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 let mut r = record(&node, "success", Some(started), Some(out.rows), None);
                 r.summary.file = out.file;
                 r.summary.notices = out.notices;
+                r.summary.warnings = out.warnings;
                 r
             }
             Err(e) if cancel.is_cancelled() || step_stopped || e.kind == "cancelled" => {
@@ -1596,6 +1599,8 @@ struct NodeOut {
     /// File written (Export).
     file: Option<String>,
     notices: Vec<String>,
+    /// See [`NodeRunSummary::warnings`](databrain_workspace::NodeRunSummary).
+    warnings: Vec<String>,
     /// Incremental: the largest value of its column now (column, value,
     /// its type), kept as its mark when the steps after it succeed too.
     mark: Option<(String, String, MarkType)>,
@@ -1725,7 +1730,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             }
             None => None,
         };
-        return Ok(NodeOut { rows, file: None, notices: vec![], mark });
+        return Ok(NodeOut { rows, file: None, notices: vec![], warnings: vec![], mark });
     }
     // This step's result (a statement that returns rows ends with one).
     let output = ctx
@@ -1769,7 +1774,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             t.log("warning", n.clone(), None, None, None);
             notices.push(n);
         }
-        return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices, mark });
+        return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices, warnings: vec![], mark });
     }
     let target =
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
@@ -1803,7 +1808,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // From here a failure may have written: a retry needs the load to say it kept nothing.
     *t.load.lock() = LoadState::Started;
     let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
-    Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices, mark })
+    Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices, warnings: report.warnings, mark })
 }
 
 /// [`load_spec`] with the run's `:name` values in the before/after SQL.

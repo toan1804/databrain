@@ -1,6 +1,6 @@
 // Pieces the job editor's parts share: status icon and text, progress bar,
 // step lists, field styles.
-import { FileDown, ArrowDownToLine, CheckCircle2, CircleDashed, Database, Hourglass, Loader2, XCircle } from "lucide-react";
+import { AlertTriangle, FileDown, ArrowDownToLine, CheckCircle2, CircleDashed, Database, Hourglass, Loader2, XCircle } from "lucide-react";
 import type { JobNode, JobRun, NodeRunSummary, StepProgress } from "../../lib/types";
 import { formatCount, formatDuration, relativeTime } from "../../lib/util";
 import { useLayoutEffect, useRef } from "react";
@@ -123,6 +123,23 @@ export function runLine(run: JobRun, now: number): string {
       return failed ? `Failed at ${failed.name}: ${failed.error ?? "see its runs"}` : `Failed: ${run.error ?? "see its runs"}`;
     }
   }
+}
+
+/**
+ * What the user should change about a load (a column of the rows that isn't
+ * the table's type, so they went by INSERTs instead of a bulk load).
+ */
+export function Warnings({ warnings, className = "" }: { warnings?: string[] | null; className?: string }) {
+  if (!warnings?.length) return null;
+  return (
+    <div className={`space-y-1 ${className}`}>
+      {warnings.map((w, i) => (
+        <div key={i} role="note" className="flex items-start gap-1 rounded-md border border-warning/40 bg-warning/10 px-2 py-1 text-[11.5px]">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0 text-warning" /> <span className="min-w-0 break-words">{w}</span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 /** A time estimate, to the second: "45s", "3m 05s", "1h 20m". */
