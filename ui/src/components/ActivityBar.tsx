@@ -78,12 +78,13 @@ export function exportLive(x: BackgroundExport, now: number): Live {
 }
 
 export function loadLive(l: BackgroundLoad, now: number): Live {
-  const fraction = l.total > 0 ? Math.min(1, l.done / l.total) : null;
-  const rows = l.total > 0 ? `${formatCount(l.done)} / ${formatCount(l.total)} rows ·${pct(fraction)}` : `${formatCount(l.done)} rows`;
+  // Making its rows first (test data): no rows written yet.
+  const fraction = !l.phase && l.total > 0 ? Math.min(1, l.done / l.total) : null;
+  const rows = l.phase ? l.phase : l.total > 0 ? `${formatCount(l.done)} / ${formatCount(l.total)} rows ·${pct(fraction)}` : `${formatCount(l.done)} rows`;
   return {
     key: `load:${l.id}`,
     icon: <Upload size={13} className="shrink-0 text-accent" />,
-    title: `Load into ${l.table} on ${l.target}`,
+    title: `${l.label ?? `Load into ${l.table}`} on ${l.target}`,
     line: `${l.stopping ? "Stopping… " : ""}${rows} · ${formatDuration(Math.max(0, now - l.started))}`,
     short: `${l.table}${pct(fraction)}`,
     fraction,
@@ -177,10 +178,10 @@ export function ActivityBar() {
       .filter((l) => l.status !== "running" && l.id !== loadInDialog)
       .map((l) => ({
         key: `load:${l.id}`,
-        name: `Load into ${l.table}`,
+        name: l.label ?? `Load into ${l.table}`,
         failed: l.status === "failed",
         ok: l.status === "done",
-        text: l.status === "done" ? `Loaded ${formatCount(l.done)} rows into ${l.table}` : `Load into ${l.table} failed: ${l.error ?? ""}`,
+        text: l.status === "done" ? `Loaded ${formatCount(l.done)} rows into ${l.table}` : `${l.label ?? `Load into ${l.table}`} failed: ${l.error ?? ""}`,
         dismiss: () => useLoads.getState().dismiss(l.id),
         autoMs: l.status === "done" ? DONE_MS : undefined,
       })),

@@ -151,3 +151,51 @@ describe("opening the dialog", () => {
     expect(screen.getByLabelText("Fill total")).not.toBeChecked();
   });
 });
+
+describe("Generate and load in the background", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("goes on in the activity bar once the dialog is left: rows made, then loaded, then how it ended", async () => {
+    const { ActivityBar } = await import("./ActivityBar");
+    const { useLoads } = await import("../loadsStore");
+    const conn = {
+      id: "c1",
+      name: "Dev",
+      connected: true,
+      env: "dev",
+      has_secret: false,
+      created_at: 0,
+      updated_at: 0,
+      config: { kind: "postgres", auth: { kind: "none" }, ssl_mode: "prefer", read_only: false },
+      ai_policy: { ai_enabled: false, share_metadata: true, allowed_providers: [] },
+    } as unknown as ConnectionView;
+    useStore.setState({ connections: [conn], testDataPatterns: {}, testDataDialog: { connection_id: "c1", schema: "public", table: "people" }, tabs: [], toasts: [] });
+    useLoads.setState({ items: [], inDialog: null });
+    vi.spyOn(api, "cachedTestDataPlan").mockResolvedValue(null);
+    vi.spyOn(api, "testDataPlan").mockResolvedValue({ table: '"public"."people"', columns: [col("name")], foreign_keys: [], warnings: [] });
+    let made: (o: unknown) => void = () => {};
+    vi.spyOn(api, "generateTestData").mockImplementation(() => new Promise((r) => (made = r as never)));
+    let loaded: (r: unknown) => void = () => {};
+    const load = vi.spyOn(api, "loadResult").mockImplementation(() => new Promise((r) => (loaded = r as never)));
+    render(
+      <>
+        <TestDataDialogHost />
+        <ActivityBar />
+      </>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Generate and load 100 rows/ }));
+    expect(await screen.findByText("Making 100 rows…")).toBeInTheDocument();
+    const bar = () => screen.queryByRole("region", { name: "Background activity" });
+    expect(bar()).toBeNull(); // the dialog shows it
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in background" }));
+    expect(screen.queryByText(/Generate test data/)).toBeNull();
+    expect(bar()!.textContent).toContain("Test data into people on Dev · Making 100 rows…");
+
+    await act(async () => made({ output: { result_id: "r9", rows: 100, handle: "h9" }, seed: 1, notes: [], table: '"public"."people"' }));
+    await waitFor(() => expect(load).toHaveBeenCalled());
+    expect(bar()!.textContent).toContain("Test data into people on Dev · 0 / 100 rows · 0%");
+    await act(async () => loaded({ rows: 100, deleted: 0, created_table: false, transaction: true, notices: [] }));
+    expect(screen.getByRole("status", { name: "Test data into people" }).textContent).toContain("Loaded 100 rows into people");
+  });
+});

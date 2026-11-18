@@ -6,7 +6,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, BookOpen, Eye, Link2, Loader2, Sparkles, Square, Upload } from "lucide-react";
-import { api, onLoadProgress, toError } from "../lib/api";
+import { api, toError } from "../lib/api";
+import { useLoads } from "../loadsStore";
 import type { LoadDryRun, LoadReport, TestDataColumn, TestDataOutput, TestDataPlan, TestDataSpec } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { openOutput } from "../outputs";
@@ -100,9 +101,15 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const [busy, setBusy] = useState<null | "preview" | "dry" | "load">(null);
   const [made, setMade] = useState<TestDataOutput | null>(null);
   const [dry, setDry] = useState<LoadDryRun | null>(null);
-  const [progress, setProgress] = useState<{ id: string; done: number; total: number } | null>(null);
   const [report, setReport] = useState<LoadReport | null>(null);
-  const loadId = useRef<string | null>(null);
+  // "Generate and load" running from this dialog: the loads store follows it
+  // (its rows made, then loaded), also once the dialog is left.
+  const [runId, setRunId] = useState<string | null>(null);
+  const run = useLoads((s) => (runId ? s.items.find((l) => l.id === runId && l.status === "running") : undefined)) ?? null;
+  // Left (closed, "Continue in background"): what "Generate and load" does goes on, in the bar.
+  const left = useRef(false);
+  // The AI request of a "Generate and load" (closing the dialog doesn't stop it).
+  const loading = useRef(false);
   const aiSettings = useStore((s) => s.testDataAi);
   const setAiSettings = useStore((s) => s.setTestDataAi);
   const providers = useAi((s) => s.providers);
@@ -126,10 +133,13 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const running = useRef<string | null>(null);
   // Counts the settings' changes: rows made for earlier settings are not the ones asked for now.
   const settingsVersion = useRef(0);
-  // Closing the dialog stops a request still running.
+  // Closing the dialog stops a request still running, unless it makes the
+  // rows of a "Generate and load", which goes on in the activity bar.
   useEffect(
     () => () => {
-      if (running.current) void api.aiCancel(running.current);
+      left.current = true;
+      if (running.current && !loading.current) void api.aiCancel(running.current);
+      if (useLoads.getState().inDialog) useLoads.getState().setInDialog(null);
     },
     [],
   );
@@ -168,11 +178,6 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
       live = false;
     };
   }, [req.connection_id, req.schema, req.table]);
-
-  useEffect(() => {
-    const un = onLoadProgress((e) => e.load_id === loadId.current && setProgress((p) => (p ? { ...p, done: e.done, total: e.total } : p)));
-    return () => void un.then((f) => f());
-  }, []);
 
   // Settings changed: earlier rows and checks no longer match them. The
   // connection's AI policy by value: a refresh of the connection list
@@ -310,32 +315,56 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   };
   const load = async () => {
     setBusy("load");
+    const id = uid();
+    const loads = useLoads.getState();
+    const what = { id, table: req.table, target: conn?.name ?? "the connection", label: `Test data into ${req.table}` };
+    // Shown here until the dialog is left; then in the bar.
+    const shownHere = () => useLoads.getState().inDialog === id;
+    const claim = () => !left.current && loads.setInDialog(id);
+    loading.current = true;
+    setRunId(id);
     try {
-      const out = await generate();
-      const id = uid();
+      // The rows first: made here, or written by the AI (Stop cancels that request).
+      const making = generate();
+      const asked = Math.min(rows, MAX_TEST_ROWS);
+      loads.begin({
+        ...what,
+        total: asked,
+        phase: made ? "Rows made" : running.current ? `${providerName} is writing ${formatCount(aiRows)} rows…` : `Making ${formatCount(asked)} rows…`,
+        aiRun: running.current ?? undefined,
+      });
+      claim();
+      const out = await making;
       const r = await loadResultAsking(
         out.output.result_id,
         args(out.table),
         id,
         () => {
-          loadId.current = id;
-          setProgress({ id, done: 0, total: out.output.rows });
+          loads.begin({ ...what, total: out.output.rows });
+          claim();
         },
-        () => {
-          loadId.current = null;
-          setProgress(null);
-        },
+        () => loads.dismiss(id),
       );
-      if (!r) return;
-      setReport(r);
-      toast(`Loaded ${formatCount(r.rows)} test rows into ${req.table}`, "success");
+      if (!r) return loads.dismiss(id);
+      const here = shownHere();
+      loads.finish(id, r.rows);
+      if (here) setReport(r);
     } catch (e) {
-      failed(e);
+      const here = shownHere();
+      if (toError(e).kind === "cancelled") loads.stopped(id);
+      else loads.fail(id, toError(e).message);
+      if (here) failed(e);
     } finally {
+      loading.current = false;
       setBusy(null);
-      setProgress(null);
-      loadId.current = null;
+      setRunId(null);
     }
+  };
+  // Leave the dialog, keep "Generate and load" going: the activity bar follows it.
+  const toBackground = () => {
+    left.current = true;
+    useLoads.getState().setInDialog(null);
+    onClose();
   };
 
   const toggle = (name: string, on: boolean) =>
@@ -349,18 +378,23 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   return (
     <Modal
       title={`Generate test data · ${req.table}`}
-      // Not while it generates for a load or loads: closing would leave the load running unseen.
-      onClose={() => !progress && busy !== "load" && onClose()}
+      // While it generates for a load or loads: closing hands it to the activity bar.
+      onClose={() => (busy === "load" ? toBackground() : onClose())}
       width={820}
       footer={
         report ? (
           <button className="btn-primary" onClick={onClose}>
             Close
           </button>
-        ) : progress ? (
-          <button className="btn-ghost mr-auto" onClick={() => void api.cancelLoad(progress.id)}>
-            <Square size={12} /> Stop
-          </button>
+        ) : busy === "load" && run ? (
+          <>
+            <button className="btn-ghost mr-auto" onClick={() => useLoads.getState().cancel(run.id)} disabled={run.stopping}>
+              {run.stopping ? <Loader2 size={12} className="animate-spin" /> : <Square size={12} />} Stop
+            </button>
+            <button className="btn-ghost border border-line" onClick={toBackground} title="Close this dialog; the bar at the bottom shows it until it ends">
+              Continue in background
+            </button>
+          </>
         ) : aiRun ? (
           <>
             <span className="mr-auto flex items-center gap-1.5 text-[12px] text-muted" role="status">
@@ -622,14 +656,16 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
               ))}
             </ul>
           )}
-          {progress && (
+          {run && (
             <div className="space-y-1" role="status">
               <div className="flex items-center gap-2 text-[11.5px] text-muted">
-                <Loader2 size={12} className="animate-spin" /> Writing {formatCount(progress.done)} of {formatCount(progress.total)} rows…
+                <Loader2 size={12} className="animate-spin" /> {run.phase ?? `Writing ${formatCount(run.done)} of ${formatCount(run.total)} rows…`}
               </div>
-              <div className="h-1.5 overflow-hidden rounded bg-hover">
-                <div className="h-full bg-accent transition-all" style={{ width: `${progress.total ? Math.min(100, (progress.done / progress.total) * 100) : 0}%` }} />
-              </div>
+              {!run.phase && (
+                <div className="h-1.5 overflow-hidden rounded bg-hover">
+                  <div className="h-full bg-accent transition-all" style={{ width: `${run.total ? Math.min(100, (run.done / run.total) * 100) : 0}%` }} />
+                </div>
+              )}
             </div>
           )}
           {dry && <DryRunReport report={dry} />}
