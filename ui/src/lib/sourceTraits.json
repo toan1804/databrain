@@ -258,7 +258,7 @@
     "language": "sql",
     "levels": "three",
     "load": {
-      "binary_literal": "X'{}'",
+      "binary_literal": "from_hex('{}')",
       "bool_words": true,
       "bytes_note": "DataBrain's limit per statement",
       "create_if_missing": "if_not_exists",

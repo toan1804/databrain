@@ -799,7 +799,14 @@ pub const DUCKDB: SourceTraits = SourceTraits {
     formatter: "duckdb",
     syntax: SqlSyntax { dollar: DollarQuotes::Tagged, escape_strings: true, ..STANDARD_SYNTAX },
     // Local, in one transaction: fewer, larger statements to parse.
-    load: Some(LoadTraits { types: TypeNames { timestamp_tz: "TIMESTAMPTZ", ..STANDARD_TYPES }, default_rows: 10_000, default_bytes: 8 * MB, ..STANDARD_LOAD }),
+    load: Some(LoadTraits {
+        types: TypeNames { timestamp_tz: "TIMESTAMPTZ", ..STANDARD_TYPES },
+        default_rows: 10_000,
+        default_bytes: 8 * MB,
+        // DuckDB reads `X'00ff'` as the text "x00ff", not bytes.
+        binary_literal: "from_hex('{}')",
+        ..STANDARD_LOAD
+    }),
     transactions: Some(TxDialect { savepoint: None, ..STANDARD_TX }),
     ..STANDARD
 };
