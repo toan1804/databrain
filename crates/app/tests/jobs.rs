@@ -88,7 +88,13 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
 /// Every test ends in time: a hang fails it (with where it hung) instead
 /// of stopping the whole test run.
 async fn guarded(test: impl std::future::Future<Output = ()>) {
-    tokio::time::timeout(Duration::from_secs(240), test).await.expect("the test hung (more than 4 minutes)");
+    guarded_within(Duration::from_secs(240), test).await
+}
+
+/// [`guarded`] for a test that may take longer than 4 minutes (INSERTs into
+/// a slow live server).
+async fn guarded_within(limit: Duration, test: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(limit, test).await.unwrap_or_else(|_| panic!("the test hung (more than {} s)", limit.as_secs()));
 }
 
 /// Poll `cond` every 20 ms for up to `secs` s; fails naming `what` if it never holds.
@@ -613,12 +619,13 @@ async fn duckdb_appended_loads_write_what_inserts_do() {
 /// creates and into existing ones with other column types (an `int`, a
 /// decimal of a smaller scale, `datetime2(3)` for a date, …), where the
 /// copy fires the insert trigger for every row, as INSERTs do. 120,000
-/// rows (two bulk copy calls); the INSERT half takes about a minute on CI's
-/// server and more on a slow one, so each run may take ten.
+/// rows (two bulk copy calls); an INSERT run takes about a minute on CI's
+/// server and more on a slow one, so each run may take ten minutes and the
+/// test half an hour.
 #[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn mssql_bulk_loads_write_what_inserts_do() {
-    guarded(async {
+    guarded_within(Duration::from_secs(1800), async {
         let Ok(host) = std::env::var("DATABRAIN_MSSQL_HOST") else {
             panic!("live test: DATABRAIN_MSSQL_HOST not set (run with --ignored)");
         };
