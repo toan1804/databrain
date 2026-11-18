@@ -26,6 +26,7 @@ export function ExportDialog({
   viewRows,
   dialect,
   defaultName,
+  tabId,
   onClose,
 }: {
   info: ResultInfo;
@@ -33,6 +34,8 @@ export function ExportDialog({
   viewRows: number;
   dialect: string | undefined;
   defaultName: string;
+  /** The tab whose session a full export runs the query on (closing it stops the export). */
+  tabId?: string;
   onClose: () => void;
 }) {
   const toast = useStore((s) => s.toast);
@@ -79,7 +82,7 @@ export function ExportDialog({
     if (typeof path !== "string") return;
     const options = { format, header, table_name: table || "my_table", dialect: (dialect as never) ?? null, excel_safe: excelSafe };
     if (scope === "all") {
-      setBgId(await useExports.getState().start({ resultId: info.id, options, path, source: defaultName }));
+      setBgId(await useExports.getState().start({ resultId: info.id, options, path, source: defaultName, tabId }));
       return;
     }
     setBusy(true);

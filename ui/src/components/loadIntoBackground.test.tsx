@@ -91,6 +91,28 @@ describe("Load into… in the background", () => {
     expect(useStore.getState().toasts.at(-1)?.message).toBe("Loaded 1,000 rows into orders");
   });
 
+  it("a load asked again for production after it went to the background stays in the bar, and its end shows", async () => {
+    const calls: { res: (r: LoadReport) => void; rej: (e: unknown) => void }[] = [];
+    vi.mocked(api.loadResult).mockImplementation(() => new Promise<LoadReport>((res, rej) => void calls.push({ res, rej })));
+    await openDialog();
+    act(() => screen.getByRole("button", { name: /Load 1,000 rows/ }).click());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Continue in background" })).toBeTruthy());
+    act(() => screen.getByRole("button", { name: "Continue in background" }).click());
+    // The server asks: production. The user says yes; it starts again.
+    await act(async () => calls[0].rej({ kind: "invalid", message: '"Warehouse" is a production connection', code: "needs_confirmation" }));
+    await waitFor(() => expect(useStore.getState().confirm).not.toBeNull());
+    const c = useStore.getState().confirm!;
+    act(() => {
+      useStore.getState().askConfirm(null);
+      c.onConfirm();
+    });
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(useLoads.getState().inDialog).toBeNull();
+    expect(bar()!.textContent).toContain("Load into orders on Warehouse");
+    await act(async () => calls[1].res(report));
+    expect(screen.getByRole("status", { name: "Load into orders" }).textContent).toContain("Loaded 1,000 rows into orders");
+  });
+
   it("a load that ends while its dialog shows it stays there, with its report", async () => {
     await openDialog();
     act(() => screen.getByRole("button", { name: /Load 1,000 rows/ }).click());
@@ -99,5 +121,39 @@ describe("Load into… in the background", () => {
     expect(screen.getByText(/rows written into/).textContent).toContain("1,000 rows written into orders on Warehouse");
     expect(bar()).toBeNull();
     expect(useLoads.getState().items).toHaveLength(0);
+  });
+});
+
+describe("closing a tab that background work runs on", () => {
+  beforeEach(() => {
+    useStore.setState({ tabs: [{ id: "t1", title: "Orders", sql: "", connection_id: null } as never], activeTabId: "t1", confirm: null, toasts: [], txOpen: {} });
+    useLoads.setState({ items: [], inDialog: null });
+  });
+
+  it("asks first, and the load says why it stopped", () => {
+    vi.spyOn(api, "cancelLoad").mockResolvedValue(true);
+    vi.spyOn(api, "closeTab").mockResolvedValue(undefined as never);
+    useLoads.getState().begin({ id: "l1", table: "orders", target: "Warehouse", total: 0, tabId: "t1" });
+    useStore.getState().requestCloseTab("t1");
+    const c = useStore.getState().confirm!;
+    expect(c.reasons).toEqual(["Closing it stops what runs on its connection session: the load into orders."]);
+    expect(c.confirmLabel).toBe("Close and stop");
+    expect(useStore.getState().tabs.map((t) => t.id)).toEqual(["t1"]);
+    act(() => {
+      useStore.getState().askConfirm(null);
+      c.onConfirm();
+    });
+    expect(useStore.getState().tabs.some((t) => t.id === "t1")).toBe(false);
+    // The backend stops it (cancelled): the outcome says why.
+    useLoads.getState().stopped("l1");
+    expect(useStore.getState().toasts.at(-1)?.message).toBe("Load into orders stopped: its tab was closed");
+  });
+
+  it("doesn't ask for a load that reads the rows the result holds (no tab session)", () => {
+    vi.spyOn(api, "closeTab").mockResolvedValue(undefined as never);
+    useLoads.getState().begin({ id: "l2", table: "orders", target: "Warehouse", total: 10 });
+    useStore.getState().requestCloseTab("t1");
+    expect(useStore.getState().confirm).toBeNull();
+    expect(useStore.getState().tabs.some((t) => t.id === "t1")).toBe(false);
   });
 });

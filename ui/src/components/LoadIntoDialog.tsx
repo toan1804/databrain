@@ -3,7 +3,7 @@
 // merge by key; a missing table is created). Also the last step of
 // importing a CSV/Excel/Parquet file: query it, then load the result.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, Square, Upload } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { useLoads } from "../loadsStore";
@@ -36,6 +36,7 @@ export function LoadIntoDialog({
   sql,
   outputName,
   connectionId,
+  tabId,
   onClose,
 }: {
   info: ResultInfo;
@@ -43,6 +44,8 @@ export function LoadIntoDialog({
   outputName?: string | null;
   /** Connection the rows came from: the default target for generated test data. */
   connectionId?: string;
+  /** The result's tab: an "every row" load runs its query again on that tab's session. */
+  tabId?: string;
   onClose: () => void;
 }) {
   const toast = useStore((s) => s.toast);
@@ -63,8 +66,15 @@ export function LoadIntoDialog({
   // store, which keeps following it if the dialog closes (the activity bar).
   const [runId, setRunId] = useState<string | null>(null);
   const run = useLoads((s) => (runId ? s.items.find((l) => l.id === runId && l.status === "running") : undefined)) ?? null;
-  // Closed while it runs: the bar shows it from now on.
-  useEffect(() => () => void (useLoads.getState().inDialog && useLoads.getState().setInDialog(null)), []);
+  // Left (closed, "Continue in background") while it runs: the bar shows it from now on.
+  const left = useRef(false);
+  useEffect(
+    () => () => {
+      left.current = true;
+      if (useLoads.getState().inDialog) useLoads.getState().setInDialog(null);
+    },
+    [],
+  );
   const [report, setReport] = useState<LoadReport | null>(null);
   const targetKind = connections.find((c) => c.id === target)?.config.kind;
   const modes = useMemo(() => loadModesFor(targetKind), [targetKind]);
@@ -110,8 +120,10 @@ export function LoadIntoDialog({
         args,
         id,
         () => {
-          loads.begin({ id, table, target: targetName || "the connection", total: streaming ? 0 : info.total_rows });
-          loads.setInDialog(id);
+          loads.begin({ id, table, target: targetName || "the connection", total: streaming ? 0 : info.total_rows, tabId: streaming ? tabId : undefined });
+          // Not after the dialog was left: a start again (after a production
+          // prompt) would hide the load from the bar, its end with it.
+          if (!left.current) loads.setInDialog(id);
           setRunId(id);
         },
         () => {
@@ -137,6 +149,7 @@ export function LoadIntoDialog({
   };
   // Leave the dialog, keep the load: the activity bar follows it.
   const toBackground = () => {
+    left.current = true;
     useLoads.getState().setInDialog(null);
     onClose();
   };

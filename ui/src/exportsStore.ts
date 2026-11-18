@@ -4,6 +4,7 @@ import type { ExportOptions } from "./lib/types";
 import { useStore } from "./store";
 import { formatCount, uid } from "./lib/util";
 import { useActivity } from "./activityStore";
+import { registerTabUser } from "./tabUsers";
 
 /**
  * Full exports ("All rows of the query") run in the background: the query
@@ -28,6 +29,10 @@ export interface BackgroundExport {
   error?: string;
   /** Stop was pressed; waiting for the backend to stop. */
   stopping?: boolean;
+  /** The tab whose session runs its query (closing it stops the export). */
+  tabId?: string;
+  /** Why it stopped, when not Stop ("its tab was closed"). */
+  stopReason?: string;
 }
 
 interface ExportsState {
@@ -36,7 +41,7 @@ interface ExportsState {
   inDialog: string | null;
   setInDialog: (id: string | null) => void;
   /** Start a full export; resolves with its id once it is running. */
-  start: (a: { resultId: string; options: ExportOptions; path: string; source: string }) => Promise<string>;
+  start: (a: { resultId: string; options: ExportOptions; path: string; source: string; tabId?: string }) => Promise<string>;
   cancel: (id: string) => void;
   dismiss: (id: string) => void;
   reveal: (id: string) => void;
@@ -62,7 +67,7 @@ export const useExports = create<ExportsState>((set, get) => {
     inDialog: null,
     setInDialog: (inDialog) => set({ inDialog }),
 
-    start: async ({ resultId, options, path, source }) => {
+    start: async ({ resultId, options, path, source, tabId }) => {
       await listen();
       const id = uid();
       const item: BackgroundExport = {
@@ -75,6 +80,7 @@ export const useExports = create<ExportsState>((set, get) => {
         bytes: 0,
         started: Date.now(),
         status: "running",
+        tabId,
       };
       set((s) => ({ items: [...s.items, item] }));
       void api
@@ -95,8 +101,9 @@ export const useExports = create<ExportsState>((set, get) => {
           const err = toError(e);
           useActivity.getState().ended(`export:${id}`);
           if (err.kind === "cancelled") {
+            const why = get().items.find((x) => x.id === id)?.stopReason;
             get().dismiss(id);
-            useStore.getState().toast(`Export of ${item.fileName} stopped`, "info");
+            useStore.getState().toast(`Export of ${item.fileName} stopped${why ? `: ${why}` : ""}`, "info");
           } else patch(id, { status: "failed", error: err.message, finished: Date.now(), stopping: false });
         });
       return id;
@@ -130,3 +137,13 @@ export function phaseLabel(p: ExportPhase): string {
       return "Finishing the file…";
   }
 }
+
+registerTabUser({
+  uses: (tabId) =>
+    useExports
+      .getState()
+      .items.filter((x) => x.status === "running" && x.tabId === tabId)
+      .map((x) => `the export to ${x.fileName}`),
+  closing: (tabId) =>
+    useExports.setState((s) => ({ items: s.items.map((x) => (x.status === "running" && x.tabId === tabId ? { ...x, stopReason: "its tab was closed" } : x)) })),
+});

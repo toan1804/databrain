@@ -77,6 +77,19 @@ describe("background exports", () => {
     expect(useActivity.getState().hidden).toEqual({});
   });
 
+  it("an export of a tab being closed says why it stopped", async () => {
+    const { registerTabUser } = await import("./tabUsers");
+    void registerTabUser; // registered by the store
+    const { tabUses, tabClosing } = await import("./tabUsers");
+    const id = await useExports.getState().start({ resultId: "r1", options: opts, path: "/a.csv", source: "A", tabId: "t9" });
+    expect(tabUses("t9")).toEqual(["the export to a.csv"]);
+    expect(tabUses("other")).toEqual([]);
+    tabClosing("t9");
+    pending.get(id)!.reject({ kind: "cancelled", message: "cancelled" });
+    await flush();
+    expect(useStore.getState().toasts.at(-1)?.message).toBe("Export of a.csv stopped: its tab was closed");
+  });
+
   it("keeps a failed export with its error until dismissed", async () => {
     const id = await useExports.getState().start({ resultId: "r1", options: opts, path: "/x.csv", source: "X" });
     pending.get(id)!.reject({ kind: "query", message: "relation does not exist" });

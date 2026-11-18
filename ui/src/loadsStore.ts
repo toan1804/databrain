@@ -6,6 +6,7 @@ import { api, onLoadProgress } from "./lib/api";
 import { useActivity } from "./activityStore";
 import { useStore } from "./store";
 import { formatCount } from "./lib/util";
+import { registerTabUser } from "./tabUsers";
 
 export interface BackgroundLoad {
   id: string;
@@ -21,6 +22,10 @@ export interface BackgroundLoad {
   error?: string;
   /** Stop was pressed; waiting for the load to stop. */
   stopping?: boolean;
+  /** The tab whose session runs its query again ("every row"): closing it stops the load. */
+  tabId?: string;
+  /** Why it stopped, when not Stop ("its tab was closed"). */
+  stopReason?: string;
 }
 
 interface LoadsState {
@@ -29,7 +34,7 @@ interface LoadsState {
   inDialog: string | null;
   setInDialog: (id: string | null) => void;
   /** A load started (in the dialog). */
-  begin: (l: { id: string; table: string; target: string; total: number }) => void;
+  begin: (l: { id: string; table: string; target: string; total: number; tabId?: string }) => void;
   /** It wrote `rows`: kept for the bar unless its dialog shows it, or it was hidden (a toast). */
   finish: (id: string, rows: number) => void;
   /** It failed: kept for the bar unless its dialog shows the error. */
@@ -49,12 +54,12 @@ export const useLoads = create<LoadsState>((set, get) => {
     items: [],
     inDialog: null,
     setInDialog: (inDialog) => set({ inDialog }),
-    begin: ({ id, table, target, total }) => {
+    begin: ({ id, table, target, total, tabId }) => {
       listening ??= onLoadProgress((e) => {
         if (item(e.load_id)?.status === "running") patch(e.load_id, { done: e.done, total: e.total || item(e.load_id)!.total });
       }).catch(() => {});
       if (item(id)) return patch(id, { status: "running", stopping: false });
-      set((s) => ({ items: [...s.items, { id, table, target, done: 0, total, started: Date.now(), status: "running" }] }));
+      set((s) => ({ items: [...s.items, { id, table, target, done: 0, total, started: Date.now(), status: "running", tabId }] }));
     },
     finish: (id, rows) => {
       const l = item(id);
@@ -76,7 +81,7 @@ export const useLoads = create<LoadsState>((set, get) => {
       const l = item(id);
       useActivity.getState().ended(`load:${id}`);
       get().dismiss(id);
-      if (l && get().inDialog !== id) useStore.getState().toast(`Load into ${l.table} stopped`, "info");
+      if (l && get().inDialog !== id) useStore.getState().toast(`Load into ${l.table} stopped${l.stopReason ? `: ${l.stopReason}` : ""}`, "info");
     },
     cancel: (id) => {
       patch(id, { stopping: true });
@@ -84,4 +89,14 @@ export const useLoads = create<LoadsState>((set, get) => {
     },
     dismiss: (id) => set((s) => ({ items: s.items.filter((x) => x.id !== id), inDialog: s.inDialog === id ? null : s.inDialog })),
   };
+});
+
+registerTabUser({
+  uses: (tabId) =>
+    useLoads
+      .getState()
+      .items.filter((l) => l.status === "running" && l.tabId === tabId)
+      .map((l) => `the load into ${l.table}`),
+  closing: (tabId) =>
+    useLoads.setState((s) => ({ items: s.items.map((l) => (l.status === "running" && l.tabId === tabId ? { ...l, stopReason: "its tab was closed" } : l)) })),
 });
