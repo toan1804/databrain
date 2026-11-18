@@ -133,6 +133,94 @@ impl Session for DuckSession {
         self.strings("select 1".into(), vec![]).await.map(|_| ())
     }
 
+    /// The appender: the rows go into a temporary table of their own types
+    /// (the appender converts nothing, so its types must match), then one
+    /// `INSERT INTO table (columns) SELECT …` converts each value with
+    /// DuckDB's casts, as an INSERT's literals are; the temporary table is
+    /// dropped. In the load's transaction when it has one.
+    async fn append_rows(
+        &self,
+        table: &str,
+        columns: &[String],
+        batch: databrain_connector_core::arrow::array::RecordBatch,
+        cancel: databrain_connector_core::CancellationToken,
+    ) -> Result<Option<u64>> {
+        use databrain_connector_core::arrow::datatypes::{Field, Schema};
+        if batch.num_rows() == 0 {
+            return Ok(Some(0));
+        }
+        let n = batch.num_rows() as u64;
+        // Columns `c0`, `c1`, …: the rows' own names may clash or need quoting.
+        let normal = crate::outputs::normalize_for_duckdb(&batch)?;
+        let renamed = Arc::new(Schema::new(
+            normal.schema().fields().iter().enumerate().map(|(i, f)| Field::new(format!("c{i}"), f.data_type().clone(), true)).collect::<Vec<_>>(),
+        ));
+        let rows = databrain_connector_core::arrow::array::RecordBatch::try_new(renamed.clone(), normal.columns().to_vec())
+            .map_err(|e| ConnectorError::internal(e.to_string()))?;
+        let rows = crate::outputs::to_arrow58(&rows)?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let temp = format!("databrain_append_{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let defs = renamed.fields().iter().map(|f| format!("{} {}", f.name(), crate::outputs::duck_type(f.data_type()))).collect::<Vec<_>>().join(", ");
+        let target_cols = columns.iter().map(|c| databrain_connector_core::quote_ident(ConnectorKind::Duckdb, c)).collect::<Vec<_>>().join(", ");
+        let source_cols = (0..columns.len()).map(|i| format!("c{i}")).collect::<Vec<_>>().join(", ");
+        let insert = format!(
+            "INSERT INTO {} ({target_cols}) SELECT {source_cols} FROM temp.main.{temp}",
+            databrain_connector_core::quote_path(ConnectorKind::Duckdb, table)
+        );
+        let interrupt = self.interrupt.clone();
+        let watch = cancel.clone();
+        let stop = tokio::spawn(async move {
+            watch.cancelled().await;
+            interrupt.interrupt();
+        });
+        let r = self
+            .with_conn(move |c| {
+                c.execute_batch(&format!("CREATE TEMP TABLE {temp} ({defs})")).map_err(map_err)?;
+                let run = || -> Result<()> {
+                    {
+                        let mut app = c.appender_to_catalog_and_db(&temp, "temp", "main").map_err(map_err)?;
+                        app.append_record_batch(rows).map_err(map_err)?;
+                        app.flush().map_err(map_err)?;
+                    }
+                    c.execute_batch(&insert).map_err(map_err)
+                };
+                let r = run();
+                let _ = c.execute_batch(&format!("DROP TABLE IF EXISTS temp.main.{temp}"));
+                r
+            })
+            .await;
+        stop.abort();
+        if cancel.is_cancelled() {
+            return Err(ConnectorError::cancelled());
+        }
+        r.map(|()| Some(n))
+    }
+
+    fn append_rows_possible(&self) -> bool {
+        true
+    }
+
+    /// The pairs DuckDB's casts convert differently from an INSERT's
+    /// literal ([`appender_refused`]), from the table's column types.
+    async fn append_rows_refused(
+        &self,
+        table: &str,
+        columns: &[String],
+        schema: &databrain_connector_core::arrow::datatypes::SchemaRef,
+    ) -> Result<Option<String>> {
+        let sql = format!("DESCRIBE SELECT * FROM {}", databrain_connector_core::quote_path(ConnectorKind::Duckdb, table));
+        let types: Vec<(String, String)> =
+            self.strings(sql, vec![]).await?.into_iter().filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?))).collect();
+        for (f, c) in schema.fields().iter().zip(columns) {
+            // DuckDB's names are case-insensitive.
+            let target = types.iter().find(|(n, _)| n == c).or_else(|| types.iter().find(|(n, _)| n.eq_ignore_ascii_case(c)));
+            if let Some(why) = target.and_then(|(_, t)| appender_refused(f, t)) {
+                return Ok(Some(format!("{c}: {why}")));
+            }
+        }
+        Ok(None)
+    }
+
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
         let sql = stmt.sql();
         let state = self.state.clone();
@@ -473,6 +561,33 @@ impl DuckSession {
     }
 }
 
+/// Why a value of Arrow type `source` doesn't go through the appender into
+/// a column of DuckDB type `target`: the appender's cast would write
+/// something other than the INSERT's literal. Floats are cast as binary
+/// floats (a double `2.5` into an INTEGER rounds half to even, `1.005` into
+/// DECIMAL(5,2) is `1.00`; a FLOAT `0.1` into a DOUBLE is `0.100000001…`),
+/// where the literal's decimal text rounds half away from zero; an instant
+/// with a time zone into anything but TIMESTAMPTZ is converted in the
+/// session's time zone, where the literal carries its offset; an exact
+/// decimal carried as text is a number literal (`00123.50` into VARCHAR is
+/// `123.50`), so it goes only into number columns, which read the text alike.
+pub(crate) fn appender_refused(f: &databrain_connector_core::arrow::datatypes::Field, target: &str) -> Option<String> {
+    use databrain_connector_core::arrow::datatypes::DataType as D;
+    let t = target.trim().to_ascii_uppercase();
+    let source = f.data_type();
+    if databrain_connector_core::value::is_decimal_text(f) {
+        let number = t.starts_with("DECIMAL") || matches!(t.as_str(), "DOUBLE" | "FLOAT" | "HUGEINT" | "BIGINT" | "INTEGER" | "SMALLINT" | "TINYINT");
+        return (!number).then(|| format!("a decimal as text into {target} would be written as text, not as the number the INSERT writes"));
+    }
+    let fine = match source {
+        D::Float64 => matches!(t.as_str(), "DOUBLE" | "FLOAT" | "VARCHAR"),
+        D::Float32 => matches!(t.as_str(), "FLOAT" | "VARCHAR"),
+        D::Timestamp(_, Some(_)) => t == "TIMESTAMP WITH TIME ZONE",
+        _ => true,
+    };
+    (!fine).then(|| format!("{source} into {target} would be converted differently from an INSERT's value"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +625,41 @@ mod tests {
         let e = tokio::time::timeout(t, running.collect()).await.expect("stopped quickly").unwrap_err();
         assert!(e.is_cancelled(), "{e:?}");
         assert_eq!(tokio::time::timeout(t, q(&*s, "select 1")).await.expect("no hang").num_rows(), 1, "still usable");
+    }
+
+    /// The appender is refused for the pairs its casts convert differently
+    /// from an INSERT's literal, read from the table's column types.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn appender_refuses_pairs_converted_differently() {
+        use databrain_connector_core::arrow::datatypes::{DataType as D, Field, Schema, TimeUnit};
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        q(&*s, "create table \"T\" (i integer, d decimal(5,2), f float, x double, v varchar, ts timestamp, tz timestamptz, tm time)").await;
+        let schema = |dt: D| Arc::new(Schema::new(vec![Field::new("c", dt, true)]));
+        let tz = D::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        for (dt, col) in [(D::Float64, "i"), (D::Float64, "d"), (D::Float32, "x"), (D::Float32, "D"), (tz.clone(), "ts"), (tz.clone(), "v"), (tz.clone(), "tm")]
+        {
+            let why = s.append_rows_refused("T", &[col.into()], &schema(dt.clone())).await.unwrap();
+            assert!(why.as_deref().is_some_and(|w| w.starts_with(&format!("{col}: "))), "{dt:?} into {col}: {why:?}");
+        }
+        for (dt, col) in [
+            (D::Float64, "x"),
+            (D::Float64, "f"),
+            (D::Float64, "v"),
+            (D::Float32, "f"),
+            (D::Float32, "V"),
+            (tz, "tz"),
+            (D::Int64, "x"),
+            (D::Decimal128(38, 10), "i"),
+        ] {
+            assert_eq!(s.append_rows_refused("T", &[col.into()], &schema(dt.clone())).await.unwrap(), None, "{dt:?} into {col}");
+        }
+        // An exact decimal carried as text (`numeric` from another database).
+        let decimal_text = Arc::new(Schema::new(vec![
+            Field::new("c", D::Utf8, true).with_metadata([(databrain_connector_core::value::META_DB_TYPE.to_string(), "numeric(12,2)".to_string())].into()),
+        ]));
+        assert!(s.append_rows_refused("T", &["v".into()], &decimal_text).await.unwrap().is_some(), "decimal text into varchar");
+        assert_eq!(s.append_rows_refused("T", &["d".into()], &decimal_text).await.unwrap(), None, "decimal text into decimal");
+        assert_eq!(s.append_rows_refused("T", &["v".into()], &schema(D::Utf8)).await.unwrap(), None, "text into varchar");
     }
 
     /// The interrupt reaches a statement only while it holds the connection.
