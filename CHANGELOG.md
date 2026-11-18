@@ -23,6 +23,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- **Oracle reads with the thin driver were slow on wide tables:** the helper left go-ora to guess how many rows to fetch per round trip from each column's declared width, so a table with a few `VARCHAR2(4000)` columns came a handful of rows at a time (about 1,200 rows/s over a network). Queries now fetch 1,000 rows per round trip (helper 0.1.6): 50,000 rows of eight `VARCHAR2(4000)` columns went from 31,000 to 269,000 rows/s on a local server, and much more over a network. `PREFETCH_ROWS` in the connection's driver options still sets another number.
+
 - **Job progress on large tables:** a load step reading a large step's result (one kept on disk) showed rows written out of a total of 0, and a step's SQL showed only "Running…" while it read. The step now shows rows read so far while its SQL runs, then rows written out of the total with the rate and the time left, and "all rows sent, waiting for the database to finish" while a commit, COPY INTO or load job runs.
 - Job load steps say how the target database bulk loads (COPY, bulk copy, the appender, TabSeparated, array binds, staged files, load jobs) instead of always PostgreSQL's COPY, and show the connection setting a bulk load needs (Databricks' staging volume, BigQuery load jobs, Snowflake array binds) with its current value, to set or change it there; it is saved in the connection.
 - DuckDB: binary values loaded by INSERTs (job loads, "Load into…", test data) or saved from a grid edit were written as the text of their hex (`X'00ff'` is text in DuckDB): they are now the bytes (`from_hex('00ff')`).

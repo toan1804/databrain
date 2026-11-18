@@ -28,7 +28,10 @@ pub const PROTOCOL: &str = "1";
 ///        after a block or CALL (`output` in the exec reply).
 /// 0.1.5: `execmany`, one INSERT with every row's values bound as arrays
 ///        (array DML) for loads.
-pub const RELEASE: &str = "0.1.5";
+/// 0.1.6: queries fetch 1,000 rows a round trip (PREFETCH_ROWS), not
+///        go-ora's guess from the declared column widths (a few rows for
+///        tables of VARCHAR2(4000) columns: about 1,000 rows/s over a network).
+pub const RELEASE: &str = "0.1.6";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].

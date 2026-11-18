@@ -290,3 +290,29 @@ func TestAnOversizedRequestIsRefusedAndTheHelperGoesOn(t *testing.T) {
 	}
 	inW.Close()
 }
+
+// Queries fetch a fixed number of rows per round trip, not go-ora's guess
+// from the declared column widths (a few rows for wide tables); a
+// connection's own PREFETCH_ROWS is kept.
+func TestQueriesFetchManyRowsPerRoundTrip(t *testing.T) {
+	for _, r := range []*request{
+		{Host: "db", Service: "S", User: "u", Password: "p"},
+		{ConnectString: "db:1522/S", User: "u", Password: "p"},
+		{ConnectString: "(DESCRIPTION=(ADDRESS=(HOST=db)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=S)))", User: "u", Password: "p"},
+	} {
+		u, err := dsn(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(strings.ToUpper(u), "PREFETCH_ROWS=1000") {
+			t.Errorf("%+v: %s", r, u)
+		}
+	}
+	u, err := dsn(&request{Host: "db", Service: "S", User: "u", Password: "p", Options: map[string]string{"prefetch_rows": "50"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.ToUpper(u), "PREFETCH_ROWS=50") || strings.Contains(u, "1000") {
+		t.Errorf("the connection's own value: %s", u)
+	}
+}
