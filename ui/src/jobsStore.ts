@@ -37,8 +37,9 @@ interface JobsState {
   seen: Record<number, true>;
   /**
    * Work the user hid from the activity bar (×) while it ran: `run:<id>`,
-   * or `bg:<job id>` for the background runner's. It comes back when new
-   * work starts or a hidden run fails.
+   * or `bg:<job id>` for the background runner's. Per run: new work shows
+   * in the bar without bringing these back, and a hidden run that fails
+   * shows its failure there (outcomes go by `barDismissed`).
    */
   barHidden: Record<string, true>;
   /** Finished runs whose outcome left the bar (dismissed, or shown a while). */
@@ -154,12 +155,9 @@ export const useJobs = create<JobsState>((set, get) => ({
         const saved = j.last_run;
         if (cur?.status === "running" && saved && saved.id >= cur.id && saved.status !== "running" && !live.has(j.id)) runs[j.id] = saved;
       }
-      // A run the background runner just started is new work: the bar comes back.
-      const started = (elsewhere ?? []).some((id) => !s.elsewhere[id]);
       return {
         jobs,
         runs,
-        ...(started ? { barHidden: {} } : {}),
         elsewhere: Object.fromEntries((elsewhere ?? []).map((id) => [id, true])),
         running: {
           ...Object.fromEntries(Object.entries(runs).filter(([, r]) => r.status === "running").map(([id]) => [id, true])),
@@ -345,8 +343,9 @@ export function runEvent({ job_id, run }: { job_id: string; run: JobRun }) {
   useJobs.setState((s) => ({
     runs: { ...s.runs, [job_id]: run },
     running: { ...s.running, [job_id]: run.status === "running" },
-    ...(isNew ? { seen: { ...s.seen, [run.id]: true as const }, barHidden: {} } : {}),
-    ...(run.status === "error" && wasHidden ? { barHidden: {} } : {}),
+    ...(isNew ? { seen: { ...s.seen, [run.id]: true as const } } : {}),
+    // Ended: its key goes (the outcome is kept or dismissed below).
+    ...(run.status !== "running" && wasHidden ? { barHidden: Object.fromEntries(Object.entries(s.barHidden).filter(([k]) => k !== key)) } : {}),
     ...(run.status !== "running" && (inView || (wasHidden && run.status !== "error")) ? { barDismissed: { ...s.barDismissed, [run.id]: true as const } } : {}),
   }));
   const seen = !!useJobs.getState().seen[run.id];

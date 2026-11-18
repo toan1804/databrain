@@ -116,7 +116,7 @@ describe("the activity bar", () => {
     }
   });
 
-  it("hides with ×: a hidden success is a toast, a hidden failure and new work bring it back", () => {
+  it("hides with ×, per run: a hidden success is a toast, a hidden failure shows, new work shows alone", () => {
     const toasts: string[] = [];
     const orig = useStore.getState().toast;
     useStore.setState({ toast: (m: string) => void toasts.push(m) });
@@ -126,25 +126,37 @@ describe("the activity bar", () => {
       setRun(run("running", [loading], { id: 2, job_id: "k" }));
       act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
       expect(bar()).toBeNull();
+      // New work: it shows, the hidden runs don't.
+      setRun(run("running", [loading], { id: 3, job_id: "f" }));
+      expect(bar()!.textContent).toContain("Job · load_orders");
+      expect(bar()!.textContent).not.toContain("jobs running");
+      act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
       // Hidden and succeeded: a toast, the bar stays away.
       setRun(run("success", [node("a", "success")], { finished_at: 60_000 }));
       expect(bar()).toBeNull();
       expect(toasts).toEqual(['Job "Nightly sales": Finished in 1m 0s · 1 step']);
-      // Hidden and failed: back, with the failure (and what still runs).
+      // Hidden and failed: its failure shows, the other hidden run doesn't.
       setRun(run("error", [node("a", "error", { error: "disk full" })], { id: 2, job_id: "k", finished_at: 5 }));
       expect(screen.getByRole("alert", { name: "Job Hourly" })).toBeTruthy();
-      act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
-      expect(bar()).toBeNull();
-      // New work: back.
-      setRun(run("running", [loading], { id: 4 }));
-      expect(bar()!.textContent).toContain("Nightly sales");
+      expect(bar()!.textContent).not.toContain("running");
       // The Jobs icon or the command palette show what was hidden.
-      act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
       act(() => useJobs.getState().showBar());
-      expect(bar()).not.toBeNull();
+      expect(bar()!.textContent).toContain("Job · load_orders");
     } finally {
       useStore.setState({ toast: orig });
     }
+  });
+
+  it("drops a failure once its job's tab is shown, however it was opened", () => {
+    render(<ActivityBar />);
+    setRun(run("running", [loading]));
+    setRun(run("error", [node("load_orders", "error", { error: "disk full" })], { finished_at: 5 }));
+    expect(screen.getByRole("alert", { name: "Job Nightly sales" })).toBeTruthy();
+    act(() => useStore.setState({ tabs: [...useStore.getState().tabs, { id: "t2", title: "Nightly sales", sql: "", connection_id: null, job_id: "j" } as never], activeTabId: "t2" }));
+    expect(bar()).toBeNull();
+    // Back in the editor: it doesn't come back.
+    act(() => useStore.setState({ activeTabId: "t1" }));
+    expect(bar()).toBeNull();
   });
 });
 

@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, ExternalLink, Loader2, Square, Workflow, X, XCircle } from "lucide-react";
 import { useJobs } from "../jobsStore";
+import { useStore } from "../store";
 import type { JobRun } from "../lib/types";
 import { ProgressBar, runLine } from "./job/shared";
 
@@ -32,6 +33,7 @@ export function ActivityBar() {
   const hidden = useJobs((s) => s.barHidden);
   const dismissed = useJobs((s) => s.barDismissed);
   const [open, setOpen] = useState(false);
+  const shownJob = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.job_id ?? null);
   const [now, setNow] = useState(Date.now());
   const name = (id: string) => jobs.find((j) => j.id === id)?.name ?? "Job";
   const list = Object.values(runs);
@@ -50,6 +52,12 @@ export function ActivityBar() {
   useEffect(() => {
     if (!running.length) setOpen(false);
   }, [running.length]);
+  // A run that ended is seen once its job's tab is shown, however it was
+  // opened (the bar, the sidebar, the tab bar): its outcome leaves the bar.
+  const endedInView = shownJob ? ended.find((r) => r.job_id === shownJob)?.id : undefined;
+  useEffect(() => {
+    if (endedInView != null) useJobs.getState().dismissRun(endedInView);
+  }, [endedInView]);
   const hide = () => {
     const st = useJobs.getState();
     st.hideBar(running.map((r) => r.key));
