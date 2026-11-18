@@ -246,26 +246,77 @@ pub fn notify(title: &str, body: &str) {
 /// A desktop notification; `failed` picks the icon where the OS shows one
 /// (Windows). Blocks for a while on Windows (the balloon's lifetime).
 pub fn notify_as(title: &str, body: &str, failed: bool) {
-    let _ = if cfg!(target_os = "macos") {
-        let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        std::process::Command::new("osascript").args(["-e", &format!("display notification \"{}\" with title \"{}\"", q(body), q(title))]).output()
+    let mut cmd = if cfg!(target_os = "macos") {
+        mac_notify(title, body)
     } else if cfg!(windows) {
-        let q = |s: &str| s.replace('\'', "''");
-        let ps = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(10000, '{}', '{}', '{}'); Start-Sleep -Seconds 10; $n.Dispose()",
-            q(title),
-            q(body),
-            if failed { "Error" } else { "Info" }
-        );
-        std::process::Command::new("powershell").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps]).output()
+        windows_notify(title, body, failed)
     } else {
-        std::process::Command::new("notify-send").args(["--app-name=DataBrain", title, body]).output()
+        linux_notify(title, body)
     };
+    let _ = cmd.output();
+}
+
+// The title and body are never written into script text: they come from
+// a database's error message, and a quote the script's own quoting misses
+// (PowerShell also ends a '…' string at ‘ ’ ‚ ‛) would run what follows.
+// They go as arguments (osascript's `argv`, notify-send's after `--`) or
+// environment variables (PowerShell), which no shell parses.
+
+const TITLE_VAR: &str = "DATABRAIN_NOTIFY_TITLE";
+const BODY_VAR: &str = "DATABRAIN_NOTIFY_BODY";
+
+fn mac_notify(title: &str, body: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("osascript");
+    c.args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run", title, body]);
+    c
+}
+
+fn windows_notify(title: &str, body: &str, failed: bool) -> std::process::Command {
+    let icon = if failed { "Error" } else { "Info" };
+    let ps = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(10000, $env:{TITLE_VAR}, $env:{BODY_VAR}, '{icon}'); Start-Sleep -Seconds 10; $n.Dispose()"
+    );
+    let mut c = std::process::Command::new("powershell");
+    c.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps]).env(TITLE_VAR, title).env(BODY_VAR, body);
+    c
+}
+
+fn linux_notify(title: &str, body: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("notify-send");
+    // `--`: a title or body starting with `-` isn't an option.
+    c.args(["--app-name=DataBrain", "--", title, body]);
+    c
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title or body with quotes of any kind (an error message from a
+    /// database) is never part of the script text: it can't end a string
+    /// and run a command. Allowed: the text reaches the notification whole.
+    #[test]
+    fn notification_text_never_becomes_script() {
+        let evil = "disk full\u{2019}; Remove-Item -Recurse C:\\; \u{2019}' \"; do shell script \"rm -rf ~\" --\"";
+        let args = |c: &std::process::Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let env = |c: &std::process::Command, k: &str| c.get_envs().find(|(n, _)| *n == k).and_then(|(_, v)| v).map(|v| v.to_string_lossy().into_owned());
+
+        let w = windows_notify("Job \u{2018}x\u{2019} failed", evil, true);
+        let script = args(&w).join(" ");
+        assert!(!script.contains("disk full") && !script.contains("Remove-Item") && !script.contains("Job"), "{script}");
+        assert!(script.contains("$env:DATABRAIN_NOTIFY_TITLE") && script.contains("'Error'"), "{script}");
+        assert_eq!(env(&w, TITLE_VAR).as_deref(), Some("Job \u{2018}x\u{2019} failed"));
+        assert_eq!(env(&w, BODY_VAR).as_deref(), Some(evil));
+        assert!(args(&windows_notify("t", "b", false)).join(" ").contains("'Info'"));
+
+        let m = args(&mac_notify("Job x failed", evil));
+        // The script is the three -e lines; the text comes after them, as argv.
+        assert!(m[..6].iter().all(|a| !a.contains("disk full")), "{m:?}");
+        assert_eq!(&m[6..], ["Job x failed", evil]);
+
+        let l = args(&linux_notify("-t", evil));
+        assert_eq!(l, ["--app-name=DataBrain", "--", "-t", evil]);
+    }
 
     #[test]
     fn os_entries_run_the_runner_every_minute() {

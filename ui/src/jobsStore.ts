@@ -33,6 +33,8 @@ interface JobsState {
   elsewhere: Record<string, boolean>;
   /** Log lines of runs seen live in this session, by run id. */
   logs: Record<number, RunLogEntry[]>;
+  /** Runs seen running in this window (the jobs tray follows them; their end is told). */
+  seen: Record<number, true>;
   refresh: () => Promise<void>;
   init: () => Promise<void>;
   open: (id: string, name: string) => void;
@@ -50,12 +52,13 @@ interface JobsState {
 }
 
 let started = false;
-/** Scheduled runs already announced ("Starting job …"). */
-const announced = new Set<number>();
 /** Finished runs whose notices were shown. */
 const noticed = new Set<number>();
-/** Runs seen running in this window: their end may be told on the desktop. */
-const watched = new Set<number>();
+/** Finished runs whose end was told on the desktop. */
+const told = new Set<number>();
+
+/** Notification text past this is cut (a server's error can be pages long). */
+export const NOTIFY_MAX = 200;
 
 /**
  * Tell on the desktop that a run ended, when the window isn't focused (the
@@ -66,14 +69,21 @@ export function notifyIfAway(jobs: JobSummary[], run: JobRun, focused: boolean) 
   if (focused) return;
   const name = jobs.find((j) => j.id === run.job_id)?.name ?? "A job";
   const how = run.status === "success" ? "finished" : run.status === "cancelled" ? "stopped" : "failed";
-  void api.notifyJobRun(`Job "${name}" ${how}`, runLine(run, Date.now()), run.status === "error").catch(() => {});
+  const line = runLine(run, Date.now());
+  const body = line.length > NOTIFY_MAX ? `${line.slice(0, NOTIFY_MAX - 1)}…` : line;
+  void api.notifyJobRun(`Job "${name}" ${how}`, body, run.status === "error").catch(() => {});
 }
 
-export function announceScheduled(jobs: JobSummary[], run: JobRun) {
-  if (run.trigger !== "schedule" || run.status !== "running" || announced.has(run.id)) return;
-  announced.add(run.id);
-  const name = jobs.find((j) => j.id === run.job_id)?.name ?? "a scheduled job";
-  useStore.getState().toast(`Starting scheduled job "${name}"…`, "info");
+/**
+ * The toast for a failed scheduled or "run after" run, when the jobs tray
+ * has no card for it (it never was seen running here). A run seen running
+ * has its card (or its tab shown), which says it already.
+ */
+export function failureToast(jobs: JobSummary[], run: JobRun, seen: boolean): string | null {
+  if (seen || run.status !== "error" || !(run.trigger === "schedule" || run.trigger.startsWith("after:"))) return null;
+  const name = jobs.find((j) => j.id === run.job_id)?.name ?? "A job";
+  const what = run.trigger === "schedule" ? `Scheduled job "${name}" failed` : `"${name}" (run after "${run.trigger.slice(6)}" succeeded) failed`;
+  return `${what}: ${run.error ?? "see its runs"}`;
 }
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -106,6 +116,7 @@ export const useJobs = create<JobsState>((set, get) => ({
   running: {},
   elsewhere: {},
   logs: {},
+  seen: {},
   refresh: async () => {
     if (!isTauri()) return;
     const { jobs, running, elsewhere } = await api.listJobs();
@@ -142,10 +153,16 @@ export const useJobs = create<JobsState>((set, get) => ({
       }),
     );
     await onJobRun(({ job_id, run }) => {
-      set((s) => ({ runs: { ...s.runs, [job_id]: run }, running: { ...s.running, [job_id]: run.status === "running" } }));
-      announceScheduled(get().jobs, run);
-      if (run.status === "running") watched.add(run.id);
-      else if (watched.delete(run.id)) notifyIfAway(get().jobs, run, typeof document === "undefined" || document.hasFocus());
+      set((s) => ({
+        runs: { ...s.runs, [job_id]: run },
+        running: { ...s.running, [job_id]: run.status === "running" },
+        ...(run.status === "running" && !s.seen[run.id] ? { seen: { ...s.seen, [run.id]: true as const } } : {}),
+      }));
+      const seen = !!get().seen[run.id];
+      if (run.status !== "running" && seen && !told.has(run.id)) {
+        told.add(run.id);
+        notifyIfAway(get().jobs, run, typeof document === "undefined" || document.hasFocus());
+      }
       if (run.status !== "running") {
         // Tell what a step did that the user didn't set up by hand (a created table).
         if (!noticed.has(run.id)) {
@@ -155,11 +172,8 @@ export const useJobs = create<JobsState>((set, get) => ({
         // Next run time and last status in the list.
         clearTimeout(refreshTimer);
         refreshTimer = setTimeout(() => void get().refresh().catch(() => {}), 200);
-        if ((run.trigger === "schedule" || run.trigger.startsWith("after:")) && run.status === "error") {
-          const name = get().jobs.find((j) => j.id === job_id)?.name ?? "A job";
-          const what = run.trigger === "schedule" ? `Scheduled job "${name}" failed` : `"${name}" (run after "${run.trigger.slice(6)}" succeeded) failed`;
-          useStore.getState().toast(`${what}: ${run.error ?? "see its runs"}`, "error");
-        }
+        const failed = failureToast(get().jobs, run, seen);
+        if (failed) useStore.getState().toast(failed, "error");
       }
     });
     // Runs of the background runner (another process) send no events: look
@@ -170,8 +184,16 @@ export const useJobs = create<JobsState>((set, get) => ({
       window.addEventListener("focus", () => void get().refresh().catch(() => {}));
     }
     await get().refresh();
-    // Scheduled runs started at launch, before this listener existed.
-    for (const j of get().jobs) if (j.last_run && get().running[j.id]) announceScheduled(get().jobs, j.last_run);
+    // Runs started at launch (a scheduled one), before this listener
+    // existed: the jobs tray follows them too.
+    set((s) => {
+      const started = get().jobs.flatMap((j) => (j.last_run?.status === "running" && s.running[j.id] && !s.runs[j.id] ? [j.last_run] : []));
+      if (!started.length) return {};
+      return {
+        runs: { ...s.runs, ...Object.fromEntries(started.map((r) => [r.job_id, r])) },
+        seen: { ...s.seen, ...Object.fromEntries(started.map((r) => [r.id, true as const])) },
+      };
+    });
   },
   open: (id, name) => {
     const st = useStore.getState();

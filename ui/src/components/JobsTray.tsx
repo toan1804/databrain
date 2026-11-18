@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, ExternalLink, Loader2, Square, Workflow, X, XCircle } from "lucide-react";
 import { useJobs } from "../jobsStore";
 import { useStore } from "../store";
 import type { JobRun } from "../lib/types";
 import { ProgressBar, runLine } from "./job/shared";
 
-/** A finished run's card goes away by itself after this long (failed and stopped ones stay). */
+/** A successful run's card goes away by itself after this long (failed and stopped ones stay). */
 export const DONE_CARD_MS = 15_000;
 
 /**
@@ -21,23 +21,13 @@ export function JobsTray() {
   const here = useJobs((s) => s.running);
   const shownJob = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.job_id ?? null);
   const [dismissed, setDismissed] = useState<ReadonlySet<number>>(new Set());
-  // Runs seen running in this session: a finished run gets a card only if
-  // it was (not the last run of every job when the app starts).
-  const [seen, setSeen] = useState<ReadonlySet<number>>(new Set());
+  // Runs seen running in this window (kept by the store as the events
+  // come): a finished run gets a card only if it was, not the last run of
+  // every job when the app starts.
+  const seen = useJobs((s) => s.seen);
   const [now, setNow] = useState(Date.now());
   const list = Object.values(runs);
-  const runningKey = list
-    .filter((r) => r.status === "running")
-    .map((r) => r.id)
-    .join(",");
-  useEffect(() => {
-    if (!runningKey) return;
-    setSeen((s) => {
-      const ids = runningKey.split(",").map(Number);
-      return ids.every((id) => s.has(id)) ? s : new Set([...s, ...ids]);
-    });
-  }, [runningKey]);
-  const anyRunning = runningKey !== "";
+  const anyRunning = list.some((r) => r.status === "running");
   useEffect(() => {
     if (!anyRunning) return;
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -49,17 +39,8 @@ export function JobsTray() {
     const r = shownJob ? runs[shownJob] : undefined;
     if (r && r.status !== "running" && !dismissed.has(r.id)) setDismissed((d) => new Set(d).add(r.id));
   }, [shownJob, runs, dismissed]);
-  // A successful run's card goes after a while.
-  const doneIds = list.filter((r) => r.status === "success" && seen.has(r.id) && !dismissed.has(r.id)).map((r) => r.id);
-  const doneKey = doneIds.join(",");
-  useEffect(() => {
-    if (!doneKey) return;
-    const ids = doneKey.split(",").map(Number);
-    const t = setTimeout(() => setDismissed((d) => new Set([...d, ...ids])), DONE_CARD_MS);
-    return () => clearTimeout(t);
-  }, [doneKey]);
   const cards = list
-    .filter((r) => r.job_id !== shownJob && seen.has(r.id) && !dismissed.has(r.id))
+    .filter((r) => r.job_id !== shownJob && seen[r.id] && !dismissed.has(r.id))
     .sort((a, b) => a.started_at - b.started_at);
   if (cards.length === 0) return null;
   return (
@@ -82,6 +63,16 @@ export function JobsTray() {
 function JobCard({ run, name, now, stoppable, onDismiss }: { run: JobRun; name: string; now: number; stoppable: boolean; onDismiss: () => void }) {
   const [stopping, setStopping] = useState(false);
   const running = run.status === "running";
+  // A successful run's card goes after a while, each on its own clock.
+  const dismissLater = useRef(onDismiss);
+  dismissLater.current = onDismiss;
+  const succeeded = run.status === "success";
+  useEffect(() => {
+    if (!succeeded) return;
+    const t = setTimeout(() => dismissLater.current(), DONE_CARD_MS);
+    return () => clearTimeout(t);
+  }, [succeeded]);
+  const line = runLine(run, now);
   const step = running ? run.nodes.find((n) => n.status === "running" && n.progress) : undefined;
   const open = () => {
     useJobs.getState().open(run.job_id, name);
@@ -109,8 +100,10 @@ function JobCard({ run, name, now, stoppable, onDismiss }: { run: JobRun; name: 
         )}
         <div className="min-w-0 flex-1 text-[12.5px]">
           <div className="truncate font-medium">{name}</div>
-          <div className={`text-[11.5px] ${run.status === "error" ? "break-words text-danger" : "truncate text-muted"}`} title={runLine(run, now)}>
-            {stopping && running ? "Stopping…" : runLine(run, now)}
+          {/* A server's error can be pages long: three lines here (all of it
+              on hover and in the job's tab), so Dismiss stays on screen. */}
+          <div className={`text-[11.5px] ${run.status === "error" ? "line-clamp-3 break-words text-danger" : "truncate text-muted"}`} title={line}>
+            {stopping && running ? "Stopping…" : line}
           </div>
         </div>
         {!running && (

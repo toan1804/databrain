@@ -18,12 +18,20 @@ const node = (name: string, status: string, extra = {}) => ({ node_id: name, nam
 const run = (status: JobRun["status"], nodes: JobRun["nodes"], extra: Partial<JobRun> = {}): JobRun => ({ id: 1, job_id: "j", trigger: "manual", started_at: 0, status, nodes, ...extra });
 const loading = node("load_orders", "running", { progress: { phase: "Inserting rows", done: 250_000, total: 1_000_000, elapsed_ms: 10_000 } });
 
+/** What the store does with a "job-run" event (it keeps the runs seen running). */
+function event(r: JobRun) {
+  useJobs.setState((s) => ({
+    runs: { ...s.runs, [r.job_id]: r },
+    running: { ...s.running, [r.job_id]: r.status === "running" },
+    seen: r.status === "running" ? { ...s.seen, [r.id]: true as const } : s.seen,
+  }));
+}
 function setRun(r: JobRun) {
-  act(() => useJobs.setState({ runs: { j: r }, running: { j: r.status === "running" } }));
+  act(() => event(r));
 }
 
 beforeEach(() => {
-  useJobs.setState({ jobs: [{ id: "j", name: "Nightly sales" } as never], runs: {}, running: {}, elsewhere: {} });
+  useJobs.setState({ jobs: [{ id: "j", name: "Nightly sales" } as never, { id: "k", name: "Hourly" } as never], runs: {}, running: {}, elsewhere: {}, seen: {} });
   useStore.setState({ tabs: [{ id: "t1", title: "Query", sql: "", connection_id: null } as never], activeTabId: "t1" });
 });
 
@@ -66,6 +74,44 @@ describe("the jobs tray", () => {
     expect(screen.queryByRole("status", { name: "Job Nightly sales" })).toBeNull();
   });
 
+  it("has a card for a run that started and failed between two renders", () => {
+    render(<JobsTray />);
+    act(() => {
+      event(run("running", [loading]));
+      event(run("error", [node("load_orders", "error", { error: "disk full" })], { finished_at: 5 }));
+    });
+    expect(screen.getByRole("alert", { name: "Job Nightly sales" }).textContent).toContain("disk full");
+  });
+
+  it("shows three lines of a long error (all of it on hover), so Dismiss stays reachable", () => {
+    render(<JobsTray />);
+    const long = "at org.apache.spark.SparkException ".repeat(200);
+    setRun(run("running", [loading]));
+    setRun(run("error", [node("load_orders", "error", { error: long })], { finished_at: 5 }));
+    const line = screen.getByRole("alert").querySelector(".line-clamp-3");
+    expect(line?.getAttribute("title")).toBe(`Failed at load_orders: ${long}`);
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
+  });
+
+  it("lets each successful run's card go on its own clock", () => {
+    vi.useFakeTimers();
+    try {
+      render(<JobsTray />);
+      setRun(run("running", [loading]));
+      setRun(run("running", [loading], { id: 2, job_id: "k" }));
+      setRun(run("success", [node("load_orders", "success")], { finished_at: 1 }));
+      act(() => vi.advanceTimersByTime(DONE_CARD_MS - 1_000));
+      setRun(run("success", [node("load_orders", "success")], { id: 2, job_id: "k", finished_at: 1 }));
+      act(() => vi.advanceTimersByTime(1_010));
+      expect(screen.queryByRole("status", { name: "Job Nightly sales" })).toBeNull();
+      expect(screen.getByRole("status", { name: "Job Hourly" })).toBeTruthy();
+      act(() => vi.advanceTimersByTime(DONE_CARD_MS));
+      expect(screen.queryByRole("status", { name: "Job Hourly" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("lets a successful run's card go by itself", () => {
     vi.useFakeTimers();
     try {
@@ -96,5 +142,10 @@ describe("the desktop notification", () => {
       ['Job "Nightly sales" failed', "Failed at load: disk full", true],
       ['Job "Nightly sales" finished', "Finished in 2m 0s · 1 step", false],
     ]);
+    // A server's long error is cut.
+    notifyIfAway(jobs, run("error", [node("load", "error", { error: "x".repeat(5_000) })], { finished_at: 1 }), false);
+    const body = (notify.mock.calls[2] as unknown as string[])[1];
+    expect(body.length).toBe(200);
+    expect(body.endsWith("…")).toBe(true);
   });
 });

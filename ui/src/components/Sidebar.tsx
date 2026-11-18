@@ -34,7 +34,8 @@ function ActivityRail() {
   const aiOpen = useAi((s) => s.open);
   const setAiOpen = useAi((s) => s.setOpen);
   const scheduled = useJobs((s) => s.jobs.filter((j) => j.schedule.enabled).length);
-  const runningJobs = useJobs((s) => Object.values(s.runs).filter((r) => r.status === "running").length);
+  // Run by the app, or by the background runner (another process).
+  const runningJobs = useJobs((s) => new Set([...Object.values(s.runs).filter((r) => r.status === "running").map((r) => r.job_id), ...Object.keys(s.elsewhere).filter((id) => s.elsewhere[id])]).size);
   const item = (p: SidebarPanel, icon: ReactNode, label: string, dot = false, dotClass = "bg-danger") => (
     <button
       key={p}
