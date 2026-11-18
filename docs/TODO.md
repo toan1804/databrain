@@ -75,7 +75,7 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 ## Jobs (improvements of 2026-11-16)
 
 - **The assistant's job tools** set only an interval or one daily time: not several times, monthly, cron, a time zone, the missed-run policy, "run after", limits, retries or an incremental column.
-- **Bulk loads** exist for PostgreSQL (`COPY`) and Databricks (Parquet in a staging volume, one `INSERT … SELECT`). Not done: MySQL `LOAD DATA LOCAL` (it turns conversion errors into warnings and truncates where an INSERT fails, and `local_infile` is off by default), ClickHouse native/RowBinary, Snowflake staged files. BigQuery load jobs exist behind a connection option (beta).
+- **Bulk loads:** every target has its fast path now; what is left per database is in "Loads into other databases" below. Not planned: MySQL `LOAD DATA LOCAL` (it turns conversion errors into warnings and truncates where an INSERT fails, and `local_infile` is off by default), Snowflake staged files (array binds instead).
 - **Databricks bulk loads:** files are uploaded one at a time (not in parallel); a load stopped by a crash or a killed app leaves its `databrain-load-…` folder in the staging volume (deleted on failure and Stop otherwise); columns whose cast isn't the INSERT literal's (text into a number column, a timestamp into a DATE) send the whole step by INSERTs rather than casting those columns another way.
 - **`INSERT … SELECT` on the server** (a load whose rows come from a query on the same connection, without passing through DataBrain) was tried and dropped: it runs the query again after the load's own DELETE/DROP and before SQL (a Replace of a table from itself empties it), loads rows other than the step's (volatile functions, `LIMIT` without `ORDER BY`, a capped result), and Postgres refuses text into typed columns the INSERT path takes. Only as an explicit opt-in, plain inserts, no before SQL, and a query that provably doesn't read the target.
 - **No retry test with a load** that fails with a connection error midway; the decision is unit-tested (`reads_only`, `retryable`, `load_retry_refused`, `kept_nothing`), and what a failed load reports is tested on SQLite (rolled back, before SQL that may commit, failed before writing). A failed commit and a database without transactions are tested only through `kept_nothing`.
@@ -87,34 +87,119 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 - **chrono / chrono-tz are unmaintained** (RUSTSEC-2026-0543, -0555; ignored in `deny.toml`): DataBrain's own uses (job schedules and their time zones, `databrain-jobs`, export file names, the Neo4j, Oracle and Databricks connectors) could move to `jiff`, but arrow, parquet, neo4rs and russh keep chrono in the build, so it would add a crate without removing one. Revisit when arrow moves off chrono or a vulnerability is reported.
 - **Run date:** the step panel's `:run_date` examples for Snowflake, BigQuery and Databricks follow their documentation and aren't run against a live server (the others are, in `run_date_examples_give_what_they_say`); the assistant's `run_job` can't run for a given date (no `run_date` argument); a range of days ("run for 1–15 November") is one "Run for this date" per day; the `current_date` hint reads the step's SQL text only (not a parameter set's `{}` expressions such as `current_date - 1`); a queued "run after" start takes the date of the other job's latest success, which a newer run of it may have replaced meanwhile.
 
-## `dbr` command (idea, 2026-11-18)
+## `dbr` command (idea, 2026-11-18; flags 2026-11-19)
 
 A short command that opens files in DataBrain or queries from a terminal, for what DuckDB's own CLI can't do: DataBrain's file reading (Excel sheets, blank headers, Delta/Iceberg), its grid, charts, export and AI on the result, and its saved connections with their rules.
 
-- **`dbr data.parquet orders.xlsx`**: opens the app (or the window already running) with a tab per file, `select * from …` run on the local DuckDB connection, as "Query a local file…" does.
-- **`dbr report.sql`** (and double-click / "Open with" on a `.sql` file): opens it in a file tab, as ⌘O does (saved back with ⌘S, reloaded when changed outside); `--run` runs it, `-c "Sales PG"` picks its connection.
-- **`dbr query "<sql>" [files…]`**: runs in the terminal on the bundled DuckDB and prints a table, `--csv` or `--json`, for pipes.
-- **`dbr query -c "Sales PG" "<sql>"`**: any saved connection by name, with its credentials, read-only setting, production confirmation, PII masking and history; the part DuckDB's CLI can't do.
+One command, two flags decide where it runs and where the rows go:
 
-To build: a launcher like `databrain-mcp` / `databrain-jobs` (`dbr` → `databrain open …` / `databrain query …`; almost no app size); the single-instance plugin to pass "open these files" to a running window; a file association for `.sql` (and optionally `.parquet`, `.csv`) in `tauri.conf.json`; an "Install the `dbr` command" item (as VS Code's `code`), since the launchers aren't on PATH; and in the build without bundled DuckDB, a clear message when no DuckDB library is installed. Start with opening files and `.sql` in the app, then `query -c`; plain `query` only if it gets used.
+- **`-c, --conn <name>`**: the saved connection to run on (by name, any case; an unknown or ambiguous name lists the close ones and exits). Default: the local DuckDB (files), or the connection a `.sql` file was saved with.
+- **`-i, --inline`**: print the rows in the terminal instead of opening the app. Without it, `dbr` opens the app (or the running window) with a tab for each file or query.
+
+```
+dbr data.parquet orders.xlsx                 # app: a tab per file, select * from … on the local DuckDB
+dbr data.parquet -i                          # terminal: the first rows of the file
+dbr report.sql                               # app: the file in a file tab (⌘S saves it back)
+dbr report.sql -c "Sales PG" --run           # app: the file on Sales PG, run
+dbr -c "Sales PG" "select * from orders"     # app: a new tab on Sales PG with the query run
+dbr -c "Sales PG" -i "select count(*) from orders"
+                                             # terminal: the result as a table
+dbr -c sales_pg -i --csv "select …" > out.csv
+dbr -i "select * from 'data.parquet' where amount > 100"
+                                             # terminal: the local DuckDB (files in the SQL)
+```
+
+What the terminal mode does:
+
+```
+$ dbr -c "Sales PG" -i "select id, status, total from orders order by id"
+ id │ status │   total
+────┼────────┼────────
+  1 │ paid   │  120.50
+  2 │ open   │   35.00
+  … │ …      │       …
+100 rows shown of 48,213 (--limit 0 for all) · Sales PG · 182 ms
+```
+
+- **Output:** a table sized to the terminal (long cells cut with `…`, numbers right-aligned), up to `--limit` rows (100 by default; 0 for all). `--csv`, `--json` (lines) and `--tsv` print every row in that format and imply `--inline`. When stdout isn't a terminal (a pipe or a file), the default format is CSV, so `dbr -c x -i "…" | head` and `> out.csv` work.
+- **Rules:** the connection's own rules, as in the app. Read-only refuses writes. A production connection asks `Run on production "Sales PG"? [y/N]` (or refuses without a terminal, unless `--yes`). PII masking and the AI table rules don't apply (no AI), the table access rules do. Every run goes to the query history with origin `cli`.
+- **Statements:** several statements run in order; each that returns rows prints its own table (`-- statement 2 of 3` between them). Errors print the database's message and exit 1; Ctrl-C stops the statement on the server.
+- **`:name` parameters:** `-p name=value` (repeatable); a missing one is an error naming it (no prompts, so scripts don't hang).
+- **What an argument is:** an existing path is a file (`.sql` → its text; data files → read on DuckDB); anything else is SQL. `-e "<sql>"` forces SQL (a query that happens to be a file name).
+- **Exit codes:** 0 done, 1 the query failed, 2 bad arguments (unknown connection, missing parameter), 130 stopped.
+
+To build: a launcher like `databrain-mcp` / `databrain-jobs` (`dbr` → `databrain open …` / `databrain query …`; almost no app size); the single-instance plugin to pass "open these files" to a running window; a file association for `.sql` (and optionally `.parquet`, `.csv`) in `tauri.conf.json`; an "Install the `dbr` command" item (as VS Code's `code`), since the launchers aren't on PATH; and in the build without bundled DuckDB, a clear message when no DuckDB library is installed. The terminal mode reuses the engine the jobs runner uses (sessions, the safety checks, history), with no window. Order: open files and `.sql` in the app; then `-c … -i` (the part DuckDB's CLI can't do: saved connections with their credentials and rules); then the formats and parameters.
 
 ## Loads into other databases (review of 2026-11-17, checked against vendor docs)
 
-Every target but PostgreSQL (`COPY`) and Databricks (staged files, INSERTs 4 at once) loads with multi-row INSERTs, one after the other. In order of value for the work, with what the docs say may go wrong:
+Done (checked 2026-11-19): every target has its fast path. PostgreSQL `COPY`; Databricks Parquet files in a staging volume; ClickHouse `FORMAT TabSeparated`, 100,000 rows / 16 MB an INSERT; MySQL 5,000 rows / 3 MB, capped under the server's `max_allowed_packet`; Oracle array DML (both drivers, helper 0.1.5+); Snowflake array binds and BigQuery load jobs (both behind a connection setting, off by default); SQL Server bulk copy; DuckDB's appender. A column a fast path can't take as its INSERT would sends the step by INSERTs, with a warning on the step. Left, in order of value:
 
-- **ClickHouse, larger INSERTs** (done: 100,000 rows / 16 MB by default): each INSERT writes a new part, and small ones are slow and lead to "too many parts". `max_query_size` (256 KB) bounds the SQL text, not the rows streamed after `VALUES`. Watch: on Replicated tables `insert_deduplicate` is on by default and drops an INSERT whose block is identical to a recent one, so two batches with the same rows (a table loaded twice, identical data) are kept once; that is true today and doesn't depend on the batch size.
-- **ClickHouse body inserts** (done with `FORMAT TabSeparated`, which ClickHouse parses per column type as it does VALUES, so the table ends up the same): RowBinary would also skip the text parsing, but needs every value encoded as its column's exact binary type. The same deduplication applies.
-- **MySQL, larger defaults** (done: 5,000 rows / 3 MB, capped under the server's own `max_allowed_packet`, read when a load starts): `max_allowed_packet` is 64 MB by default on 8.0 but 4 MB on 5.7, often lower on hosted servers; a statement past it gets ER_NET_PACKET_TOO_LARGE and **the connection is closed**, so the split-on-too-large retry can't help there (and loads run in a transaction anyway), hence the cap.
-- **Oracle array binding** (done, both drivers; the thin helper 0.1.5's binaries must be uploaded to `oracle-agent/v0.1.5` before a build with it ships): it doesn't use batch-error mode (a call fails at its first bad row and keeps none), so an error names the call's rows, not the failing one. Loads used to send `INSERT ALL` of 100 rows (max 1,000), each a statement Oracle parses again: 2M rows was 20,000 statements. Batch-error mode would report per-row errors only with client and server 12.1+, and fails the call past too many error rows (OCI-38902). go-ora's open issues on NULLs in array binds don't hit the helper's `sql.NullString` arrays (tested live, a column of only NULLs included). Tested live against Oracle 23 Free on both drivers; not against older servers.
-- **BigQuery load jobs** (done behind the connection option "Load jobs for loads (beta)", off by default): newline-delimited JSON in one resumable upload, one job, `bq_fits` per column. Left: try it against a live project (the value equivalence is checked by reading BigQuery's JSON and literal rules, and the upload against a mock server, not against BigQuery; every upload request carries the token, which Google may not need past the first, and 429/5xx are resumed after a pause), then turn it on by default; a comparison test like `clickhouse_tsv_loads_write_what_inserts_do` gated on a BigQuery project; every load job (failed ones too) counts toward the per-table daily modification limit, so a job step that runs often can hit it.
-- **SQL Server, 1,000 rows per INSERT by default** (measured 2026-11-18, not adopted): on a 30-column table, 50,000 rows took 36.5 s in 1,000-row INSERTs and 30.3 s in 500-row ones, so 500 stays.
-- **SQL Server, more than 1,000 rows per statement:** `INSERT … SELECT … FROM (VALUES …) v(cols)` has no 1,000-row cap, but the cap exists to keep compile times sane: measure before adopting, it may be slower than 1,000-row INSERTs.
-- **SQL Server bulk copy** (done: tiberius 0.13's `bulk_insert_with_options` sends `WITH (CHECK_CONSTRAINTS, KEEP_NULLS, FIRE_TRIGGERS)`; the values are converted in `connectors/mssql/src/bulk.rs`). Columns still on INSERTs, as their literal converts differently or the server refuses the copy: a double into `real` or `decimal`, text into `varchar`/`char` (the `N'…'` literal maps to the code page with `?`), a decimal carried as text into `nvarchar` (the INSERT writes it as a number), `datetime`/`smalldatetime`/`money`, timestamps with more digits than the column, time zones with a changing offset, and `datetimeoffset` below scale 7 (the server answers "Invalid column attribute from bcp client"; check whether tiberius sends its metadata as the server expects).
-- **Snowflake array binding** (done, behind the connection's "Array binds for loads", off by default: turn it on by default once `snowflake_array_loads_write_what_inserts_do` has passed against a live account): typed binds (`FIXED`, `REAL`, `BOOLEAN`, `BINARY`, `TEXT`), 1 MB of values a call, under the login's `CLIENT_STAGE_ARRAY_BINDING_THRESHOLD`. "Array bind currently not supported for this query type" falls back to INSERTs; Snowflake publishes no error code for it, so the message is matched.
-- **DuckDB appender** (done: through a temporary table of the rows' types, then `INSERT … SELECT`, since the appender converts nothing): a few column types still go by INSERTs (`Date64`, nanosecond time zone timestamps, decimals over 38 digits, intervals, nested types), and so do floats into integer or decimal columns and zoned instants into anything but `TIMESTAMPTZ` (DuckDB's casts differ from the literal there; casting through the literal's text in the `SELECT` would let them through).
-- **Parallel INSERTs** fit only Databricks: the others load in one transaction on one session (PostgreSQL, MySQL, SQL Server, Snowflake, DuckDB, SQLite), where several sessions would give up the all-or-nothing load; Oracle gains more from array binding; ClickHouse wants bigger inserts, not more; BigQuery a load job.
+- **BigQuery load jobs:** try them against a live project (the value equivalence comes from BigQuery's JSON and literal rules, the upload is tested against a mock server; every upload request carries the token, which Google may not need past the first; 429/5xx are resumed after a pause), add a comparison test like `clickhouse_tsv_loads_write_what_inserts_do` gated on a project, then turn them on by default. Every load job (failed ones too) counts toward the table's daily modification limit, so a step that runs often can hit it.
+- **Snowflake array binds:** turn them on by default once `snowflake_array_loads_write_what_inserts_do` has passed against a live account. "Array bind currently not supported for this query type" falls back to INSERTs; Snowflake publishes no error code for it, so the message is matched.
+- **Oracle array DML:** no batch-error mode (a call fails at its first bad row and keeps none), so an error names the call's rows, not the failing one; batch-error mode reports per-row errors only with client and server 12.1+, and fails the call past too many error rows (OCI-38902). Tested live against Oracle 23 Free on both drivers, not older servers.
+- **SQL Server bulk copy, columns still on INSERTs** (their literal converts differently, or the server refuses the copy): a double into `real` or `decimal`, text into `varchar`/`char` (the `N'…'` literal maps to the code page with `?`), a decimal carried as text into `nvarchar`, `datetime`/`smalldatetime`/`money`, timestamps with more digits than the column, time zones with a changing offset, and `datetimeoffset` below scale 7 ("Invalid column attribute from bcp client": check whether tiberius sends its metadata as the server expects). Also: `INSERT … SELECT … FROM (VALUES …)` has no 1,000-row cap; measure it before using it (500-row INSERTs beat 1,000-row ones on a 30-column table: 30.3 s vs 36.5 s for 50,000 rows).
+- **DuckDB appender, columns still on INSERTs:** `Date64`, nanosecond time zone timestamps, decimals over 38 digits, intervals, nested types, floats into integer or decimal columns and zoned instants into anything but `TIMESTAMPTZ` (DuckDB's casts differ from the literal there; casting through the literal's text in the `SELECT` would let them through).
+- **Databricks staged files, columns still on INSERTs:** a timestamp into `DATE`, text into a number column (the user is warned and can cast; DataBrain doesn't convert).
+- **ClickHouse:** RowBinary would also skip the text parsing, but needs every value encoded as its column's exact binary type. Watch: on Replicated tables `insert_deduplicate` (on by default) drops an INSERT whose block is identical to a recent one, so the same rows loaded twice are kept once, whatever the batch size.
+
+Not planned: parallel INSERTs beyond Databricks (the others load in one transaction on one session, which several sessions would give up; Oracle gains more from arrays, ClickHouse from bigger inserts, BigQuery from a load job).
 
 Sources: ClickHouse [too many parts](https://clickhouse.com/docs/resources/support-center/knowledge-base/troubleshooting/exception-too-many-parts), [deduplication on retries](https://clickhouse.com/docs/guides/developer/deduplicating-inserts-on-retries); MySQL [packet too large](https://docs.oracle.com/cd/E17952_01/mysql-8.0-en/packet-too-large.html); [rust-oracle batch](https://github.com/kubo/rust-oracle/issues/29), [OCI-38902](https://docs.oracle.com/en/error-help/db/oci-38902), [go-ora issues](https://issues.ecosyste.ms/hosts/GitHub/repositories/sijms%2Fgo-ora/issues?page=2); BigQuery [quotas](https://docs.cloud.google.com/bigquery/quotas), [API uploads](https://docs.cloud.google.com/bigquery/docs/reference/api-uploads); SQL Server [table value constructor](https://learn.microsoft.com/sql/t-sql/queries/table-value-constructor-transact-sql), [triggers in bulk import](https://technet.microsoft.com/en-us/ms187640(v=sql.105)), [tiberius client source](https://docs.rs/tiberius/0.12.2/src/tiberius/client.rs.html); Snowflake [gosnowflake #540](https://github.com/snowflakedb/gosnowflake/issues/540), [ADBC driver](https://arrow.apache.org/adbc/15/driver/snowflake.html); DuckDB [appender](https://duckdb.org/docs/current/data/appender).
+
+## Table explorer (design, 2026-11-19)
+
+One tab per table that gathers what DataBrain knows and can read about it, as Databricks' Catalog Explorer and DBeaver's table editor do: sample rows, columns, DDL, statistics, relations, history and use, without writing a query. Today these are spread out (Show DDL, the ER diagram, Generate test data, the knowledge base's notes and learned joins, column stats in a result grid) or missing (table statistics, a column profile, partitions, Delta/time-travel history).
+
+**Opening it:** double-click a table or view in the explorer (today: inserts its name), right-click → "Open table", ⌘-click a table name in the editor, "Open table" in the command palette (search any indexed table), a table name in the AI panel. One tab per table: opening it again shows that tab.
+
+```
+┌ ▦ sales.orders · Sales PG ────────────────────────────────────────────────────── × ┐
+│ ▦ orders   table · sales · Sales PG  PROD    ~1.2M rows · 340 MB · changed 2 h ago  │
+│ Orders placed on the web shop (comment)                         [⟳] [★ Pin note]   │
+│ [▶ Query] [⇪ Load into…] [⤓ Export…] [✱ Test data…] [⇄ Compare…] [✦ Ask AI]          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│ Data · Columns 14 · DDL · Statistics · Relations 3 · Indexes 4 · History · Usage · Notes 2 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│ Sample  (•) First 100  ( ) Random 1,000  ( ) Last changed      Filter [status='paid'] ▶│
+│ ┌──────┬─────────────┬────────┬─────────┬────────────────────┐                     │
+│ │ id   │ customer_id │ status │   total │ created_at         │                     │
+│ ├──────┼─────────────┼────────┼─────────┼────────────────────┤                     │
+│ │ 1001 │ 77          │ paid   │  120.50 │ 2026-11-18 09:12   │  (the result grid:  │
+│ │ 1002 │ 12          │ open   │   35.00 │ 2026-11-18 09:15   │   sort, find, copy, │
+│ │ …    │             │        │         │                    │   column stats)     │
+│ └──────┴─────────────┴────────┴─────────┴────────────────────┘                     │
+│ 100 rows · 41 ms · select * from sales.orders where status='paid' limit 100  [Open in editor]│
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Header:** name, kind (table, view, materialized view, external/foreign, Delta, Iceberg), schema, connection with its tag (PROD/TEST), the row estimate and size the database keeps (no `count(*)`), last changed, the comment, and the actions DataBrain already has, preset to this table: Query (a new tab with `select * … limit 100`), Load into…, Export…, Generate test data…, Compare… (schema compare), Ask AI (the AI panel with the table as context).
+
+**Sub-tabs** (each loads when first shown; what a database can't say is "Not available on Snowflake" with why, not hidden):
+
+- **Data:** sample rows in the result grid. First 100 (`LIMIT`/`TOP`/`FETCH FIRST`), random (`TABLESAMPLE` / `SAMPLE` / `ORDER BY random()` where cheap; only where the database samples without a full scan), or last changed (an `updated_at`-like column if there is one). A filter box (a `WHERE` condition, checked as a read), row limit, Open in editor. A view runs its query; on BigQuery the bytes it would scan are shown first (cost preview), and a sample past a set size asks.
+- **Columns:** name, type as the database names it, nullable, default, PK/FK/unique marks, comment, the knowledge base's note and PII mark. On demand ("Profile columns", one query, asks on production or a large table): non-null %, distinct count (approximate where the database has it: `approx_count_distinct`, `APPROX_COUNT_DISTINCT`, `uniq`), min/max, the most common values, a small histogram of numbers and dates.
+
+```
+│ Column        Type            Null  Key  Comment              Non-null  Distinct  Min … Max              │
+│ id            bigint          no    PK                          100%     1.2M      1 … 1,204,880           │
+│ customer_id   bigint          no    FK→customers.id              100%     88,412    1 … 91,002              │
+│ status        varchar(16)     no         paid/open/cancelled     100%     3         ▇▇▇▇▇▂ paid 71% open 25% │
+│ total         numeric(12,2)   yes        incl. VAT               99.8%    40,113    0.00 … 9,870.00 ▁▃▇▅▂   │
+```
+
+- **DDL:** what Show DDL shows today (Format, Copy, Open in editor), in the tab.
+- **Statistics:** row count (estimate, and "Count exactly" on demand), size on disk and in indexes, partitions/files (Databricks `DESCRIBE DETAIL`, BigQuery partitions, Snowflake clustering), last analyzed/vacuumed (Postgres `pg_stat_user_tables`: live/dead rows, seq/index scans), last DDL and last data change where the database records them.
+- **Relations:** declared foreign keys in and out, learned and documented joins (with their state: given to the AI, waiting…), views and materialized views that read the table, and the ER diagram around it (the existing ER tab, one level out, "More" to widen).
+- **Indexes & constraints:** indexes (columns, unique, size, use counts where the database keeps them), checks, uniques, triggers.
+- **History:** Delta `DESCRIBE HISTORY` (version, time, operation, rows written; "Query this version" opens `VERSION AS OF`), Snowflake and BigQuery time travel (`AT`/`FOR SYSTEM_TIME AS OF`), Iceberg snapshots; elsewhere "Not available".
+- **Usage:** from DataBrain's query history: how often and when it was read or written (the user's queries, jobs, the AI), the jobs whose steps read or load it (open the job), the most used queries on it (open in editor). Local only: nothing is asked of the server.
+- **Notes:** the knowledge base's notes on the table and its columns, add/edit (as in Knowledge → Notes), and the AI's description of the table if one was made.
+
+**Rules:** everything goes through the connection's safety checks (reads only, read-only connections fine; samples and profiles of a production table or one past a size ask once per tab); every query a sub-tab runs is in the query history (origin `explorer`) and shown at the bottom of its sub-tab, so the user can see and copy it; nothing is sent to the AI unless "Ask AI" is pressed. Metadata comes from the explorer cache and knowledge index first (shown at once, marked as cached with their age), then the database (Refresh).
+
+**Per database (first version):** PostgreSQL, MySQL, SQL Server, Oracle, Snowflake, Databricks, BigQuery, DuckDB, SQLite, ClickHouse: Data, Columns, DDL, Relations, Usage, Notes. Statistics and Indexes where the catalog has them (Postgres, MySQL, SQL Server, Oracle first; Snowflake/BigQuery/Databricks sizes and partitions). History on Databricks (Delta), Snowflake and BigQuery. MongoDB: Data (`find().limit`), fields sampled from documents, indexes, collection stats; no DDL. Neo4j: labels and relationship types instead of a table (later).
+
+**Build order:** 1. the tab with header, Data (first N), Columns (no profile), DDL, Notes: reuses what exists. 2. Column profile and Statistics per database. 3. Relations (FKs, learned joins, ER around it) and Usage (local history). 4. History/time travel and Indexes. Size: no new dependency; the profile and statistics are SQL per dialect in the connectors (a `Session::table_stats` with a default "not available").
 
 ## AI job tools (review of 2026-11-17)
 
