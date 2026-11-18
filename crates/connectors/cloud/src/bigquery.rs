@@ -777,8 +777,15 @@ struct LoadWriter {
     buf: Vec<u8>,
     sent: u64,
     chunk: usize,
+    /// The first wait after a 429, doubled on each one after it.
+    rate_wait: std::time::Duration,
     cancel: databrain_connector_core::CancellationToken,
 }
+
+/// Upload requests retried (or asked about) after a failure, per send.
+const UPLOAD_TRIES: u32 = 6;
+/// The longest wait after a 429.
+const RATE_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(32);
 
 /// What an upload request got: more wanted (bytes received so far) or the job.
 enum Uploaded {
@@ -789,7 +796,7 @@ enum Uploaded {
 impl LoadWriter {
     fn new(inner: Arc<Inner>, dest: (String, String, String), cancel: databrain_connector_core::CancellationToken) -> Self {
         let job_id = format!("databrain_load_{}", uuid::Uuid::new_v4().simple());
-        LoadWriter { inner, dest, job_id, upload: None, buf: Vec::new(), sent: 0, chunk: UPLOAD_CHUNK, cancel }
+        LoadWriter { inner, dest, job_id, upload: None, buf: Vec::new(), sent: 0, chunk: UPLOAD_CHUNK, rate_wait: std::time::Duration::from_secs(1), cancel }
     }
 
     /// Start the upload with the job's settings: append, the table must exist,
@@ -895,21 +902,34 @@ impl LoadWriter {
 
     /// Upload `len` bytes of the buffer (all of it when `last`), resuming
     /// from where the server is after a dropped or failed request.
+    /// A dropped request or a 5xx waits 0.1 s, doubling; a 429 waits
+    /// `rate_wait` (1 s), doubling up to 32 s, as Google asks. The status
+    /// request after a failure is retried the same way.
     async fn send(&mut self, len: usize, last: bool) -> Result<Option<serde_json::Value>> {
         let mut backoff = Backoff::new();
+        let mut rate_wait = self.rate_wait;
         let mut tries = 0;
+        let mut resume = false;
         let end = self.sent + len as u64;
         loop {
             let left = (end - self.sent) as usize;
-            let r = match self.put(left, last).await {
-                Err(e) if e.kind == databrain_connector_core::ErrorKind::Connection && tries < 4 => {
+            let r = if resume { self.status().await } else { self.put(left, last).await };
+            let got = match r {
+                Err(e) if e.kind == databrain_connector_core::ErrorKind::Connection && tries < UPLOAD_TRIES => {
                     tries += 1;
-                    backoff.wait().await;
-                    self.status().await
+                    if e.message.starts_with("BigQuery load (429") {
+                        tokio::time::sleep(rate_wait).await;
+                        rate_wait = (rate_wait * 2).min(RATE_WAIT_MAX);
+                    } else {
+                        backoff.wait().await;
+                    }
+                    resume = true;
+                    continue;
                 }
-                r => r,
+                r => r?,
             };
-            match r? {
+            resume = false;
+            match got {
                 Uploaded::Job(job) => {
                     self.buf.clear();
                     return Ok(Some(job));
@@ -1127,6 +1147,8 @@ mod tests {
         let got: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
         let origin: Arc<std::sync::Mutex<String>> = Arc::default();
         let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // After a 429, the status request that follows is answered 429 once too.
+        let rate_limited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (g, o) = (got.clone(), origin.clone());
         let (url, _, log) = crate::mock_http::serve_full(move |m, p, h, b| {
             let range = h.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-range:").map(|v| v.trim().to_string())).unwrap_or_default();
@@ -1144,12 +1166,16 @@ mod tests {
             }
             if m == "PUT" && p == "/up/1" {
                 if range == "bytes */*" {
+                    if rate_limited.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        return (429, vec![], json!({"error": {"message": "Too many requests"}}).to_string());
+                    }
                     return (308, received(got.len()), String::new());
                 }
                 let k = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some((at, status)) = drop_put
                     && at == k
                 {
+                    rate_limited.store(status == 429, std::sync::atomic::Ordering::SeqCst);
                     return (status, vec![], json!({"error": {"message": "Too many requests"}}).to_string());
                 }
                 let spec = range.trim_start_matches("bytes ");
@@ -1185,6 +1211,7 @@ mod tests {
         let dest = inner.table_ref("ds.t").unwrap();
         let mut w = Box::new(LoadWriter::new(inner, dest, Default::default()));
         w.chunk = chunk;
+        w.rate_wait = std::time::Duration::from_millis(10);
         for c in chunks {
             w.write(c.as_bytes().to_vec()).await?;
         }
@@ -1239,7 +1266,8 @@ mod tests {
     }
 
     /// A dropped upload request, or one answered 429 or 5xx: the writer asks
-    /// where the upload is and goes on from there.
+    /// where the upload is (asking again when that is answered 429) and goes
+    /// on from there.
     #[tokio::test]
     async fn a_dropped_upload_request_resumes() {
         for drop in [(0, 0), (2, 0), (1, 429), (0, 503)] {
