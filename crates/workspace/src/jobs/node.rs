@@ -121,8 +121,13 @@ pub struct StepProgress {
     pub phase: String,
     #[ts(as = "f64")]
     pub done: u64,
+    /// 0: not known (rows read as the query runs).
     #[ts(as = "f64")]
     pub total: u64,
+    /// Since the phase started, for the rate and the time left.
+    #[serde(default)]
+    #[ts(as = "f64")]
+    pub elapsed_ms: u64,
 }
 
 /// One line of a run's log, for tracing what ran and what came back.

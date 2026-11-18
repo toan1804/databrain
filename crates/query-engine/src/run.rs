@@ -154,7 +154,21 @@ impl QueryEngine {
     /// broadcast: a subscriber that lags behind there loses events, and a
     /// lost `JobFinished` left the caller (a job step, with every step
     /// downstream of it) waiting forever after the query had ended.
-    pub async fn run_and_wait(self: &Arc<Self>, _hub: &EventHub, req: RunRequest, cancel: Option<CancellationToken>) -> Result<Vec<StatementOutcomeView>> {
+    pub async fn run_and_wait(self: &Arc<Self>, hub: &EventHub, req: RunRequest, cancel: Option<CancellationToken>) -> Result<Vec<StatementOutcomeView>> {
+        self.run_and_watch(hub, req, cancel, &|_, _| {}).await
+    }
+
+    /// [`Self::run_and_wait`], telling `rows` how many rows the running
+    /// statement has read so far and in how many ms (when the tab's
+    /// progress goes out), so a job step reading a large table isn't just
+    /// "running".
+    pub async fn run_and_watch(
+        self: &Arc<Self>,
+        _hub: &EventHub,
+        req: RunRequest,
+        cancel: Option<CancellationToken>,
+        rows: &(dyn Fn(u64, u64) + Sync),
+    ) -> Result<Vec<StatementOutcomeView>> {
         let (waiter, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let statements = match self.start_run(req, Some(waiter))? {
             RunResponse::Started { job_id, statements } => (job_id, statements),
@@ -210,6 +224,7 @@ impl QueryEngine {
                         o.duration_ms = duration_ms;
                     }
                 }
+                JobEvent::Progress { rows: n, elapsed_ms, .. } => rows(n as u64, elapsed_ms),
                 JobEvent::JobFinished { status, .. } => return finished(status, out),
                 _ => {}
             }
@@ -264,7 +279,7 @@ impl QueryEngine {
             let started_at = now_ms();
             let t0 = Instant::now();
             let outcome = match self.begin_if_manual(&req, conn_kind, stmt, &cancel).await {
-                Ok(()) => self.run_statement(&job_id, &req, stmt, limit, cancel.child_token()).await,
+                Ok(()) => self.run_statement(&job_id, &req, stmt, limit, cancel.child_token(), waiter.as_ref()).await,
                 Err(e) => Err(e),
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
@@ -408,6 +423,7 @@ impl QueryEngine {
         stmt: &PlannedStatement,
         limit: Option<usize>,
         cancel: CancellationToken,
+        waiter: Option<&Waiter>,
     ) -> Result<StatementOutcome> {
         let started = Instant::now();
         let session = tokio::select! {
@@ -427,7 +443,7 @@ impl QueryEngine {
                 },
             )
             .await?;
-        self.collect_stream(job_id, req, stmt, limit, cancel, stream, started).await
+        self.collect_stream(job_id, req, stmt, limit, cancel, stream, started, waiter).await
     }
 
     /// Reads a statement's result stream into the result store. Every way
@@ -444,6 +460,8 @@ impl QueryEngine {
         cancel: CancellationToken,
         mut stream: databrain_connector_core::QueryStream,
         started: Instant,
+        // Gets the progress too (a job step waiting on the run).
+        waiter: Option<&Waiter>,
     ) -> Result<StatementOutcome> {
         let mut server_ms = None;
         let result_id = format!("{job_id}:{}", stmt.index);
@@ -593,13 +611,17 @@ impl QueryEngine {
                     }
                     if last_progress.elapsed() >= PROGRESS_INTERVAL {
                         last_progress = Instant::now();
-                        self.events.emit(JobEvent::Progress {
+                        let ev = JobEvent::Progress {
                             job_id: job_id.to_string(),
                             tab_id: req.tab_id.clone(),
                             index: stmt.index,
                             rows,
                             elapsed_ms: t0.elapsed().as_millis() as u64,
-                        });
+                        };
+                        if let Some(w) = waiter {
+                            let _ = w.send(ev.clone());
+                        }
+                        self.events.emit(ev);
                     }
                 }
                 Ok(StreamEvent::Notice(n)) => notices.push(n),

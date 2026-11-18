@@ -4,4 +4,12 @@ export type StepProgress = {
 /**
  * What is being done ("Inserting rows", "Staging rows").
  */
-phase: string, done: number, total: number, };
+phase: string, done: number, 
+/**
+ * 0: not known (rows read as the query runs).
+ */
+total: number, 
+/**
+ * Since the phase started, for the rate and the time left.
+ */
+elapsed_ms: number, };

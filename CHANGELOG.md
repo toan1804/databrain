@@ -15,6 +15,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- **Job progress on large tables:** a load step reading a large step's result (one kept on disk) showed rows written out of a total of 0, and a step's SQL showed only "Running…" while it read. The step now shows rows read so far while its SQL runs, then rows written out of the total with the rate and the time left, and "all rows sent, waiting for the database to finish" while a commit, COPY INTO or load job runs.
 - Job load steps say how the target database bulk loads (COPY, bulk copy, the appender, TabSeparated, array binds, staged files, load jobs) instead of always PostgreSQL's COPY, and show the connection setting a bulk load needs (Databricks' staging volume, BigQuery load jobs, Snowflake array binds) with its current value, to set or change it there; it is saved in the connection.
 - DuckDB: binary values loaded by INSERTs (job loads, "Load into…", test data) or saved from a grid edit were written as the text of their hex (`X'00ff'` is text in DuckDB): they are now the bytes (`from_hex('00ff')`).
 

@@ -437,7 +437,8 @@ impl Tracer {
         let Some((id, _)) = &self.node else { return };
         let snapshot = {
             let mut l = self.live.lock();
-            let finished = p.done >= p.total;
+            // A total of 0 is unknown, not done.
+            let finished = p.total > 0 && p.done >= p.total;
             if let Some(r) = l.run.nodes.iter_mut().find(|r| &r.node_id == id) {
                 r.summary.progress = Some(p);
             }
@@ -448,6 +449,15 @@ impl Tracer {
             l.run.clone()
         };
         emit(&self.ctx, &snapshot);
+    }
+
+    /// The step's phase ended: no progress until the next one says its own.
+    fn clear_progress(&self) {
+        let Some((id, _)) = &self.node else { return };
+        let mut l = self.live.lock();
+        if let Some(r) = l.run.nodes.iter_mut().find(|r| &r.node_id == id) {
+            r.summary.progress = None;
+        }
     }
 
     fn with_run<T>(&self, f: impl FnOnce(&mut JobRun) -> T) -> T {
@@ -505,7 +515,7 @@ impl LoadObserver for Tracer {
                 ),
                 Some(e) => self.log("error", format!("{label} failed: {e}"), Some(&sql), None, Some(duration_ms as i64)),
             },
-            LoadEvent::Progress { phase, done, total } => self.progress(StepProgress { phase, done, total }),
+            LoadEvent::Progress { phase, done, total, elapsed_ms } => self.progress(StepProgress { phase, done, total, elapsed_ms }),
             LoadEvent::Failed { kept_nothing } => *self.load.lock() = if kept_nothing { LoadState::KeptNothing } else { LoadState::MayHaveKept },
             LoadEvent::Inserted { label, table, rows, statements, sql, duration_ms, error } => {
                 let batches = format!("{statements} batch{}", if statements == 1 { "" } else { "es" });
@@ -1516,9 +1526,11 @@ async fn run_sql(
     // The run's `:name` values (job parameters); a missing one fails the step.
     let params = t.params_for(connection_kind(ctx, &connection_id))?;
     t.log("info", format!("Running SQL on {conn}"), None, None, None);
+    // Rows read so far: a large table isn't just "running".
+    let reading = |done: u64, elapsed_ms: u64| t.progress(StepProgress { phase: "Reading rows".into(), done, total: 0, elapsed_ms });
     let outcomes = ctx
         .engine
-        .run_and_wait(
+        .run_and_watch(
             &ctx.hub,
             RunRequest {
                 connection_id,
@@ -1534,8 +1546,12 @@ async fn run_sql(
                 output_masks: None,
             },
             Some(cancel.clone()),
+            &reading,
         )
-        .await?;
+        .await;
+    // Read: what comes next (a load) says its own progress.
+    t.clear_progress();
+    let outcomes = outcomes?;
     let n = outcomes.len();
     for o in &outcomes {
         let which = if n > 1 { format!("Statement {} of {n}", o.index + 1) } else { "Statement".to_string() };
