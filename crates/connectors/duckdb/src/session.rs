@@ -214,7 +214,7 @@ impl Session for DuckSession {
         for (f, c) in schema.fields().iter().zip(columns) {
             // DuckDB's names are case-insensitive.
             let target = types.iter().find(|(n, _)| n == c).or_else(|| types.iter().find(|(n, _)| n.eq_ignore_ascii_case(c)));
-            if let Some(why) = target.and_then(|(_, t)| appender_refused(f.data_type(), t)) {
+            if let Some(why) = target.and_then(|(_, t)| appender_refused(f, t)) {
                 return Ok(Some(format!("{c}: {why}")));
             }
         }
@@ -568,10 +568,17 @@ impl DuckSession {
 /// DECIMAL(5,2) is `1.00`; a FLOAT `0.1` into a DOUBLE is `0.100000001…`),
 /// where the literal's decimal text rounds half away from zero; an instant
 /// with a time zone into anything but TIMESTAMPTZ is converted in the
-/// session's time zone, where the literal carries its offset.
-pub(crate) fn appender_refused(source: &databrain_connector_core::arrow::datatypes::DataType, target: &str) -> Option<String> {
+/// session's time zone, where the literal carries its offset; an exact
+/// decimal carried as text is a number literal (`00123.50` into VARCHAR is
+/// `123.50`), so it goes only into number columns, which read the text alike.
+pub(crate) fn appender_refused(f: &databrain_connector_core::arrow::datatypes::Field, target: &str) -> Option<String> {
     use databrain_connector_core::arrow::datatypes::DataType as D;
     let t = target.trim().to_ascii_uppercase();
+    let source = f.data_type();
+    if databrain_connector_core::value::is_decimal_text(f) {
+        let number = t.starts_with("DECIMAL") || matches!(t.as_str(), "DOUBLE" | "FLOAT" | "HUGEINT" | "BIGINT" | "INTEGER" | "SMALLINT" | "TINYINT");
+        return (!number).then(|| format!("a decimal as text into {target} would be written as text, not as the number the INSERT writes"));
+    }
     let fine = match source {
         D::Float64 => matches!(t.as_str(), "DOUBLE" | "FLOAT" | "VARCHAR"),
         D::Float32 => matches!(t.as_str(), "FLOAT" | "VARCHAR"),
@@ -646,6 +653,13 @@ mod tests {
         ] {
             assert_eq!(s.append_rows_refused("T", &[col.into()], &schema(dt.clone())).await.unwrap(), None, "{dt:?} into {col}");
         }
+        // An exact decimal carried as text (`numeric` from another database).
+        let decimal_text = Arc::new(Schema::new(vec![
+            Field::new("c", D::Utf8, true).with_metadata([(databrain_connector_core::value::META_DB_TYPE.to_string(), "numeric(12,2)".to_string())].into()),
+        ]));
+        assert!(s.append_rows_refused("T", &["v".into()], &decimal_text).await.unwrap().is_some(), "decimal text into varchar");
+        assert_eq!(s.append_rows_refused("T", &["d".into()], &decimal_text).await.unwrap(), None, "decimal text into decimal");
+        assert_eq!(s.append_rows_refused("T", &["v".into()], &schema(D::Utf8)).await.unwrap(), None, "text into varchar");
     }
 
     /// The interrupt reaches a statement only while it holds the connection.
