@@ -14,6 +14,7 @@ workspace = true
 databrain-ai = { version = "0.4.4", path = "../ai" }
 databrain-auth = { version = "0.4.4", path = "../auth" }
 databrain-connector-core = { version = "0.4.4", path = "../connector-core" }
+databrain-connector-mssql = { version = "0.4.4", path = "../connectors/mssql" }
 databrain-connector-sqlite = { version = "0.4.4", path = "../connectors/sqlite" }
 databrain-export = { version = "0.4.4", path = "../export" }
 databrain-lineage = { version = "0.4.4", path = "../lineage" }

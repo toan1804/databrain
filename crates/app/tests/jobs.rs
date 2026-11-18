@@ -88,7 +88,13 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
 /// Every test ends in time: a hang fails it (with where it hung) instead
 /// of stopping the whole test run.
 async fn guarded(test: impl std::future::Future<Output = ()>) {
-    tokio::time::timeout(Duration::from_secs(240), test).await.expect("the test hung (more than 4 minutes)");
+    guarded_within(Duration::from_secs(240), test).await
+}
+
+/// [`guarded`] for a test that may take longer than 4 minutes (INSERTs into
+/// a slow live server).
+async fn guarded_within(limit: Duration, test: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(limit, test).await.unwrap_or_else(|_| panic!("the test hung (more than {} s)", limit.as_secs()));
 }
 
 /// Poll `cond` every 20 ms for up to `secs` s; fails naming `what` if it never holds.
@@ -115,7 +121,12 @@ fn logged(st: &AppState, job: &str, prefix: &str) -> bool {
 async fn finished(st: &AppState, job: &str) -> JobRun {
     // Up to a minute: a slow step (DuckDB summing 300 M rows) takes seconds
     // more on a loaded machine.
-    for _ in 0..2400 {
+    finished_within(st, job, Duration::from_secs(60)).await
+}
+
+async fn finished_within(st: &AppState, job: &str, limit: Duration) -> JobRun {
+    let polls = limit.as_millis() / 25;
+    for _ in 0..polls {
         let run = st.workspace.job_runs(job, 1).unwrap().remove(0);
         // The run is recorded before the job lets go of its slot.
         if run.status != "running" && !st.jobs.is_running(job) {
@@ -690,6 +701,107 @@ async fn duckdb_appended_loads_write_what_inserts_do() {
     .await;
 }
 
+/// Live (DATABRAIN_MSSQL_HOST, _PASSWORD): a load into SQL Server goes by
+/// bulk copy, and the table ends up exactly as with INSERTs: the same rows
+/// of every kind loaded both ways and compared, into tables the load
+/// creates and into existing ones with other column types (an `int`, a
+/// decimal of a smaller scale, `datetime2(3)` for a date, …), where the
+/// copy fires the insert trigger for every row, as INSERTs do. 120,000
+/// rows (two bulk copy calls); an INSERT run takes about a minute on CI's
+/// server and more on a slow one, so each run may take ten minutes and the
+/// test half an hour.
+#[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn mssql_bulk_loads_write_what_inserts_do() {
+    guarded_within(Duration::from_secs(1800), async {
+        let Ok(host) = std::env::var("DATABRAIN_MSSQL_HOST") else {
+            panic!("live test: DATABRAIN_MSSQL_HOST not set (run with --ignored)");
+        };
+        let st = state();
+        let mut c = ConnectionConfig::new(ConnectorKind::Mssql, AuthMethod::Password { user: std::env::var("DATABRAIN_MSSQL_USER").unwrap_or("sa".into()) });
+        c.host = Some(host);
+        c.port = std::env::var("DATABRAIN_MSSQL_PORT").ok().and_then(|p| p.parse().ok());
+        c.options.insert("trust_cert".into(), "true".into());
+        let id = api::save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "ms".into(),
+                    config: c,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: true,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: std::env::var("DATABRAIN_MSSQL_PASSWORD").ok(),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+        .id;
+        let src = "select i::bigint as id, \
+                   case when i % 7 = 0 then null else 'n' || i || ' it''s \"ünï\" a\tb 😀' end as name, \
+                   i % 2 = 0 as ok, \
+                   case when i = 5 then 'nan'::double when i = 6 then 'inf'::double when i = 8 then '-inf'::double else i / 7.0 end as f, \
+                   (i / 8)::decimal(12, 3) as amount, \
+                   date '2026-01-01' + (i % 400)::int as d, \
+                   timestamp '2026-01-01 10:00:00.123456' + to_microseconds(i::bigint * 1000) as ts, \
+                   to_timestamp(1767254400 + i) as tz, \
+                   case when i % 5 = 0 then null else from_hex(printf('%04x', i)) end as b \
+                   from range(120000) t(i)";
+        let existing = "(id int NOT NULL CHECK (id >= 0), name nvarchar(200), ok bit, f float, amount decimal(18, 2), \
+                        d datetime2(3), ts datetime2(6), tz datetimeoffset(7), b varbinary(100))";
+        for (pre, label) in [(false, "created"), (true, "existing")] {
+            for (table, insert_only) in [("dbr_ms_bulk", false), ("dbr_ms_ins", true)] {
+                rows(&st, &id, &format!("DROP TABLE IF EXISTS {table}; SELECT 1")).await;
+                rows(&st, &id, &format!("DROP TABLE IF EXISTS {table}_log; SELECT 1")).await;
+                if pre {
+                    rows(&st, &id, &format!("CREATE TABLE {table} {existing}; SELECT 1")).await;
+                    rows(&st, &id, &format!("CREATE TABLE {table}_log (n int); SELECT 1")).await;
+                    rows(
+                        &st,
+                        &id,
+                        &format!(
+                            "EXEC('CREATE TRIGGER {table}_trg ON {table} AFTER INSERT AS INSERT INTO {table}_log SELECT count(*) FROM inserted'); SELECT 1"
+                        ),
+                    )
+                    .await;
+                }
+                let job = load_job(&st, &id, table, src, |n| {
+                    n.load_mode = LoadMode::Append;
+                    n.load_insert_only = insert_only;
+                });
+                let run = run_all_within(&st, &job, Duration::from_secs(600)).await;
+                assert_eq!(run.status, "success", "{label} {table}: {run:?}");
+                assert_eq!(step(&run, "loaded").rows, Some(120_000), "{label} {table}");
+                let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+                assert_eq!(
+                    log.iter().any(|l| l.message.contains("bulk copy (INSERT BULK")),
+                    !insert_only,
+                    "{label} {table}: {:#?}",
+                    log.iter().map(|l| &l.message).collect::<Vec<_>>()
+                );
+                if pre {
+                    assert_eq!(rows(&st, &id, &format!("SELECT sum(n) FROM {table}_log")).await[0][0], "120000", "{label} {table}: the trigger saw every row");
+                }
+            }
+            let (a, i) = ("SELECT * FROM dbr_ms_bulk", "SELECT * FROM dbr_ms_ins");
+            let differ = rows(&st, &id, &format!("SELECT count(*) FROM (SELECT * FROM ({a} EXCEPT {i}) x UNION ALL SELECT * FROM ({i} EXCEPT {a}) y) z")).await;
+            assert_eq!(differ[0][0], "0", "{label}: bulk copy and INSERTs wrote different rows");
+            assert_eq!(rows(&st, &id, "SELECT count(*) FROM dbr_ms_bulk").await[0][0], "120000", "{label}");
+        }
+        for t in ["dbr_ms_bulk", "dbr_ms_ins", "dbr_ms_bulk_log", "dbr_ms_ins_log"] {
+            rows(&st, &id, &format!("DROP TABLE IF EXISTS {t}; SELECT 1")).await;
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn export_steps_write_files_with_duckdb() {
     guarded(async {
@@ -985,6 +1097,13 @@ fn load_job(st: &AppState, target: &str, table: &str, src: &str, edit: impl FnOn
 async fn run_all(st: &AppState, job: &Job) -> JobRun {
     api::run_job(st, &job.id, None).unwrap();
     finished(st, &job.id).await
+}
+
+/// [`run_all`] for a job that may take longer than a minute (INSERTs into
+/// a slow live server).
+async fn run_all_within(st: &AppState, job: &Job, limit: Duration) -> JobRun {
+    api::run_job(st, &job.id, None).unwrap();
+    finished_within(st, &job.id, limit).await
 }
 
 fn step(run: &JobRun, name: &str) -> databrain_workspace::NodeRunSummary {

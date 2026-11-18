@@ -1468,8 +1468,16 @@ async fn array_rows(
     }
 }
 
-/// Rows per appender call ([`appended_rows`]).
+/// Rows per appender or bulk copy call ([`appended_rows`]).
 const APPEND_ROWS: usize = 100_000;
+
+/// What [`Session::append_rows`] is called in the run log.
+fn appender_word(d: ConnectorKind) -> &'static str {
+    match d {
+        ConnectorKind::Mssql => "bulk copy",
+        _ => "the appender",
+    }
+}
 
 /// Whether the rows' columns go through DuckDB's appender as they are:
 /// the types it takes without converting them (a `Date64` would lose its
@@ -1493,10 +1501,12 @@ fn appender_fits(schema: &SchemaRef) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// The rows by the database's appender (DuckDB): up to [`APPEND_ROWS`] a
-/// call, each through a temporary table and one `INSERT … SELECT` that
-/// converts the values as INSERTs do (see `Session::append_rows`). A session
-/// that turns the first call down gets INSERTs, the rows put back.
+/// The rows by the database's appender (DuckDB: each call through a
+/// temporary table and one `INSERT … SELECT` that converts the values as
+/// INSERTs do) or bulk copy (SQL Server: the values converted as the
+/// INSERT literals are), up to [`APPEND_ROWS`] a call (see
+/// `Session::append_rows`). A session that turns the first call down gets
+/// INSERTs, the rows put back.
 async fn appended_rows(
     p: &Prepared,
     table: &str,
@@ -1509,7 +1519,10 @@ async fn appended_rows(
     let mut w = Written {
         rows: 0,
         statements: 0,
-        sql: format!("INSERT INTO {table} SELECT … (appender)"),
+        sql: match p.dialect {
+            ConnectorKind::Mssql => format!("INSERT BULK {table} WITH (CHECK_CONSTRAINTS, KEEP_NULLS, FIRE_TRIGGERS)"),
+            _ => format!("INSERT INTO {table} SELECT … (appender)"),
+        },
         result: Ok(()),
         split: None,
         parallel: false,
@@ -1530,7 +1543,13 @@ async fn appended_rows(
         match p.session.append_rows(table, &columns, batch.clone(), cancel.clone()).await {
             Ok(Some(n)) => {
                 if w.statements == 0 {
-                    note(format!("the appender, up to {} rows a call through a temporary table", grouped(APPEND_ROWS)));
+                    note(match p.dialect {
+                        ConnectorKind::Mssql => format!(
+                            "bulk copy (INSERT BULK, firing triggers and checking constraints as INSERTs do), up to {} rows a call",
+                            grouped(APPEND_ROWS)
+                        ),
+                        _ => format!("the appender, up to {} rows a call through a temporary table", grouped(APPEND_ROWS)),
+                    });
                 }
                 w.rows += n;
                 w.statements += 1;
@@ -2214,11 +2233,15 @@ async fn run_plan(
                 let array_insert = (writer.is_none() && !p.insert_only && p.session.insert_array_possible())
                     .then(|| sqlgen::ArrayInsert::new(p.dialect, table, &schema))
                     .flatten();
-                // No bulk load or array INSERTs: the appender where the session has one (DuckDB).
-                // The columns' types, then the table's (`append_rows_refused`).
+                // No bulk load or array INSERTs: the appender (DuckDB) or bulk
+                // copy (SQL Server) where the session has one and takes the columns.
                 let appender = if writer.is_none() && array_insert.is_none() && !p.insert_only && p.session.append_rows_possible() {
                     let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-                    let fits = match appender_fits(&schema) {
+                    let fits = match p.dialect {
+                        ConnectorKind::Duckdb => appender_fits(&schema),
+                        _ => Ok(()),
+                    };
+                    let fits = match fits {
                         Ok(()) => match p.session.append_rows_refused(table, &columns, &schema).await {
                             Ok(None) => Ok(()),
                             Ok(Some(why)) => Err(why),
@@ -2230,7 +2253,7 @@ async fn run_plan(
                     match fits {
                         Ok(()) => Some(()),
                         Err(why) => {
-                            obs.event(LoadEvent::Info(format!("{label}: INSERTs, not the appender ({why})")));
+                            obs.event(LoadEvent::Info(format!("{label}: INSERTs, not {} ({why})", appender_word(p.dialect))));
                             None
                         }
                     }

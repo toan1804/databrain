@@ -8,6 +8,7 @@
 //! reading and replace the connection, unless it carries session state
 //! (`databrain_connector_core::ConnState`), when the rest is read instead.
 
+mod bulk;
 mod config;
 mod error;
 mod exec;
@@ -37,6 +38,7 @@ use tiberius::Config;
 use tiberius::EncryptionLevel;
 use tokio::sync::Mutex;
 
+pub use bulk::bench_rows;
 pub use session::MssqlSession;
 
 const ENTRA_SCOPE: &str = "https://database.windows.net//.default";
