@@ -53,6 +53,15 @@ pub(crate) async fn resume_job(state: State<'_, AppState>, id: String) -> R<data
     api::resume_job(&state, &id)
 }
 
+/// A desktop notification that a job run ended (the UI sends it when the
+/// window isn't focused: the user is in another app).
+#[tauri::command]
+pub(crate) async fn notify_job_run(title: String, body: String, failed: bool) -> R<()> {
+    // Off the async runtime: it starts a process (and waits on Windows).
+    tokio::task::spawn_blocking(move || crate::background::notify_as(&title, &body, failed));
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) async fn cancel_job(state: State<'_, AppState>, id: String) -> R<bool> {
     Ok(api::cancel_job(&state, &id))

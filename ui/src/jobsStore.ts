@@ -5,6 +5,7 @@ import type { RunParams, Job, JobRun, JobSummary, RunLogEntry } from "./lib/type
 import { useStore } from "./store";
 import { uid } from "./lib/util";
 import { cellStepBase, stepsFromCells, uniqueName, type CellSource } from "./lib/jobGraph";
+import { runLine } from "./components/job/shared";
 
 /**
  * A step name no other job's step or named output uses (`step`, `step_2`…).
@@ -53,6 +54,20 @@ let started = false;
 const announced = new Set<number>();
 /** Finished runs whose notices were shown. */
 const noticed = new Set<number>();
+/** Runs seen running in this window: their end may be told on the desktop. */
+const watched = new Set<number>();
+
+/**
+ * Tell on the desktop that a run ended, when the window isn't focused (the
+ * user went to another app during a long run). The jobs tray says it in the
+ * window.
+ */
+export function notifyIfAway(jobs: JobSummary[], run: JobRun, focused: boolean) {
+  if (focused) return;
+  const name = jobs.find((j) => j.id === run.job_id)?.name ?? "A job";
+  const how = run.status === "success" ? "finished" : run.status === "cancelled" ? "stopped" : "failed";
+  void api.notifyJobRun(`Job "${name}" ${how}`, runLine(run, Date.now()), run.status === "error").catch(() => {});
+}
 
 export function announceScheduled(jobs: JobSummary[], run: JobRun) {
   if (run.trigger !== "schedule" || run.status !== "running" || announced.has(run.id)) return;
@@ -129,6 +144,8 @@ export const useJobs = create<JobsState>((set, get) => ({
     await onJobRun(({ job_id, run }) => {
       set((s) => ({ runs: { ...s.runs, [job_id]: run }, running: { ...s.running, [job_id]: run.status === "running" } }));
       announceScheduled(get().jobs, run);
+      if (run.status === "running") watched.add(run.id);
+      else if (watched.delete(run.id)) notifyIfAway(get().jobs, run, typeof document === "undefined" || document.hasFocus());
       if (run.status !== "running") {
         // Tell what a step did that the user didn't set up by hand (a created table).
         if (!noticed.has(run.id)) {

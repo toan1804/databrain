@@ -322,6 +322,7 @@ pub fn run() {
             commands::jobs::resume_job,
             commands::system::reveal_logs,
             commands::jobs::cancel_job,
+            commands::jobs::notify_job_run,
             commands::jobs::cancel_job_step,
             commands::jobs::dry_run_job_step,
             commands::system::load_batch_limits,

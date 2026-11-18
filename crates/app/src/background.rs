@@ -238,17 +238,24 @@ pub fn set_enabled(state: &AppState, dir: &Path, on: bool) -> Result<BackgroundS
     status(state, dir)
 }
 
-/// A desktop notification (best effort; nothing when the OS has no way).
+/// A desktop notification of a failure (best effort; nothing when the OS has no way).
 pub fn notify(title: &str, body: &str) {
+    notify_as(title, body, true)
+}
+
+/// A desktop notification; `failed` picks the icon where the OS shows one
+/// (Windows). Blocks for a while on Windows (the balloon's lifetime).
+pub fn notify_as(title: &str, body: &str, failed: bool) {
     let _ = if cfg!(target_os = "macos") {
         let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         std::process::Command::new("osascript").args(["-e", &format!("display notification \"{}\" with title \"{}\"", q(body), q(title))]).output()
     } else if cfg!(windows) {
         let q = |s: &str| s.replace('\'', "''");
         let ps = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(10000, '{}', '{}', 'Error'); Start-Sleep -Seconds 10; $n.Dispose()",
+            "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(10000, '{}', '{}', '{}'); Start-Sleep -Seconds 10; $n.Dispose()",
             q(title),
-            q(body)
+            q(body),
+            if failed { "Error" } else { "Info" }
         );
         std::process::Command::new("powershell").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps]).output()
     } else {
