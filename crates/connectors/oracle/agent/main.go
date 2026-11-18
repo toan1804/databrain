@@ -497,12 +497,23 @@ func readOutput(ctx context.Context, t q) ([]string, bool) {
 	return lines, status == 2
 }
 
+// prefetchRows is how many rows a query fetches per round trip (see dsn).
+const prefetchRows = 1000
+
 // dsn builds the go-ora URL. `connect_string` may be an Easy Connect string
 // ([//]host[:port]/service), a full (DESCRIPTION=…) or a tnsnames.ora alias.
 func dsn(r *request) (string, error) {
 	opts := map[string]string{}
 	for k, v := range r.Options {
 		opts[strings.ToUpper(strings.TrimSpace(k))] = strings.TrimSpace(v)
+	}
+	// Rows per round trip. go-ora's default (25) makes it guess from each
+	// column's declared width (128 KB / the widest a row could be): a few
+	// VARCHAR2(4000) columns get 2-5 rows a round trip however short the
+	// values are, about 1,000 rows/s over a network. A fixed size fetches
+	// that many rows' actual bytes; a connection's own PREFETCH_ROWS wins.
+	if _, set := opts["PREFETCH_ROWS"]; !set {
+		opts["PREFETCH_ROWS"] = strconv.Itoa(prefetchRows)
 	}
 	cs := strings.TrimSpace(r.ConnectString)
 	if cs == "" {
