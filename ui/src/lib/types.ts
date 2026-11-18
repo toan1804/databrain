@@ -84,6 +84,9 @@ import type { ApplyReport } from "./bindings/ApplyReport";
 import type { ResultLink } from "./bindings/ResultLink";
 import type { LoadCheck } from "./bindings/LoadCheck";
 import type { LoadDryRun } from "./bindings/LoadDryRun";
+import type { RunMomentPreview } from "./bindings/RunMomentPreview";
+import type { RunMomentPart } from "./bindings/RunMomentPart";
+import type { RunDateExample } from "./bindings/RunDateExample";
 import type { LoadReport } from "./bindings/LoadReport";
 import type { ParamSet } from "./bindings/ParamSet";
 import type { RunParams } from "./bindings/RunParams";
@@ -273,6 +276,9 @@ export type {
   ResultLink,
   LoadCheck,
   LoadDryRun,
+  RunMomentPreview,
+  RunMomentPart,
+  RunDateExample,
   LoadReport,
   ParamSet,
   RunParams,

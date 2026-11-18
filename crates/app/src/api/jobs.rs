@@ -130,6 +130,11 @@ pub fn resume_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job
     crate::jobs::resume(&state.job_ctx(), id)
 }
 
+/// What `:run_date` / `:run_time` are in a step's SQL for a run for `date`.
+pub fn run_moment_preview(state: &AppState, job: databrain_workspace::Job, node_id: &str, date: Option<&str>) -> Result<crate::jobs::RunMomentPreview> {
+    crate::jobs::run_moment_preview(&state.job_ctx(), &job, node_id, date)
+}
+
 pub fn cancel_job(state: &AppState, id: &str) -> bool {
     state.jobs.cancel(id)
 }

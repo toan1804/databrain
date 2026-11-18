@@ -3800,3 +3800,109 @@ async fn loads_of_the_assistants_rows_follow_the_ai_rules() {
     .await
     .expect("test hung");
 }
+
+/// The `:run_date` examples a step panel shows give what they say, run by
+/// each database through the preview (its literal for `:run_date` and the
+/// step's SQL with it in): SQLite and DuckDB here; Postgres, MySQL, SQL
+/// Server and ClickHouse when their DATABRAIN_*_HOST is set, Oracle when
+/// its helper is installed too (DATABRAIN_ORACLE_AGENT).
+#[tokio::test(flavor = "multi_thread")]
+async fn run_date_examples_give_what_they_say() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let mut conns = vec![(sqlite(&st, "lite", &dir.path().join("a.db"), false), ""), (duckdb(&st, "duck", &dir.path().join("a.duckdb")), "")];
+        let live = |kind: ConnectorKind, var: &str, user: &str, name: &str| -> Option<String> {
+            let host = std::env::var(format!("DATABRAIN_{var}_HOST")).ok()?;
+            // Oracle connects through its helper: only where one is installed.
+            if kind == ConnectorKind::Oracle && std::env::var("DATABRAIN_ORACLE_AGENT").is_err() {
+                return None;
+            }
+            let mut c = ConnectionConfig::new(kind, AuthMethod::Password { user: std::env::var(format!("DATABRAIN_{var}_USER")).unwrap_or(user.into()) });
+            c.host = Some(host);
+            c.port = std::env::var(format!("DATABRAIN_{var}_PORT")).ok().and_then(|p| p.parse().ok());
+            match kind {
+                ConnectorKind::Mssql => drop(c.options.insert("trust_cert".into(), "true".into())),
+                ConnectorKind::Oracle => {
+                    c.options.insert("service_name".into(), std::env::var("DATABRAIN_ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".into()));
+                    c.options.insert("driver".into(), "thin".into());
+                }
+                ConnectorKind::Postgres => c.database = Some("postgres".into()),
+                _ => {}
+            }
+            let profile = ConnectionProfile {
+                id: String::new(),
+                name: name.into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: true,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            };
+            let secret = std::env::var(format!("DATABRAIN_{var}_PASSWORD")).ok();
+            Some(api::save_connection(&st, SaveConnectionArgs { profile, secret, clear_secret: false, extra_secrets: Default::default() }).unwrap().id)
+        };
+        for (kind, var, user, from) in [
+            (ConnectorKind::Postgres, "POSTGRES", "postgres", ""),
+            (ConnectorKind::Mysql, "MYSQL", "root", ""),
+            (ConnectorKind::Oracle, "ORACLE", "system", " from dual"),
+            (ConnectorKind::Mssql, "MSSQL", "sa", ""),
+            (ConnectorKind::Clickhouse, "CLICKHOUSE", "default", ""),
+        ] {
+            if let Some(id) = live(kind, var, user, var) {
+                conns.push((id, from));
+            }
+        }
+        for (conn, from) in &conns {
+            // 2026-01-01: the day before is in another year.
+            for date in ["2026-11-18", "2026-01-01"] {
+                let mut job = plain_job("dates", vec![node("a", "a", JobNodeKind::Query, Some(conn), "select 1")]);
+                let base = api::run_moment_preview(&st, job.clone(), "a", Some(date)).unwrap();
+                let part = &base.parts[0];
+                assert!(part.examples.len() >= 3, "{base:?}");
+                assert_eq!((base.date.as_str(), base.time.as_str()), (date, format!("{date} 00:00:00").as_str()));
+                for ex in &part.examples {
+                    job.nodes[0].sql = format!("select {} as v{from}", ex.sql);
+                    let p = api::run_moment_preview(&st, job.clone(), "a", Some(date)).unwrap();
+                    let p = &p.parts[0];
+                    assert!(!p.sql.contains(":run_date") && p.sql.contains(&p.run_date), "{p:?}");
+                    let got = rows(&st, conn, &p.sql).await;
+                    // A date may come back with a time (Oracle's DATE).
+                    assert!(got[0][0].starts_with(&ex.value), "{:?}: {} gave {:?}, not {}", part.kind, p.sql, got[0][0], ex.value);
+                }
+            }
+        }
+        // Other parameters stay as written; a bad date is refused.
+        let lite = conns[0].0.clone();
+        let mut job = plain_job("p", vec![node("a", "a", JobNodeKind::Query, Some(&lite), "select :run_date, :other")]);
+        let p = api::run_moment_preview(&st, job.clone(), "a", Some("2026-02-01")).unwrap();
+        assert_eq!(p.parts[0].sql, "select '2026-02-01', :other");
+        assert!(p.parts[0].text, "SQLite gets text");
+        assert!(api::run_moment_preview(&st, job.clone(), "a", Some("01/02/2026")).unwrap_err().message.contains("must be a date like"));
+        // No date asked: the job's own run_date, as a run gets it.
+        job.params.insert("run_date".into(), databrain_connector_core::sql::ParamValue { value: "2026-01-01".into(), raw: false });
+        let p = api::run_moment_preview(&st, job.clone(), "a", None).unwrap();
+        assert_eq!((p.date.as_str(), p.time.as_str(), p.parts[0].sql.as_str()), ("2026-01-01", "2026-01-01 00:00:00", "select '2026-01-01', :other"));
+        assert_eq!(api::run_moment_preview(&st, job, "a", Some("2026-03-04")).unwrap().date, "2026-03-04", "the date asked for wins");
+
+        // A load's before/after SQL runs on the target: its literal and
+        // examples, not those of Results (DuckDB), where the step's own SQL runs.
+        let mut load = node("l", "l", JobNodeKind::Load, None, "select 1 as day");
+        load.target_connection_id = Some(lite.clone());
+        load.load_before_sql = Some("delete from t where day = :run_date".into());
+        let job = plain_job("load", vec![load]);
+        let p = api::run_moment_preview(&st, job, "l", Some("2026-01-01")).unwrap();
+        let what: Vec<_> = p.parts.iter().map(|x| (x.what.as_str(), x.kind)).collect();
+        assert_eq!(what, [("step", ConnectorKind::Duckdb), ("before", ConnectorKind::Sqlite)]);
+        let before = &p.parts[1];
+        assert_eq!(before.sql, "delete from t where day = '2026-01-01'");
+        assert_eq!(before.examples[0].sql, "date(:run_date, '-1 day')");
+        assert_eq!(before.examples[0].value, "2025-12-31");
+        let got = rows(&st, &lite, &format!("select {}", before.examples[0].sql.replace(":run_date", &before.run_date))).await;
+        assert_eq!(got[0][0], "2025-12-31");
+    })
+    .await;
+}

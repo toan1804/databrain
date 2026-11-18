@@ -53,6 +53,16 @@ pub(crate) async fn resume_job(state: State<'_, AppState>, id: String) -> R<data
     api::resume_job(&state, &id)
 }
 
+#[tauri::command]
+pub(crate) async fn run_moment_preview(
+    state: State<'_, AppState>,
+    job: databrain_workspace::Job,
+    node_id: String,
+    date: Option<String>,
+) -> R<crate::jobs::RunMomentPreview> {
+    api::run_moment_preview(&state, job, &node_id, date.as_deref())
+}
+
 /// A desktop notification that a job run ended (the UI sends it when the
 /// window isn't focused: the user is in another app).
 #[tauri::command]

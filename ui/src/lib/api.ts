@@ -13,6 +13,7 @@ import type {
   Watermark,
   JobSummary,
   LoadDryRun,
+  RunMomentPreview,
   LoadTarget,
   BatchLimits,
   ImportAction,
@@ -365,6 +366,8 @@ export const api = {
   cancelJobStep: (id: string, nodeId: string) => call<boolean>("cancel_job_step", { id, nodeId }),
   /** Check a load step of `job` (as edited) without keeping any change. */
   dryRunJobStep: (job: Job, nodeId: string) => call<LoadDryRun>("dry_run_job_step", { job, nodeId }),
+  /** What `:run_date` / `:run_time` are in a step's SQL for a run for `date` (`2026-11-18`; null: now). */
+  runMomentPreview: (job: Job, nodeId: string, date: string | null) => call<RunMomentPreview>("run_moment_preview", { job, nodeId, date }),
   /** INSERT batch sizes a connection type allows (load steps). */
   loadBatchLimits: (kind: string) => call<BatchLimits>("load_batch_limits", { kind }),
   /** What else uses an output name (for a step of `jobId`), or null when free. */
