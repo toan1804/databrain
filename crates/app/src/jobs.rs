@@ -1896,6 +1896,129 @@ fn type_run_moment(params: &mut HashMap<String, ParamValue>, kind: ConnectorKind
     }
 }
 
+/// What `:run_date` and `:run_time` are in a step's SQL, for a run for a
+/// date: a user writing `where booking_date = :run_date - 1` sees the value
+/// its database gets, and the SQL as it would run.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct RunMomentPreview {
+    /// Where the step's SQL runs (a load's or export's on Results, DuckDB).
+    pub kind: ConnectorKind,
+    /// The run's date and time as given (`2026-11-18`, `2026-11-18 06:30:00`).
+    pub date: String,
+    pub time: String,
+    /// As the step's database gets them (`DATE '2026-11-18'`).
+    pub run_date: String,
+    pub run_time: String,
+    /// The step's SQL with them in (other parameters as written); empty
+    /// when the step has none of its own.
+    pub sql: String,
+    /// Ways to write the day before in this database, and what each gives.
+    pub examples: Vec<RunDateExample>,
+}
+
+/// An expression of `:run_date` in a database's SQL and the value it gives.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct RunDateExample {
+    /// "the day before", "the day before as text"…
+    pub label: String,
+    /// With `:run_date` (`to_char(:run_date - 1, 'DD-Mon-YY')`).
+    pub sql: String,
+    /// What it gives for the preview's date (`17-Nov-26`).
+    pub value: String,
+}
+
+/// The day before `:run_date` in `kind`'s SQL, then as text in three
+/// common shapes, each with what it gives for `date`. None where dates
+/// aren't SQL values (MongoDB, Neo4j). Checked against live servers in
+/// `run_date_examples_give_what_they_say` (tests/jobs.rs).
+pub fn run_date_examples(kind: ConnectorKind, date: chrono::NaiveDate) -> Vec<RunDateExample> {
+    use ConnectorKind as K;
+    let day_before = match kind {
+        K::Postgres | K::Oracle | K::Duckdb | K::Clickhouse => ":run_date - 1",
+        K::Mysql => ":run_date - interval 1 day",
+        K::Mssql | K::Snowflake => "dateadd(day, -1, :run_date)",
+        K::Bigquery => "date_sub(:run_date, interval 1 day)",
+        K::Databricks => "date_sub(:run_date, 1)",
+        K::Sqlite => "date(:run_date, '-1 day')",
+        _ => return vec![],
+    };
+    // (`2026-11-17`, `17-Nov-26`, `20261117`) in the database's own patterns.
+    let text = |iso: bool, dmy: bool| -> Option<String> {
+        let y = day_before;
+        let pick = |a: &str, b: &str, c: &str| {
+            Some(
+                (if iso {
+                    a
+                } else if dmy {
+                    b
+                } else {
+                    c
+                })
+                .to_string(),
+            )
+        };
+        match kind {
+            K::Postgres | K::Oracle => pick("YYYY-MM-DD", "DD-Mon-YY", "YYYYMMDD").map(|p| format!("to_char({y}, '{p}')")),
+            K::Snowflake => pick("YYYY-MM-DD", "DD-MON-YY", "YYYYMMDD").map(|p| format!("to_char({y}, '{p}')")),
+            K::Mysql => pick("%Y-%m-%d", "%d-%b-%y", "%Y%m%d").map(|p| format!("date_format({y}, '{p}')")),
+            // `convert` styles, not `format` (it needs the CLR, which
+            // Azure SQL Edge lacks, and is slow): 23 `2026-11-17`, 6
+            // `17 Nov 26`, 112 `20261117`.
+            K::Mssql if iso => Some(format!("convert(varchar(10), {y}, 23)")),
+            K::Mssql if dmy => Some(format!("replace(convert(varchar(9), {y}, 6), ' ', '-')")),
+            K::Mssql => Some(format!("convert(varchar(8), {y}, 112)")),
+            K::Clickhouse => pick("%Y-%m-%d", "%d-%b-%y", "%Y%m%d").map(|p| format!("formatDateTime({y}, '{p}')")),
+            K::Duckdb => pick("%Y-%m-%d", "%d-%b-%y", "%Y%m%d").map(|p| format!("strftime({y}, '{p}')")),
+            K::Bigquery => pick("%Y-%m-%d", "%d-%b-%y", "%Y%m%d").map(|p| format!("format_date('{p}', {y})")),
+            K::Databricks => pick("yyyy-MM-dd", "dd-MMM-yy", "yyyyMMdd").map(|p| format!("date_format({y}, '{p}')")),
+            // No month names in SQLite.
+            K::Sqlite if dmy => None,
+            K::Sqlite => Some(format!("strftime('{}', {y})", if iso { "%Y-%m-%d" } else { "%Y%m%d" })),
+            _ => None,
+        }
+    };
+    let before = date.pred_opt().unwrap_or(date);
+    let mut out = vec![RunDateExample { label: "the day before".into(), sql: day_before.into(), value: before.format("%Y-%m-%d").to_string() }];
+    for (iso, dmy, shape) in [(true, false, "%Y-%m-%d"), (false, true, "%d-%b-%y"), (false, false, "%Y%m%d")] {
+        if let Some(sql) = text(iso, dmy) {
+            out.push(RunDateExample { label: "the day before, as text".into(), sql, value: before.format(shape).to_string() });
+        }
+    }
+    out
+}
+
+/// [`RunMomentPreview`] of step `node_id` of `job` (as edited), for a run
+/// for `date` (`2026-11-18`), or now in the job's time zone.
+pub fn run_moment_preview(ctx: &JobCtx, job: &Job, node_id: &str, date: Option<&str>) -> Result<RunMomentPreview> {
+    let node = job.nodes.iter().find(|n| n.id == node_id).ok_or_else(|| EngineError::new("not_found", "No such step"))?;
+    let kind = match (&node.kind, node.connection_id.as_deref()) {
+        (JobNodeKind::Query, Some(c)) if !c.is_empty() => connection_kind(ctx, c),
+        _ => ConnectorKind::Duckdb,
+    };
+    let mut values = BTreeMap::new();
+    if let Some(d) = date.map(str::trim).filter(|d| !d.is_empty()) {
+        values.insert(RUN_DATE.to_string(), ParamValue { value: d.to_string(), raw: false });
+    }
+    fill_run_moment(job, &mut values, now_ms()).map_err(|e| EngineError::new("invalid", e))?;
+    let plain = |k: &str| values.get(k).map(|v| v.value.clone()).unwrap_or_default();
+    let (date, time) = (plain(RUN_DATE), plain(RUN_TIME));
+    let mut typed: HashMap<String, ParamValue> = values.into_iter().collect();
+    type_run_moment(&mut typed, kind);
+    let literal = |k: &str| typed.get(k).map(|v| v.value.clone()).unwrap_or_default();
+    let day = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok();
+    Ok(RunMomentPreview {
+        kind,
+        examples: day.map(|d| run_date_examples(kind, d)).unwrap_or_default(),
+        date,
+        time,
+        run_date: literal(RUN_DATE),
+        run_time: literal(RUN_TIME),
+        sql: databrain_connector_core::sql::substitute_known_parameters(&node.sql, kind, &typed),
+    })
+}
+
 /// The `:run_date` / `:run_time` of `job_id`'s latest successful run, for
 /// a run that follows it ("run after").
 fn moment_of_last_success(ctx: &JobCtx, job_id: &str) -> Option<RunParams> {

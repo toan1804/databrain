@@ -16,6 +16,7 @@ import { IncrementalFields } from "./IncrementalFields";
 import { LoadFields } from "./LoadFields";
 import { StepLimitFields } from "./LimitFields";
 import { RunLog } from "./RunLog";
+import { RunDateFields } from "./RunDateFields";
 import { RUN_DATE, wallClockUse } from "./runDate";
 import { EDITOR_KEY, NodeList, ProgressBar, StatusIcon, actionIcon, field, isResults, label, latestTab, statusText, type Patch } from "./shared";
 import { outputNames } from "../../lib/sqlText";
@@ -301,6 +302,8 @@ export function NodePanel({
         <RowsSection job={job} node={node} ups={ups} onChange={onChange} onSelect={onSelect} />
       )}
 
+      <RunDateFields job={job} node={node} />
+
       {node.kind === "export" && <ExportFields job={job} node={node} onChange={onChange} />}
 
       {node.kind === "load" && <LoadFields job={job} node={node} onChange={onChange} />}
@@ -327,7 +330,7 @@ function WallClockHint({ sql }: { sql: string }) {
       <AlertTriangle size={12} className="mt-0.5 shrink-0 text-warning" />
       <span>
         Uses <code>{fn}</code>: a run that starts late, a missed run made up later or a Resume the next day reads the day it runs, not the day it is for. Use{" "}
-        <code>:{RUN_DATE}</code> (the date the run is for), e.g. <code>where day = :{RUN_DATE} - 1</code>.
+        <code>:{RUN_DATE}</code> (the date the run is for): below, how to write the day before on this database and what it gives.
       </span>
     </div>
   );

@@ -222,6 +222,16 @@ pub fn quote_string(t: &str, kind: ConnectorKind) -> String {
 
 /// Replace every parameter of `sql`. Errors with the names that have no value.
 pub fn substitute_parameters(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>) -> Result<String, Vec<String>> {
+    substitute(sql, kind, values, false)
+}
+
+/// Replace the parameters of `sql` that `values` has; the others stay as
+/// written (`:name`), for a preview of some of them.
+pub fn substitute_known_parameters(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>) -> String {
+    substitute(sql, kind, values, true).unwrap_or_else(|_| sql.to_string())
+}
+
+fn substitute(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>, keep_missing: bool) -> Result<String, Vec<String>> {
     let spans = find_parameters(sql, kind);
     if spans.is_empty() {
         return Ok(sql.to_string());
@@ -251,6 +261,8 @@ pub fn substitute_parameters(sql: &str, kind: ConnectorKind, values: &std::colle
                 }
                 at = s.end;
             }
+            // Left as written: copied with the text around it.
+            None if keep_missing => {}
             None if !missing.contains(&s.name) => missing.push(s.name.clone()),
             None => {}
         }
@@ -414,5 +426,25 @@ mod param_tests {
         assert_eq!(substitute_parameters("select :d, :n, ':d', :d", K::Postgres, &v).unwrap(), "select '2026-09-09', 2000, ':d', '2026-09-09'");
         assert_eq!(substitute_parameters("select :d, :x, :y, :x", K::Postgres, &v).unwrap_err(), vec!["x", "y"]);
         assert_eq!(substitute_parameters("select 1", K::Postgres, &HashMap::new()).unwrap(), "select 1");
+    }
+}
+
+#[cfg(test)]
+mod known_tests {
+    use super::*;
+
+    /// A preview fills only the values it has: the others stay as written,
+    /// in place, and a value never joins the text around it into a comment.
+    #[test]
+    fn substitute_known_leaves_the_others_as_written() {
+        let v = std::collections::HashMap::from([("run_date".to_string(), ParamValue { value: "DATE '2026-11-18'".into(), raw: true })]);
+        let k = ConnectorKind::Oracle;
+        assert_eq!(substitute_known_parameters("select :run_date - 1, :other from dual", k, &v), "select DATE '2026-11-18' - 1, :other from dual");
+        assert_eq!(substitute_known_parameters("select ':run_date', :x", k, &v), "select ':run_date', :x");
+        assert_eq!(substitute_known_parameters("select 1", k, &v), "select 1");
+        let neg = std::collections::HashMap::from([("d".to_string(), ParamValue { value: "-1".into(), raw: false })]);
+        assert_eq!(substitute_known_parameters("select 1-:d, :e", k, &neg), "select 1- -1, :e");
+        // The full substitution still refuses what has no value.
+        assert_eq!(substitute_parameters("select :run_date, :other", k, &v), Err(vec!["other".to_string()]));
     }
 }
