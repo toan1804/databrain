@@ -33,8 +33,22 @@ interface JobsState {
   elsewhere: Record<string, boolean>;
   /** Log lines of runs seen live in this session, by run id. */
   logs: Record<number, RunLogEntry[]>;
-  /** Runs seen running in this window (the jobs tray follows them; their end is told). */
+  /** Runs seen running in this window (the activity bar follows them; their end is told). */
   seen: Record<number, true>;
+  /**
+   * Work the user hid from the activity bar (×) while it ran: `run:<id>`,
+   * or `bg:<job id>` for the background runner's. It comes back when new
+   * work starts or a hidden run fails.
+   */
+  barHidden: Record<string, true>;
+  /** Finished runs whose outcome left the bar (dismissed, or shown a while). */
+  barDismissed: Record<number, true>;
+  /** Hide the work running now from the bar (×). */
+  hideBar: (keys: string[]) => void;
+  /** Show everything hidden again (the Jobs icon, the command palette). */
+  showBar: () => void;
+  /** A finished run's outcome leaves the bar. */
+  dismissRun: (id: number) => void;
   refresh: () => Promise<void>;
   init: () => Promise<void>;
   open: (id: string, name: string) => void;
@@ -120,6 +134,11 @@ export const useJobs = create<JobsState>((set, get) => ({
   elsewhere: {},
   logs: {},
   seen: {},
+  barHidden: {},
+  barDismissed: {},
+  hideBar: (keys) => set((s) => ({ barHidden: { ...s.barHidden, ...Object.fromEntries(keys.map((k) => [k, true as const])) } })),
+  showBar: () => set((s) => (Object.keys(s.barHidden).length ? { barHidden: {} } : {})),
+  dismissRun: (id) => set((s) => (s.barDismissed[id] ? {} : { barDismissed: { ...s.barDismissed, [id]: true as const } })),
   refresh: async () => {
     if (!isTauri()) return;
     const { jobs, running, elsewhere } = await api.listJobs();
@@ -135,9 +154,12 @@ export const useJobs = create<JobsState>((set, get) => ({
         const saved = j.last_run;
         if (cur?.status === "running" && saved && saved.id >= cur.id && saved.status !== "running" && !live.has(j.id)) runs[j.id] = saved;
       }
+      // A run the background runner just started is new work: the bar comes back.
+      const started = (elsewhere ?? []).some((id) => !s.elsewhere[id]);
       return {
         jobs,
         runs,
+        ...(started ? { barHidden: {} } : {}),
         elsewhere: Object.fromEntries((elsewhere ?? []).map((id) => [id, true])),
         running: {
           ...Object.fromEntries(Object.entries(runs).filter(([, r]) => r.status === "running").map(([id]) => [id, true])),
@@ -308,16 +330,31 @@ export const useJobs = create<JobsState>((set, get) => ({
 
 /**
  * A "job-run" event: the run's latest state. Keeps the runs seen running
- * (the jobs tray follows them), tells on the desktop when one ends while
- * the window isn't focused, and toasts what has no card.
+ * (the activity bar follows them), brings the bar back for new work and
+ * for a hidden run that fails, tells on the desktop when one ends while
+ * the window isn't focused, and toasts what the bar doesn't show.
  */
 export function runEvent({ job_id, run }: { job_id: string; run: JobRun }) {
+  const key = `run:${run.id}`;
+  const before = useJobs.getState();
+  const isNew = run.status === "running" && !before.seen[run.id];
+  const wasHidden = !!before.barHidden[key];
+  // Its job's tab is shown: the tab tells how it ended, the bar needn't.
+  const st = useStore.getState();
+  const inView = st.tabs.find((t) => t.id === st.activeTabId)?.job_id === job_id;
   useJobs.setState((s) => ({
     runs: { ...s.runs, [job_id]: run },
     running: { ...s.running, [job_id]: run.status === "running" },
-    ...(run.status === "running" && !s.seen[run.id] ? { seen: { ...s.seen, [run.id]: true as const } } : {}),
+    ...(isNew ? { seen: { ...s.seen, [run.id]: true as const }, barHidden: {} } : {}),
+    ...(run.status === "error" && wasHidden ? { barHidden: {} } : {}),
+    ...(run.status !== "running" && (inView || (wasHidden && run.status !== "error")) ? { barDismissed: { ...s.barDismissed, [run.id]: true as const } } : {}),
   }));
   const seen = !!useJobs.getState().seen[run.id];
+  // Hidden and done without a failure: a short toast, not the bar again.
+  if (wasHidden && !inView && (run.status === "success" || run.status === "cancelled")) {
+    const name = useJobs.getState().jobs.find((j) => j.id === job_id)?.name ?? "A job";
+    useStore.getState().toast(`Job "${name}": ${runLine(run, Date.now())}`, run.status === "success" ? "success" : "info");
+  }
   if (run.status !== "running" && seen && !told.has(run.id)) {
     told.add(run.id);
     notifyIfAway(useJobs.getState().jobs, run, typeof document === "undefined" || document.hasFocus());

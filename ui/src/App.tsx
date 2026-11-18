@@ -29,6 +29,7 @@ import { DuckdbEngineBanner } from "./components/DuckdbEngine";
 import { useAi } from "./aiStore";
 import { isMac, kbd, modalOpen } from "./lib/platform";
 import { globalRunApplies } from "./lib/shortcuts";
+import { ActivityBar } from "./components/ActivityBar";
 
 function useGlobalShortcuts() {
   useEffect(() => {
@@ -225,6 +226,7 @@ export default function App() {
           </>
         )}
       </div>
+      <ActivityBar />
       <ConnectionDialog />
       <SaveQueryDialog />
       <ImportConnections />

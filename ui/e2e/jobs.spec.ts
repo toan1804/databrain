@@ -350,3 +350,37 @@ test.describe("the assistant changes a job with unsaved edits here", () => {
     expect((await lastSaved(page))?.nodes[0].sql).toBe("select 2");
   });
 });
+
+test.describe("the activity bar", () => {
+  test("a job running while the user is in an editor takes a row below it, not a card over it", async ({ page }) => {
+    const step = { id: "n1", name: "load_orders", kind: "query", connection_id: "conn-shop", sql: "select * from orders", x: 80, y: 80, load_mode: "insert" };
+    const job = { id: "job-orders", name: "Nightly sales", nodes: [step], edges: [], schedule: { enabled: false, mode: "interval", minutes: 60, at: "08:00", weekdays: [] }, created_at: 1, updated_at: 1 };
+    await openApp(page, backend({ __jobs: [job] }));
+    const started = Date.now() - 65_000;
+    const progress = { phase: "Inserting rows", done: 250_000, total: 1_000_000, elapsed_ms: 10_000 };
+    const run = (status: string, node: Record<string, unknown>) => ({ id: 7, job_id: job.id, trigger: "schedule", started_at: started, finished_at: status === "running" ? null : started + 90_000, status, nodes: [{ node_id: "n1", name: "load_orders", finished_at: 0, duration_ms: 0, ...node }], error: null });
+    const bar = page.getByRole("region", { name: "Background activity" });
+    await expect(bar).toHaveCount(0);
+
+    await emit(page, "job-run", { job_id: job.id, run: run("running", { status: "running", progress }) });
+    await expect(bar).toContainText("Nightly sales · load_orders: Inserting rows: 250,000 / 1,000,000 rows · 25%");
+    // Slid in (its height animates).
+    await expect.poll(() => bar.evaluate((el) => el.parentElement!.getBoundingClientRect().height)).toBe(24);
+    // Its own row: the editor ends where the bar starts.
+    const barBox = (await bar.boundingBox())!;
+    const editor = (await page.locator(".cm-editor").first().boundingBox())!;
+    expect(editor.y + editor.height).toBeLessThanOrEqual(barBox.y + 1);
+    expect(barBox.y + barBox.height).toBeLessThanOrEqual(page.viewportSize()!.height + 1);
+    await page.screenshot({ path: process.env.ACTIVITY_SHOT ?? "test-results/activity-bar.png" });
+
+    await bar.getByRole("button", { name: /Nightly sales/ }).click();
+    await expect(page.getByRole("dialog", { name: "Running jobs" })).toContainText("Stop");
+    if (process.env.ACTIVITY_SHOT) await page.screenshot({ path: process.env.ACTIVITY_SHOT.replace(".png", "-open.png") });
+    await page.keyboard.press("Escape");
+
+    await emit(page, "job-run", { job_id: job.id, run: run("error", { status: "error", error: 'relation "orders" does not exist' }) });
+    await expect(bar.getByRole("alert")).toContainText('Failed at load_orders: relation "orders" does not exist');
+    await bar.getByRole("button", { name: "Dismiss Nightly sales" }).click();
+    await expect(bar).toHaveCount(0);
+  });
+});

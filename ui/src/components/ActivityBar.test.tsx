@@ -13,7 +13,7 @@ const { useJobs, runEvent } = await import("../jobsStore");
 /** A "job-run" event, through the store's own handler. */
 const event = (r: JobRun) => runEvent({ job_id: r.job_id, run: r });
 const { useStore } = await import("../store");
-const { JobsTray, DONE_CARD_MS } = await import("./JobsTray");
+const { ActivityBar, DONE_MS } = await import("./ActivityBar");
 const { runLine } = await import("./job/shared");
 
 const node = (name: string, status: string, extra = {}) => ({ node_id: name, name, status, finished_at: 0, duration_ms: 0, ...extra }) as JobRun["nodes"][number];
@@ -25,7 +25,7 @@ function setRun(r: JobRun) {
 }
 
 beforeEach(() => {
-  useJobs.setState({ jobs: [{ id: "j", name: "Nightly sales" } as never, { id: "k", name: "Hourly" } as never], runs: {}, running: {}, elsewhere: {}, seen: {} });
+  useJobs.setState({ jobs: [{ id: "j", name: "Nightly sales" } as never, { id: "k", name: "Hourly" } as never], runs: {}, running: {}, elsewhere: {}, seen: {}, barHidden: {}, barDismissed: {} });
   useStore.setState({ tabs: [{ id: "t1", title: "Query", sql: "", connection_id: null } as never], activeTabId: "t1" });
 });
 
@@ -43,33 +43,50 @@ describe("a running job's line", () => {
   });
 });
 
-describe("the jobs tray", () => {
-  it("shows a job running while the user is in another tab, then how it ended", () => {
-    render(<JobsTray />);
+const bar = () => screen.queryByRole("region", { name: "Background activity" });
+
+describe("the activity bar", () => {
+  it("is there only while work runs: the running step, then how the run ended", () => {
+    const { container } = render(<ActivityBar />);
+    expect(bar()).toBeNull();
+    expect((container.firstElementChild as HTMLElement).style.height).toBe("0px");
     setRun(run("running", [loading]));
-    expect(screen.getByRole("status", { name: "Job Nightly sales" }).textContent).toContain("load_orders: Inserting rows");
-    expect(screen.getByRole("button", { name: /Stop/ })).toBeTruthy();
+    expect(bar()!.textContent).toContain("Nightly sales · load_orders: Inserting rows: 250,000 / 1,000,000 rows");
+    expect((container.firstElementChild as HTMLElement).style.height).toBe("24px");
+    // The details: Open and Stop.
+    act(() => screen.getByRole("button", { name: /Nightly sales/ }).click());
+    expect(screen.getByRole("dialog", { name: "Running jobs" }).textContent).toContain("Stop");
     setRun(run("error", [node("load_orders", "error", { error: "disk full" })], { finished_at: 5 }));
+    expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.getByRole("alert", { name: "Job Nightly sales" }).textContent).toContain("Failed at load_orders: disk full");
-    act(() => screen.getByRole("button", { name: "Dismiss" }).click());
-    expect(screen.queryByRole("alert")).toBeNull();
+    act(() => screen.getByRole("button", { name: "Dismiss Nightly sales" }).click());
+    expect(bar()).toBeNull();
   });
 
-  it("has no card while the job's own tab is shown, nor for a run finished before the app saw it run", () => {
-    useStore.setState({ tabs: [{ id: "t2", title: "Nightly sales", sql: "", connection_id: null, job_id: "j" } as never], activeTabId: "t2" });
-    render(<JobsTray />);
+  it("says how many run, and shows the background runner's runs without Stop", () => {
+    render(<ActivityBar />);
     setRun(run("running", [loading]));
-    expect(screen.queryByRole("status")).toBeNull();
-    // The user goes to an editor: the card shows.
-    act(() => useStore.setState({ tabs: [...useStore.getState().tabs, { id: "t1", title: "Query", sql: "", connection_id: null } as never], activeTabId: "t1" }));
-    expect(screen.getByRole("status", { name: "Job Nightly sales" })).toBeTruthy();
-
-    setRun(run("success", [node("a", "success")], { id: 9, finished_at: 5 }));
-    expect(screen.queryByRole("status", { name: "Job Nightly sales" })).toBeNull();
+    act(() => useJobs.setState({ elsewhere: { k: true } }));
+    expect(bar()!.textContent).toContain("2 jobs running · Nightly sales 25%, Hourly");
+    act(() => screen.getByRole("button", { name: /2 jobs running/ }).click());
+    const rows = screen.getByRole("dialog", { name: "Running jobs" });
+    expect(rows.textContent).toContain("Running in the background runner");
+    expect(screen.getAllByRole("button", { name: /Stop/ })).toHaveLength(1);
   });
 
-  it("has a card for a run that started and failed between two renders", () => {
-    render(<JobsTray />);
+  it("has no outcome for a run that ended while its tab was shown, nor for one never seen running", () => {
+    useStore.setState({ tabs: [{ id: "t2", title: "Nightly sales", sql: "", connection_id: null, job_id: "j" } as never], activeTabId: "t2" });
+    render(<ActivityBar />);
+    setRun(run("running", [loading]));
+    expect(bar()).not.toBeNull();
+    setRun(run("error", [node("load_orders", "error", { error: "x" })], { finished_at: 5 }));
+    expect(bar()).toBeNull();
+    setRun(run("success", [node("a", "success")], { id: 9, finished_at: 5 }));
+    expect(bar()).toBeNull();
+  });
+
+  it("shows a run that started and failed between two renders", () => {
+    render(<ActivityBar />);
     act(() => {
       event(run("running", [loading]));
       event(run("error", [node("load_orders", "error", { error: "disk full" })], { finished_at: 5 }));
@@ -77,46 +94,56 @@ describe("the jobs tray", () => {
     expect(screen.getByRole("alert", { name: "Job Nightly sales" }).textContent).toContain("disk full");
   });
 
-  it("shows three lines of a long error (all of it on hover), so Dismiss stays reachable", () => {
-    render(<JobsTray />);
-    const long = "at org.apache.spark.SparkException ".repeat(200);
-    setRun(run("running", [loading]));
-    setRun(run("error", [node("load_orders", "error", { error: long })], { finished_at: 5 }));
-    const line = screen.getByRole("alert").querySelector(".line-clamp-3");
-    expect(line?.getAttribute("title")).toBe(`Failed at load_orders: ${long}`);
-    expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
-  });
-
-  it("lets each successful run's card go on its own clock", () => {
+  it("lets each success go on its own clock, and keeps a failure", () => {
     vi.useFakeTimers();
     try {
-      render(<JobsTray />);
+      render(<ActivityBar />);
       setRun(run("running", [loading]));
       setRun(run("running", [loading], { id: 2, job_id: "k" }));
+      setRun(run("running", [loading], { id: 3, job_id: "f" }));
       setRun(run("success", [node("load_orders", "success")], { finished_at: 1 }));
-      act(() => vi.advanceTimersByTime(DONE_CARD_MS - 1_000));
+      act(() => vi.advanceTimersByTime(DONE_MS - 1_000));
       setRun(run("success", [node("load_orders", "success")], { id: 2, job_id: "k", finished_at: 1 }));
+      setRun(run("error", [node("load_orders", "error", { error: "boom" })], { id: 3, job_id: "f", finished_at: 1 }));
       act(() => vi.advanceTimersByTime(1_010));
       expect(screen.queryByRole("status", { name: "Job Nightly sales" })).toBeNull();
       expect(screen.getByRole("status", { name: "Job Hourly" })).toBeTruthy();
-      act(() => vi.advanceTimersByTime(DONE_CARD_MS));
+      act(() => vi.advanceTimersByTime(DONE_MS));
       expect(screen.queryByRole("status", { name: "Job Hourly" })).toBeNull();
+      expect(screen.getByRole("alert", { name: "Job Job" })).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("lets a successful run's card go by itself", () => {
-    vi.useFakeTimers();
+  it("hides with ×: a hidden success is a toast, a hidden failure and new work bring it back", () => {
+    const toasts: string[] = [];
+    const orig = useStore.getState().toast;
+    useStore.setState({ toast: (m: string) => void toasts.push(m) });
     try {
-      render(<JobsTray />);
+      render(<ActivityBar />);
       setRun(run("running", [loading]));
-      setRun(run("success", [node("load_orders", "success")], { finished_at: 60_000 }));
-      expect(screen.getByRole("status", { name: "Job Nightly sales" }).textContent).toContain("Finished in 1m 0s");
-      act(() => vi.advanceTimersByTime(DONE_CARD_MS + 10));
-      expect(screen.queryByRole("status", { name: "Job Nightly sales" })).toBeNull();
+      setRun(run("running", [loading], { id: 2, job_id: "k" }));
+      act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
+      expect(bar()).toBeNull();
+      // Hidden and succeeded: a toast, the bar stays away.
+      setRun(run("success", [node("a", "success")], { finished_at: 60_000 }));
+      expect(bar()).toBeNull();
+      expect(toasts).toEqual(['Job "Nightly sales": Finished in 1m 0s · 1 step']);
+      // Hidden and failed: back, with the failure (and what still runs).
+      setRun(run("error", [node("a", "error", { error: "disk full" })], { id: 2, job_id: "k", finished_at: 5 }));
+      expect(screen.getByRole("alert", { name: "Job Hourly" })).toBeTruthy();
+      act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
+      expect(bar()).toBeNull();
+      // New work: back.
+      setRun(run("running", [loading], { id: 4 }));
+      expect(bar()!.textContent).toContain("Nightly sales");
+      // The Jobs icon or the command palette show what was hidden.
+      act(() => screen.getByRole("button", { name: "Hide the activity bar" }).click());
+      act(() => useJobs.getState().showBar());
+      expect(bar()).not.toBeNull();
     } finally {
-      vi.useRealTimers();
+      useStore.setState({ toast: orig });
     }
   });
 });
