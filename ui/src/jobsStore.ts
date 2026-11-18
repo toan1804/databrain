@@ -70,7 +70,10 @@ export function notifyIfAway(jobs: JobSummary[], run: JobRun, focused: boolean) 
   const name = jobs.find((j) => j.id === run.job_id)?.name ?? "A job";
   const how = run.status === "success" ? "finished" : run.status === "cancelled" ? "stopped" : "failed";
   const line = runLine(run, Date.now());
-  const body = line.length > NOTIFY_MAX ? `${line.slice(0, NOTIFY_MAX - 1)}…` : line;
+  // By code points: a cut through an emoji's surrogate pair would be text
+  // the app refuses (the notification lost without a sign).
+  const chars = Array.from(line);
+  const body = chars.length > NOTIFY_MAX ? `${chars.slice(0, NOTIFY_MAX - 1).join("")}…` : line;
   void api.notifyJobRun(`Job "${name}" ${how}`, body, run.status === "error").catch(() => {});
 }
 
@@ -152,30 +155,7 @@ export const useJobs = create<JobsState>((set, get) => ({
         return logs === s.logs ? {} : { logs };
       }),
     );
-    await onJobRun(({ job_id, run }) => {
-      set((s) => ({
-        runs: { ...s.runs, [job_id]: run },
-        running: { ...s.running, [job_id]: run.status === "running" },
-        ...(run.status === "running" && !s.seen[run.id] ? { seen: { ...s.seen, [run.id]: true as const } } : {}),
-      }));
-      const seen = !!get().seen[run.id];
-      if (run.status !== "running" && seen && !told.has(run.id)) {
-        told.add(run.id);
-        notifyIfAway(get().jobs, run, typeof document === "undefined" || document.hasFocus());
-      }
-      if (run.status !== "running") {
-        // Tell what a step did that the user didn't set up by hand (a created table).
-        if (!noticed.has(run.id)) {
-          noticed.add(run.id);
-          for (const n of run.nodes) for (const msg of n.notices ?? []) if (msg.startsWith("Created table")) useStore.getState().toast(`${n.name}: ${msg}`, "info");
-        }
-        // Next run time and last status in the list.
-        clearTimeout(refreshTimer);
-        refreshTimer = setTimeout(() => void get().refresh().catch(() => {}), 200);
-        const failed = failureToast(get().jobs, run, seen);
-        if (failed) useStore.getState().toast(failed, "error");
-      }
-    });
+    await onJobRun(runEvent);
     // Runs of the background runner (another process) send no events: look
     // again now and then. Set up before the first look, which may fail (and
     // is then tried again by these).
@@ -325,3 +305,33 @@ export const useJobs = create<JobsState>((set, get) => ({
     }
   },
 }));
+
+/**
+ * A "job-run" event: the run's latest state. Keeps the runs seen running
+ * (the jobs tray follows them), tells on the desktop when one ends while
+ * the window isn't focused, and toasts what has no card.
+ */
+export function runEvent({ job_id, run }: { job_id: string; run: JobRun }) {
+  useJobs.setState((s) => ({
+    runs: { ...s.runs, [job_id]: run },
+    running: { ...s.running, [job_id]: run.status === "running" },
+    ...(run.status === "running" && !s.seen[run.id] ? { seen: { ...s.seen, [run.id]: true as const } } : {}),
+  }));
+  const seen = !!useJobs.getState().seen[run.id];
+  if (run.status !== "running" && seen && !told.has(run.id)) {
+    told.add(run.id);
+    notifyIfAway(useJobs.getState().jobs, run, typeof document === "undefined" || document.hasFocus());
+  }
+  if (run.status !== "running") {
+    // Tell what a step did that the user didn't set up by hand (a created table).
+    if (!noticed.has(run.id)) {
+      noticed.add(run.id);
+      for (const n of run.nodes) for (const msg of n.notices ?? []) if (msg.startsWith("Created table")) useStore.getState().toast(`${n.name}: ${msg}`, "info");
+    }
+    // Next run time and last status in the list.
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => void useJobs.getState().refresh().catch(() => {}), 200);
+    const failed = failureToast(useJobs.getState().jobs, run, seen);
+    if (failed) useStore.getState().toast(failed, "error");
+  }
+}

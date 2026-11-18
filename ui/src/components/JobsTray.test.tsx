@@ -6,10 +6,12 @@ vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {}, removeIt
 vi.mock("../lib/api", () => ({
   isTauri: () => false,
   toError: (e: unknown) => ({ kind: "internal", message: String(e) }),
-  api: { cancelJob: vi.fn(async () => true) },
+  api: { cancelJob: vi.fn(async () => true), notifyJobRun: vi.fn(async () => {}) },
 }));
 
-const { useJobs } = await import("../jobsStore");
+const { useJobs, runEvent } = await import("../jobsStore");
+/** A "job-run" event, through the store's own handler. */
+const event = (r: JobRun) => runEvent({ job_id: r.job_id, run: r });
 const { useStore } = await import("../store");
 const { JobsTray, DONE_CARD_MS } = await import("./JobsTray");
 const { runLine } = await import("./job/shared");
@@ -18,14 +20,6 @@ const node = (name: string, status: string, extra = {}) => ({ node_id: name, nam
 const run = (status: JobRun["status"], nodes: JobRun["nodes"], extra: Partial<JobRun> = {}): JobRun => ({ id: 1, job_id: "j", trigger: "manual", started_at: 0, status, nodes, ...extra });
 const loading = node("load_orders", "running", { progress: { phase: "Inserting rows", done: 250_000, total: 1_000_000, elapsed_ms: 10_000 } });
 
-/** What the store does with a "job-run" event (it keeps the runs seen running). */
-function event(r: JobRun) {
-  useJobs.setState((s) => ({
-    runs: { ...s.runs, [r.job_id]: r },
-    running: { ...s.running, [r.job_id]: r.status === "running" },
-    seen: r.status === "running" ? { ...s.seen, [r.id]: true as const } : s.seen,
-  }));
-}
 function setRun(r: JobRun) {
   act(() => event(r));
 }
@@ -130,8 +124,8 @@ describe("the jobs tray", () => {
 describe("the desktop notification", () => {
   it("is sent when a run ends while the window isn't focused, not while it is", async () => {
     const { api } = await import("../lib/api");
-    const notify = vi.fn(async () => {});
-    (api as unknown as { notifyJobRun: typeof notify }).notifyJobRun = notify;
+    const notify = vi.mocked(api.notifyJobRun);
+    notify.mockClear();
     const { notifyIfAway } = await import("../jobsStore");
     const jobs = [{ id: "j", name: "Nightly sales" } as never];
     notifyIfAway(jobs, run("error", [node("load", "error", { error: "disk full" })], { finished_at: 1 }), true);
@@ -147,5 +141,13 @@ describe("the desktop notification", () => {
     const body = (notify.mock.calls[2] as unknown as string[])[1];
     expect(body.length).toBe(200);
     expect(body.endsWith("…")).toBe(true);
+    // An emoji where the cut falls stays whole (no half surrogate pair).
+    const line = runLine(run("error", [node("load", "error", { error: "x".repeat(176) + "🔥".repeat(30) })], { finished_at: 1 }), 0);
+    expect(Array.from(line)[198]).toBe("🔥");
+    notifyIfAway(jobs, run("error", [node("load", "error", { error: "x".repeat(176) + "🔥".repeat(30) })], { finished_at: 1 }), false);
+    const cut = (notify.mock.calls[3] as unknown as string[])[1];
+    expect(Array.from(cut)).toHaveLength(200);
+    expect(cut.endsWith("🔥…")).toBe(true);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cut)).toBe(false);
   });
 });
