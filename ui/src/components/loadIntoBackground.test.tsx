@@ -157,3 +157,22 @@ describe("closing a tab that background work runs on", () => {
     expect(useStore.getState().tabs.some((t) => t.id === "t1")).toBe(false);
   });
 });
+
+describe("Stop while test data rows are still being made", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("cancels the AI request making them; once loading, the load", () => {
+    const ai = vi.spyOn(api, "aiCancel").mockResolvedValue(true as never);
+    const load = vi.spyOn(api, "cancelLoad").mockResolvedValue(true);
+    useLoads.setState({ items: [], inDialog: null });
+    const what = { id: "t1", table: "people", target: "Dev", label: "Test data into people" };
+    useLoads.getState().begin({ ...what, total: 100, phase: "AI is writing 100 rows…", aiRun: "run-1" });
+    useLoads.getState().cancel("t1");
+    expect(ai).toHaveBeenCalledWith("run-1");
+    expect(load).not.toHaveBeenCalled();
+    useLoads.getState().begin({ ...what, total: 100 });
+    expect(useLoads.getState().items[0].phase).toBeUndefined();
+    useLoads.getState().cancel("t1");
+    expect(load).toHaveBeenCalledWith("t1");
+  });
+});

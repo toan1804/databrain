@@ -1,6 +1,7 @@
-// "Load into…" loads of a result into a table, followed outside their
-// dialog: the dialog may close while one runs ("Continue in background"),
-// and the activity bar shows it, its progress and how it ended.
+// Loads of rows into a table, followed outside their dialog: "Load into…"
+// and test data's "Generate and load" (its rows made first, then loaded).
+// The dialog may close while one runs ("Continue in background"), and the
+// activity bar shows it, its progress and how it ended.
 import { create } from "zustand";
 import { api, onLoadProgress } from "./lib/api";
 import { useActivity } from "./activityStore";
@@ -10,6 +11,12 @@ import { registerTabUser } from "./tabUsers";
 
 export interface BackgroundLoad {
   id: string;
+  /** What it is, when not "Load into <table>" ("Test data into orders"). */
+  label?: string;
+  /** Before the load: what it does ("Making 100 rows…", "OpenAI is writing 300 rows…"). */
+  phase?: string;
+  /** The AI request making its rows, which Stop cancels before the load starts. */
+  aiRun?: string;
   /** The table and the connection it goes into. */
   table: string;
   target: string;
@@ -34,7 +41,7 @@ interface LoadsState {
   inDialog: string | null;
   setInDialog: (id: string | null) => void;
   /** A load started (in the dialog). */
-  begin: (l: { id: string; table: string; target: string; total: number; tabId?: string }) => void;
+  begin: (l: { id: string; table: string; target: string; total: number; tabId?: string; label?: string; phase?: string; aiRun?: string }) => void;
   /** It wrote `rows`: kept for the bar unless its dialog shows it, or it was hidden (a toast). */
   finish: (id: string, rows: number) => void;
   /** It failed: kept for the bar unless its dialog shows the error. */
@@ -54,12 +61,13 @@ export const useLoads = create<LoadsState>((set, get) => {
     items: [],
     inDialog: null,
     setInDialog: (inDialog) => set({ inDialog }),
-    begin: ({ id, table, target, total, tabId }) => {
+    begin: ({ id, table, target, total, tabId, label, phase, aiRun }) => {
       listening ??= onLoadProgress((e) => {
         if (item(e.load_id)?.status === "running") patch(e.load_id, { done: e.done, total: e.total || item(e.load_id)!.total });
       }).catch(() => {});
-      if (item(id)) return patch(id, { status: "running", stopping: false });
-      set((s) => ({ items: [...s.items, { id, table, target, done: 0, total, started: Date.now(), status: "running", tabId }] }));
+      // Again (rows made, now loading; or after a production prompt): the new phase, the same item.
+      if (item(id)) return patch(id, { status: "running", stopping: false, total, phase, aiRun });
+      set((s) => ({ items: [...s.items, { id, table, target, done: 0, total, started: Date.now(), status: "running", tabId, label, phase, aiRun }] }));
     },
     finish: (id, rows) => {
       const l = item(id);
@@ -81,11 +89,14 @@ export const useLoads = create<LoadsState>((set, get) => {
       const l = item(id);
       useActivity.getState().ended(`load:${id}`);
       get().dismiss(id);
-      if (l && get().inDialog !== id) useStore.getState().toast(`Load into ${l.table} stopped${l.stopReason ? `: ${l.stopReason}` : ""}`, "info");
+      if (l && get().inDialog !== id) useStore.getState().toast(`${l.label ?? `Load into ${l.table}`} stopped${l.stopReason ? `: ${l.stopReason}` : ""}`, "info");
     },
     cancel: (id) => {
+      const l = item(id);
       patch(id, { stopping: true });
-      void api.cancelLoad(id).catch(() => {});
+      // Still making its rows with the AI: that request stops; else the load.
+      if (l?.phase && l.aiRun) void api.aiCancel(l.aiRun).catch(() => {});
+      else void api.cancelLoad(id).catch(() => {});
     },
     dismiss: (id) => set((s) => ({ items: s.items.filter((x) => x.id !== id), inDialog: s.inDialog === id ? null : s.inDialog })),
   };
