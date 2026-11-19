@@ -147,3 +147,8 @@ pub(crate) async fn schema_diff(
 ) -> R<databrain_query_engine::schema_diff::SchemaDiff> {
     api::schema_diff(&state, &source, &target).await
 }
+
+#[tauri::command]
+pub(crate) async fn explore_query(state: State<'_, AppState>, connection_id: String, key: String, sql: String) -> R<api::ExploreRows> {
+    api::explore_query(&state, &connection_id, &key, &sql).await
+}

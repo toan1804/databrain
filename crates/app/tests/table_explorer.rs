@@ -108,3 +108,77 @@ fn sample_sql_must_be_one_read() {
         }
     }
 }
+
+/// The profile, statistics and counts of the table explorer (step 2) run
+/// through `explore_query`: one read on the table tab's own session, its
+/// rows returned (a profile is one row) and the result dropped, kept in the
+/// history as Explorer; a write is refused by the engine, whatever the UI sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn explorer_reads_return_rows_and_refuse_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("shop.db");
+    let st = state();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(db.to_string_lossy().into());
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "Shop".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let conn = api::save_connection(&st, SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let setup = databrain_query_engine::RunRequest {
+        connection_id: conn.clone(),
+        tab_id: "setup".into(),
+        sql: "create table orders(id integer primary key, status text, total real); insert into orders(status, total) values ('paid', 10.5), ('paid', 3), ('open', null);".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: databrain_workspace::Origin::User,
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+    };
+    for o in st.engine.run_and_wait(&st.hub, setup, None).await.unwrap() {
+        assert!(o.error.is_none(), "{:?}", o.error);
+    }
+
+    // The profile the tab builds for SQLite (ui/src/lib/explore.ts).
+    let sql = "SELECT\n  COUNT(*) AS total,\n  COUNT(id) AS n0,\n  COUNT(DISTINCT id) AS d0,\n  MIN(id) AS lo0,\n  MAX(id) AS hi0,\n  COUNT(status) AS n1,\n  COUNT(DISTINCT status) AS d1,\n  COUNT(total) AS n2,\n  COUNT(DISTINCT total) AS d2,\n  MIN(total) AS lo2,\n  MAX(total) AS hi2\nFROM orders";
+    let rows = api::explore_query(&st, &conn, "tab1#profile", sql).await.unwrap();
+    assert_eq!(rows.columns[..3], ["total", "n0", "d0"]);
+    let row: Vec<Option<&str>> = rows.rows[0].iter().map(|v| v.as_deref()).collect();
+    assert_eq!(row[0], Some("3"));
+    assert_eq!((row[5], row[6], row[7], row[8]), (Some("3"), Some("2"), Some("2"), Some("2")), "{row:?}");
+
+    // Top values: one row a value.
+    let top = api::explore_query(&st, &conn, "tab1#top", "SELECT status AS value, COUNT(*) AS n\nFROM orders\nGROUP BY status\nORDER BY n DESC\nLIMIT 10")
+        .await
+        .unwrap();
+    assert_eq!(top.rows[0], vec![Some("paid".to_string()), Some("2".to_string())]);
+
+    // A write (or a read followed by one) is refused, and nothing changed.
+    for bad in ["DELETE FROM orders", "SELECT 1; DELETE FROM orders"] {
+        let e = api::explore_query(&st, &conn, "tab1#count", bad).await.unwrap_err();
+        assert!(!e.message.is_empty(), "{bad}");
+    }
+    let n = api::explore_query(&st, &conn, "tab1#count", "SELECT COUNT(*) AS n\nFROM orders").await.unwrap();
+    assert_eq!(n.rows[0][0].as_deref(), Some("3"));
+
+    // Returned, not kept: none of these reads is left in the results list.
+    assert!(api::list_outputs(&st).iter().all(|o| !o.tab_id.starts_with("tab1#")), "{:?}", api::list_outputs(&st));
+
+    // In the history as the explorer's.
+    let origins: Vec<databrain_workspace::Origin> = st.workspace.list_history(&Default::default()).unwrap().into_iter().map(|h| h.origin).collect();
+    assert!(origins.contains(&databrain_workspace::Origin::Explorer), "{origins:?}");
+    for k in ["profile", "top", "count"] {
+        api::close_tab(&st, &format!("tab1#{k}"));
+    }
+}
