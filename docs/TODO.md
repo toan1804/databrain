@@ -26,7 +26,8 @@ The review's privacy gaps and bugs were fixed on 2026-11-15 (a connection's rule
 - **Notes about dropped or renamed tables stay** (hidden from the model, never removed), and there is no limit on the number of notes or proposals.
 - **A schema that becomes empty keeps its tables in the AI's catalog** until the next full index (not confirmed; `kn_replace_schema_read` with an empty list).
 - **Workspace SQLite on the async runtime**: `knowledge::retrieve` and a schema's index write run on the runtime's threads; a learn pass commits once per sighting.
-- **Providers**: the OpenAI-compatible stream is still read as complete when it ends without `[DONE]` or a finish reason (some local servers end that way); Gemini's `thoughtSignature` is not kept with a tool call (newer models may want it back; not confirmed); the SSE reader has no cap on one line or one event; inline completions cancelled before the first byte are counted as zero tokens.
+- **A stream's events are capped, not what they add up to per field:** a stream may send 128 MB in all (a line or an event 32 MB); within that, an answer's text or one tool call's arguments can take all of it.
+- **Providers**: the OpenAI-compatible stream is still read as complete when it ends without `[DONE]` or a finish reason (some local servers end that way); Gemini's `thoughtSignature` is not kept with a tool call (newer models may want it back; not confirmed); inline completions cancelled before the first byte are counted as zero tokens.
 
 ## Connectors (review of 2026-11-15)
 

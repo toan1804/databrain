@@ -463,7 +463,7 @@ pub fn openai_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -
             };
             let e = match e {
                 Ok(e) => e,
-                Err(err) => return Some((futures::stream::iter(vec![Err(AiError::Network(err))]).boxed(), (ev, (calls, true)))),
+                Err(err) => return Some((futures::stream::iter(vec![Err(err.into())]).boxed(), (ev, (calls, true)))),
             };
             if e.data.trim() == "[DONE]" {
                 finished = true;
@@ -632,7 +632,7 @@ pub fn anthropic_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>
         loop {
             let e = match ev.next().await? {
                 Ok(e) => e,
-                Err(err) => return Some((vec![Err(AiError::Network(err))], (ev, blocks, input_tokens))),
+                Err(err) => return Some((vec![Err(err.into())], (ev, blocks, input_tokens))),
             };
             let Ok(v) = serde_json::from_str::<Value>(&e.data) else { continue };
             let mut out: Vec<Result<ChatEvent>> = Vec::new();
@@ -798,7 +798,7 @@ pub fn gemini_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -
         .map(|e| -> Vec<Result<ChatEvent>> {
             let e = match e {
                 Ok(e) => e,
-                Err(err) => return vec![Err(AiError::Network(err))],
+                Err(err) => return vec![Err(err.into())],
             };
             let Ok(v) = serde_json::from_str::<Value>(&e.data) else { return vec![] };
             // An error in the stream (quota, overload) and a blocked
