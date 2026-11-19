@@ -66,6 +66,7 @@ import type { RunRequest } from "./bindings/RunRequest";
 import type { RunResponse } from "./bindings/RunResponse";
 import type { PlannedStatement } from "./bindings/PlannedStatement";
 import type { EngineError } from "./bindings/EngineError";
+import type { ExploreRows } from "./bindings/ExploreRows";
 import type { JobEvent } from "./bindings/JobEvent";
 import type { TestResult } from "./bindings/TestResult";
 import type { OutputInfo } from "./bindings/OutputInfo";
@@ -259,6 +260,7 @@ export type {
   RunResponse,
   PlannedStatement,
   EngineError,
+  ExploreRows,
   JobEvent,
   TestResult,
   OutputInfo,

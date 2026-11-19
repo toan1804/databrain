@@ -2,6 +2,7 @@ import type { StateCreator, StoreApi } from "zustand";
 import { flushDraft, flushDrafts } from "../drafts";
 import { api, isTauri, toError } from "../lib/api";
 import type { ParamValue } from "../lib/types";
+import { takeExploreKeys } from "../lib/explore";
 import { uid } from "../lib/util";
 import { editorBridge } from "../editorBridge";
 import { baseName, persistParams, persistTabs } from "./helpers";
@@ -197,6 +198,8 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     tabClosing(id);
     // A table explorer runs its sample on its own session too: stopped and closed with it.
     if (isTauri() && (s.tabs[idx].table || isQueryTab(s.tabs[idx]))) api.closeTab(id).catch(() => {});
+    // Its profile, statistics, top values and counts each run on a session of their own.
+    if (isTauri()) for (const key of takeExploreKeys(id)) api.closeTab(key).catch(() => {});
     // Dashboards: their charts' sessions and results.
     const dash = s.tabs[idx].dashboard_id;
     if (isTauri() && dash) {
