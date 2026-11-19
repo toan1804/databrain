@@ -10,6 +10,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 - **`dbr` in a terminal:** `dbr -c "Sales PG" -i "select …"` runs SQL on a saved connection as the app's editor does (read-only refuses writes, production is asked as `[y/N]` or `--yes`; the AI's table access rules and PII masking don't apply) and prints the rows: a table as wide as the terminal of up to 1,000 rows, or every row as `--csv`, `--json` or `--tsv` (CSV by default in a pipe), written a page at a time. It reads `.sql` files and data files and folders (CSV, Parquet, JSON, Excel, Delta/Iceberg/Parquet folders) too, fills `:name` with `-p`, and its runs are in the query history as "Terminal".
 - **Table explorer:** double-click a table or view (or right-click → "Open table") for a tab of its own: its path, kind, connection, row estimate and comment, then Data (its first 100–10,000 rows in the result grid, filtered by a `where` condition that is checked to be one read before it runs), Columns (types, keys, defaults, comments, the notes on each column), DDL and Notes (the knowledge base's notes on it; add one). On BigQuery the rows aren't read on opening: Run says how much the query bills first (LIMIT doesn't lower it). On a production connection they aren't read on opening either, and the first Run asks once. Its reads are in the query history marked "Explorer". The tab isn't reopened after a restart. Double-click used to insert the table's quoted name into the editor: right-click → "Insert table path" inserts its path, into the last query tab when the table's own tab is in front.
 
+### Fixed
+
+- **An AI provider's stream can't fill memory:** a line or an event of the stream past 32 MB (a misbehaving local or OpenAI-compatible server that never ends one), or a whole stream past 128 MB (endless small deltas) now ends the answer with a provider error, after what was read before it, instead of being held without limit; a long line is no longer scanned again from its start at every chunk.
+
 ## 0.4.5 - 2026-11-19
 
 ### Added
