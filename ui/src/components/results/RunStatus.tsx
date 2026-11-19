@@ -59,7 +59,7 @@ export function RunningView({ run, tabId }: { run: TabRun; tabId: string }) {
   );
 }
 
-export function ErrorView({ stmt, tabId, connectionId, count }: { stmt: StatementRun; tabId: string; connectionId?: string | null; count: number }) {
+export function ErrorView({ stmt, tabId, connectionId, count, noEditor = false }: { stmt: StatementRun; tabId: string; connectionId?: string | null; count: number; noEditor?: boolean }) {
   const e = stmt.error!;
   const cancelled = stmt.status === "cancelled";
   const send = useAi((s) => s.send);
@@ -91,7 +91,7 @@ export function ErrorView({ stmt, tabId, connectionId, count }: { stmt: Statemen
         </div>
         {!cancelled && <pre className="whitespace-pre-wrap break-words font-mono text-[12px] select-text">{e.message}</pre>}
         <div className="mt-2 font-mono text-[11px] text-muted">{sqlPreview(stmt.plan.sql, 200)}</div>
-        {!cancelled && (
+        {!cancelled && !noEditor && (
           <button className="btn-ghost mt-2 border border-line py-1" onClick={fix}>
             <Wrench size={12} /> Fix with AI
           </button>

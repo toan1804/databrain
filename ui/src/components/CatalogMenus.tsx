@@ -1,15 +1,15 @@
 // Copy / insert actions for catalog objects (explorer tree and catalog search).
 import { traitsOf } from "../lib/sourceTraits";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ClipboardCopy, Columns3, FileCode2, GitCompare, Play, Shuffle, RefreshCw, Share2, TextCursorInput } from "lucide-react";
+import { ClipboardCopy, Columns3, FileCode2, GitCompare, Play, Shuffle, RefreshCw, Share2, Table2, TextCursorInput } from "lucide-react";
 import { toError } from "../lib/api";
 import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
 import { quoteIdent } from "../lib/util";
 import { editorBridge } from "../editorBridge";
-import { useStore } from "../store";
+import { isQueryTab, useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
-import { openCompare, openErDiagram } from "./openTabs";
+import { openCompare, openErDiagram, openTable } from "./openTabs";
 
 export async function copyText(text: string, what: string) {
   try {
@@ -23,12 +23,16 @@ export async function copyText(text: string, what: string) {
 /** Insert text at the cursor of the active editor (query tab or notebook cell). */
 export function insertText(text: string) {
   const st = useStore.getState();
-  const tab = st.tabs.find((t) => t.id === st.activeTabId);
-  if (!tab || tab.output_ref || tab.ddl) {
+  const active = st.tabs.find((t) => t.id === st.activeTabId);
+  // Into the shown query tab, else the last one (shown then): a table
+  // explorer or DDL view in front has no editor.
+  const tab = isQueryTab(active) ? active : [...st.tabs].reverse().find(isQueryTab);
+  if (!tab) {
     st.toast("Open a query tab to insert into the editor", "info");
     return;
   }
-  editorBridge.insert(st.activeTabId, text);
+  if (tab.id !== st.activeTabId) st.setActiveTab(tab.id);
+  editorBridge.insert(tab.id, text);
 }
 
 /**
@@ -139,6 +143,12 @@ export function ObjectMenu({
   const run = (f: () => void) => () => (onClose(), f());
   return (
     <Popover x={at.x} y={at.y} onClose={onClose} className="w-72">
+      {isRelation && (
+        <>
+          <MenuItem icon={<Table2 size={13} />} label="Open table" hint="data, columns, DDL, notes" onClick={run(() => openTable(conn, obj))} />
+          <MenuSeparator />
+        </>
+      )}
       <MenuItem icon={<ClipboardCopy size={13} />} label="Copy table name" hint={obj.name.length > 22 ? undefined : obj.name} onClick={run(() => void copyText(obj.name, "table name"))} />
       <MenuItem icon={<ClipboardCopy size={13} />} label="Copy table path" onClick={run(() => void copyText(path, "table path"))} />
       <MenuItem icon={<ClipboardCopy size={13} />} label="Copy schema name" hint={schema.length > 22 ? undefined : schema} onClick={run(() => void copyText(schema, "schema name"))} />

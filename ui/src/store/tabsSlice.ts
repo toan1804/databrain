@@ -172,6 +172,7 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
       saved_query_id: init?.saved_query_id ?? null,
       output_ref: init?.output_ref ?? null,
       ddl: init?.ddl ?? null,
+      table: init?.table ?? null,
       lineage: init?.lineage ?? null,
       job_id: init?.job_id ?? null,
       plan: init?.plan ?? null,
@@ -194,7 +195,8 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     if (s.txOpen[id] && !window.confirm("This tab has an open transaction. Close it and roll back the uncommitted changes?")) return;
     // What runs on its session stops with it, and says why.
     tabClosing(id);
-    if (isTauri() && isQueryTab(s.tabs[idx])) api.closeTab(id).catch(() => {});
+    // A table explorer runs its sample on its own session too: stopped and closed with it.
+    if (isTauri() && (s.tabs[idx].table || isQueryTab(s.tabs[idx]))) api.closeTab(id).catch(() => {});
     // Dashboards: their charts' sessions and results.
     const dash = s.tabs[idx].dashboard_id;
     if (isTauri() && dash) {
@@ -222,7 +224,7 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     // Remembered to reopen (not empty scratch tabs); the editor text and
     // parameters come back, the result doesn't (its session was closed).
     const closed = s.tabs[idx];
-    const keep = !!(closed.sql.trim() || closed.notebook_id || closed.output_ref || closed.ddl || closed.job_id || closed.saved_query_id);
+    const keep = !!(closed.sql.trim() || closed.notebook_id || closed.output_ref || closed.ddl || closed.table || closed.job_id || closed.saved_query_id);
     const closedTabs = keep ? [...s.closedTabs, { tab: closed, index: idx, params: s.params[id] }].slice(-20) : s.closedTabs;
     set({ tabs, activeTabId, runs, params, closedTabs, txOpen });
     persistParams(params);
@@ -250,6 +252,14 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     const s = get();
     const last = s.closedTabs[s.closedTabs.length - 1];
     if (!last) return false;
+    // One tab per table: a table explorer opened again since it closed is shown, not doubled.
+    const ref = last.tab.table;
+    const same = ref && s.tabs.find((t) => t.table && t.connection_id === last.tab.connection_id && t.table.schema === ref.schema && t.table.name === ref.name);
+    if (same) {
+      set({ closedTabs: s.closedTabs.slice(0, -1) });
+      get().setActiveTab(same.id);
+      return true;
+    }
     // A new id: the old one's session and outputs are gone.
     const tab: Tab = { ...last.tab, id: uid() };
     const savedParams = last.params;

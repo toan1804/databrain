@@ -15,6 +15,9 @@ pub enum Origin {
     Mcp,
     /// A job step (manual or scheduled run).
     Job,
+    /// The table explorer's sample rows: one read only (the engine refuses
+    /// anything else, whatever was typed in its `where` box).
+    Explorer,
 }
 
 impl Origin {
@@ -24,6 +27,7 @@ impl Origin {
             Origin::Ai => "ai",
             Origin::Mcp => "mcp",
             Origin::Job => "job",
+            Origin::Explorer => "explorer",
         }
     }
     pub(crate) fn parse(s: &str) -> Self {
@@ -31,6 +35,7 @@ impl Origin {
             "ai" => Origin::Ai,
             "mcp" => Origin::Mcp,
             "job" => Origin::Job,
+            "explorer" => Origin::Explorer,
             _ => Origin::User,
         }
     }

@@ -326,7 +326,7 @@ function defaultTargetKey(): string | null {
     return focused;
   }
   // Only query tabs have an editor to read or write.
-  return active?.notebook_id || active?.ddl || active?.job_id || active?.lineage || active?.output_ref ? null : (active?.id ?? null);
+  return active?.notebook_id || active?.ddl || active?.table || active?.job_id || active?.lineage || active?.output_ref ? null : (active?.id ?? null);
 }
 
 /** What the assistant is doing now, for the status line while it works. */

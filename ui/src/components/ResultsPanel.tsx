@@ -16,10 +16,12 @@ export interface ResultsPanelProps {
   /** Overrides for notebook cells (no tab of their own). */
   connectionId?: string | null;
   title?: string;
+  /** No SQL editor behind these results (the table explorer): no "Fix with AI" or "Optimize". */
+  noEditor?: boolean;
   compact?: boolean;
 }
 
-export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPanelProps) {
+export function ResultsPanel({ tabId, connectionId, title, compact, noEditor = false }: ResultsPanelProps) {
   const run = useStore((s) => s.runs[tabId]);
   const setActive = useStore((s) => s.setActiveStatement);
   const keepResult = useStore((s) => s.keepResult);
@@ -102,7 +104,8 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
         </div>
       </div>
       {!showMessages && <CostBar tabId={tabId} />}
-      {!showMessages && <TipsBar run={run} tabId={tabId} />}
+      {/* Query tips and "Optimize" act on an editor's SQL: not in a tab without one (the table explorer). */}
+      {!showMessages && !noEditor && <TipsBar run={run} tabId={tabId} />}
       <div className="min-h-0 flex-1">
         {showMessages ? (
           <Messages run={run} />
@@ -118,7 +121,7 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
             readOnly={!!active.added}
           />
         ) : active?.error ? (
-          <ErrorView stmt={active} tabId={tabId} connectionId={connectionId} count={run.statements.length} />
+          <ErrorView stmt={active} tabId={tabId} connectionId={connectionId} count={run.statements.length} noEditor={noEditor} />
         ) : active?.status === "done" ? (
           <DoneView stmt={active} />
         ) : run.running ? (

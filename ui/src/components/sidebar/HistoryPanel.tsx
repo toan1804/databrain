@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { AlertCircle, Ban, CheckCircle2, Sparkles, History, Loader2, Play, Plug, SquarePen, Trash2, Workflow } from "lucide-react";
+import { AlertCircle, Ban, CheckCircle2, Sparkles, History, Loader2, Play, Plug, SquarePen, Table2, Trash2, Workflow } from "lucide-react";
 import { api, toError } from "../../lib/api";
 import type { HistoryClear, HistoryEntry, RunStatus } from "../../lib/types";
 import { formatCount, formatDuration, relativeTime, sqlPreview } from "../../lib/util";
@@ -302,6 +302,11 @@ export function HistoryPanel() {
               {h.origin === "job" && (
                 <span className="flex shrink-0 items-center gap-0.5 rounded bg-hover px-1 text-fg" title="Run by a job step">
                   <Workflow size={9} /> Job
+                </span>
+              )}
+              {h.origin === "explorer" && (
+                <span className="flex shrink-0 items-center gap-0.5 rounded bg-hover px-1 text-fg" title="Sample rows read by a table explorer tab">
+                  <Table2 size={9} /> Explorer
                 </span>
               )}
               {(h.origin === "ai" || h.origin === "mcp") && (

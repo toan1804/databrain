@@ -1,7 +1,7 @@
 import type { StateCreator } from "zustand";
 import { announceSshHostKey, api, isTauri, toError } from "../lib/api";
 import { computeRunTips, slowStatements } from "../queryTips";
-import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
+import type { JobEvent, Origin, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
 import { outputLabel } from "../lib/dataflow";
 import { ddlEffect } from "./explorerSlice";
@@ -91,6 +91,8 @@ export interface RunsSlice {
     /** Run it as a new version of this output only (saved grid edits shown
      * again): the run's other results stay. `sql` is that output's statement. */
     replaces?: string,
+    /** Who runs it, for the history (default: the user); `explorer` runs one read only. */
+    origin?: Origin,
   ) => Promise<boolean>;
   /** Run the statement of result `index` of the run again, as that result only. */
   refreshResult: (runKey: string, index: number) => Promise<boolean>;
@@ -323,7 +325,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values);
   },
 
-  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params, rowLimit, replaces) => {
+  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params, rowLimit, replaces, origin) => {
     const conn = get().connections.find((c) => c.id === connectionId);
     // Closed while the run was starting (connecting, a confirmation, a
     // sign-in): what started is stopped and nothing is shown for it.
@@ -342,6 +344,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           session_key: sessionKey ?? null,
           output_name: outputName ?? null,
           params: params ?? {},
+          ...(origin ? { origin } : {}),
         };
         const resp = replaces ? await api.rerunOutput(req, replaces) : await api.runQuery(req);
         if (resp.status === "started" && closed()) {

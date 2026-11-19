@@ -300,6 +300,29 @@ describe("reopen closed tabs", () => {
     expect(st().params[t.id]).toEqual({ d: { value: "2026-01-01" } });
     expect(st().reopenClosedTab()).toBe(false);
   });
+
+  it("shows a table explorer opened again since it closed instead of doubling it", () => {
+    const orders = { schema: "public", name: "orders", kind: "table" as const };
+    useStore.setState({
+      tabs: [
+        { id: "a", title: "A", sql: "select 1", connection_id: "c1" },
+        { id: "t1", title: "orders", sql: "", connection_id: "c1", table: orders },
+      ],
+      activeTabId: "t1",
+      closedTabs: [],
+      params: {},
+    });
+    const st = () => useStore.getState();
+    st().closeTab("t1");
+    expect(st().closedTabs.map((c) => c.tab.table?.name)).toEqual(["orders"]);
+    // Opened again (double-click) before ⇧⌘T.
+    st().newTab({ title: "orders", sql: "", connection_id: "c1", table: orders });
+    const open = st().activeTabId;
+    st().setActiveTab("a");
+    expect(st().reopenClosedTab()).toBe(true);
+    expect(st().tabs.filter((t) => t.table?.name === "orders").map((t) => t.id)).toEqual([open]);
+    expect([st().activeTabId, st().closedTabs.length]).toEqual([open, 0]);
+  });
 });
 
 describe("closing a tab with unsaved edits", () => {

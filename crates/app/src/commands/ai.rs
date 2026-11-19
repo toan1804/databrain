@@ -129,6 +129,16 @@ pub(crate) async fn kn_get(state: State<'_, AppState>, connection_id: String) ->
 }
 
 #[tauri::command]
+pub(crate) async fn kn_table_notes(state: State<'_, AppState>, connection_id: String, schema: String, name: String) -> R<ai_api::TableNotes> {
+    ai_api::table_notes(&state, &connection_id, &schema, &name)
+}
+
+#[tauri::command]
+pub(crate) async fn check_sample_sql(state: State<'_, AppState>, connection_id: String, sql: String) -> R<()> {
+    ai_api::check_sample_sql(&state, &connection_id, &sql)
+}
+
+#[tauri::command]
 pub(crate) async fn kn_objects(state: State<'_, AppState>, connection_id: String, filter: String, offset: usize, limit: usize) -> R<ai_api::KnObjectPage> {
     ai_api::knowledge_objects(&state, &connection_id, &filter, offset, limit)
 }
