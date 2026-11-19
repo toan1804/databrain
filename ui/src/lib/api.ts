@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ExploreRows,
   Job,
   JobRun,
   JobRunEvent,
@@ -467,6 +468,8 @@ export const api = {
   knTableNotes: (connectionId: string, schema: string, name: string) => call<TableNotes>("kn_table_notes", { connectionId, schema, name }),
   /** The table explorer's sample SQL is one read without parameters (else why not). */
   checkSampleSql: (connectionId: string, sql: string) => call<void>("check_sample_sql", { connectionId, sql }),
+  /** One table explorer read (profile, statistics, top values, count) on session `key`: one read or refused. */
+  exploreQuery: (connectionId: string, key: string, sql: string) => call<ExploreRows>("explore_query", { connectionId, key, sql }),
   /** Tables the AI may use matching `filter` (schema.name or comment), one page at a time. */
   knObjects: (connectionId: string, filter: string, offset: number, limit: number) =>
     call<KnObjectPage>("kn_objects", { connectionId, filter, offset, limit }),

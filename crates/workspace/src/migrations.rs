@@ -605,12 +605,9 @@ impl Workspace {
                 st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
             };
             for (id, _) in ids.into_iter().filter(|(_, n)| names.contains(&n.trim().to_lowercase())) {
-                let job = self.get_job(&id)?;
-                if job.nodes.iter().all(|n| n.ai_sql) {
-                    continue;
+                if let Some(name) = self.set_ai_sql_all(&id)? {
+                    marked.push(name);
                 }
-                self.set_ai_sql_all(&job)?;
-                marked.push(job.name);
             }
         }
         self.conn.lock().execute("INSERT OR IGNORE INTO maintenance (name, done_at) VALUES (?1, ?2)", params![DONE, now_ms()])?;
