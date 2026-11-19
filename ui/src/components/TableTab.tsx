@@ -1,13 +1,14 @@
 // Table explorer: one tab per table or view that gathers what DataBrain
-// knows and can read about it: sample rows, columns, DDL and notes (see
-// docs/TODO.md "Table explorer" for the later parts: column profile,
-// statistics, relations, history, usage).
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { AlertTriangle, FileCode2, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Table2 } from "lucide-react";
+// knows and can read about it: sample rows, columns with their profile,
+// statistics, DDL and notes (see docs/TODO.md "Table explorer" for the later
+// parts: relations, history, usage).
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AlertTriangle, BarChart3, FileCode2, Hash, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Square, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { RESULTS_SCHEMA_ID, tablePath } from "../lib/catalog";
 import { traitsOf } from "../lib/sourceTraits";
-import type { ConnectionView, ObjectDetail, TableNote, TableNotes } from "../lib/types";
+import type { ConnectionView, ExploreRows, ObjectDetail, TableNote, TableNotes } from "../lib/types";
+import { approxDistinct, billsScans, columnClass, countSql, exploreKey, num, profileSql, PROFILE_MAX_COLUMNS, readAllReasons, readProfile, STAT_LABELS, statisticsSql, topValuesSql, TOP_VALUES, type Built } from "../lib/explore";
 import { formatBytes, formatCount, relativeTime, sampleSql, shortCount } from "../lib/util";
 import { useStore, type DdlRef } from "../store";
 import { DdlTab } from "./DdlTab";
@@ -15,7 +16,7 @@ import { ResultsPanel } from "./ResultsPanel";
 import { ConnDot, EnvBadge } from "./ui";
 import { objectRef, selectTop } from "./CatalogSearch";
 
-type Part = "data" | "columns" | "ddl" | "notes";
+type Part = "data" | "columns" | "stats" | "ddl" | "notes";
 type Detail = { status: "loading" } | { status: "ready"; detail: ObjectDetail } | { status: "error"; message: string };
 type Notes = { status: "loading" } | { status: "ready"; notes: TableNotes } | { status: "error"; message: string };
 
@@ -30,6 +31,8 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
   const [notes, setNotes] = useState<Notes>({ status: "loading" });
   const [detailSeq, setDetailSeq] = useState(0);
   const [notesSeq, setNotesSeq] = useState(0);
+  // Reads that scan the whole table (profile, count, top values) ask once per tab on production or a large table.
+  const heavyAsked = useRef(false);
   const kind = conn?.config.kind;
   const path = kind ? tablePath(kind, reference.schema, reference.name) : reference.name;
   const connId = conn?.id;
@@ -64,9 +67,11 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
   const columns = d?.columns ?? [];
   const loadable = reference.kind === "table" && !!traitsOf(kind).load;
   const noteList = notes.status === "ready" ? notes.notes.notes : [];
+  const explore: Explore = { tabId, conn, reference, rowEstimate: object?.row_estimate ?? null, asked: heavyAsked };
   const parts: { key: Part; label: string; count?: number }[] = [
     { key: "data", label: "Data" },
     { key: "columns", label: "Columns", count: d ? columns.length : undefined },
+    { key: "stats", label: "Statistics" },
     { key: "ddl", label: "DDL" },
     { key: "notes", label: "Notes", count: noteList.length || undefined },
   ];
@@ -150,9 +155,10 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
           ) : detail.status === "error" ? (
             <p className="p-3 text-[12px] text-danger">{detail.message}</p>
           ) : (
-            <ColumnsPart detail={detail.detail} notes={noteList} />
+            <ColumnsPart detail={detail.detail} notes={noteList} explore={explore} />
           ),
         )}
+        {slot("stats", <StatisticsPart explore={explore} />)}
         {/* The DDL view as Show DDL opens it, in this tab (read once). */}
         {slot("ddl", <DdlTab tabId={tabId} reference={reference} visible={visible && part === "ddl"} />)}
         {slot("notes", <NotesPart conn={conn} notes={notes} onSaved={() => setNotesSeq((n) => n + 1)} />)}
@@ -170,12 +176,6 @@ function Busy() {
 }
 
 const SAMPLE_SIZES = [100, 1000, 10000];
-
-/**
- * A database that bills a query by the bytes it scans, whatever its LIMIT
- * (BigQuery): its sample doesn't run by itself, and Run says what it reads.
- */
-export const billsScans = (kind: string) => kind === "bigquery";
 
 /** Sample rows: the first N, filtered by a condition, in the result grid (sort, find, copy, export, load into). */
 function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionView; reference: DdlRef }) {
@@ -310,7 +310,13 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
 }
 
 /** The columns as the database describes them, with keys, comments and notes. */
-function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote[] }) {
+function ColumnsPart({ detail, notes, explore }: { detail: ObjectDetail; notes: TableNote[]; explore: Explore }) {
+  const [profile, setProfile] = useState<ReturnType<typeof readProfile> | null>(null);
+  // The column whose top values show under it (one at a time).
+  const [open, setOpen] = useState<string | null>(null);
+  const kind = explore.conn.config.kind;
+  const approx = approxDistinct(kind);
+  const pct = (n: number | null) => (n == null || !profile?.total ? "" : `${((n / profile.total) * 100).toFixed(n === profile.total || n === 0 ? 0 : 1)}%`);
   const fkOf = (col: string) => detail.foreign_keys.find((f) => f.columns.length === 1 && f.columns[0].toLowerCase() === col.toLowerCase());
   // The server says which column a note is on (a note on the table is on none).
   // An approved note before a proposed one.
@@ -320,7 +326,10 @@ function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote
   };
   if (!detail.columns.length) return <p className="p-3 text-[12px] text-muted">The database lists no columns for it.</p>;
   return (
-    <div className="h-full overflow-auto">
+    <div className="flex h-full min-h-0 flex-col">
+      <ProfileBar e={explore} detail={detail} onProfile={(p) => p && setProfile(p)} />
+      <div className="min-h-0 flex-1 overflow-auto">
+      {profile?.total != null && <div className="px-2 pt-1.5 text-[11.5px] text-muted">{formatCount(profile.total)} rows read</div>}
       <table className="w-full border-collapse text-[12px]">
         <thead className="sticky top-0 bg-panel text-left text-[11px] uppercase tracking-wide text-muted">
           <tr>
@@ -331,14 +340,26 @@ function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote
             <th className="px-2 py-1 font-medium">Key</th>
             <th className="px-2 py-1 font-medium">Default</th>
             <th className="px-2 py-1 font-medium">Comment / note</th>
+            {profile && (
+              <>
+                <th className="px-2 py-1 text-right font-medium">Non-null</th>
+                <th className="px-2 py-1 text-right font-medium" title={approx ? "Approximate: the database's fast distinct count" : undefined}>
+                  Distinct{approx ? " ≈" : ""}
+                </th>
+                <th className="px-2 py-1 font-medium">Min … max</th>
+              </>
+            )}
           </tr>
         </thead>
         <tbody>
           {detail.columns.map((c, i) => {
             const fk = fkOf(c.name);
             const note = noteOf(c.name);
+            const p = profile?.columns[i];
+            const countable = columnClass(kind, c.data_type) !== "other";
             return (
-              <tr key={c.name} className="border-t border-line/60 hover:bg-hover/40">
+              <Fragment key={c.name}>
+              <tr className="border-t border-line/60 hover:bg-hover/40">
                 <td className="px-2 py-1 text-right tabular-nums text-muted">{i + 1}</td>
                 <td className="px-2 py-1 font-mono">{c.name}</td>
                 <td className="px-2 py-1 font-mono text-muted">{c.data_type}</td>
@@ -368,7 +389,36 @@ function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote
                     </div>
                   )}
                 </td>
+                {profile && (
+                  <>
+                    <td className="px-2 py-1 text-right tabular-nums" title={p?.nonNull != null ? `${formatCount(p.nonNull)} non-null` : "Past the profiled columns"}>
+                      {pct(p?.nonNull ?? null)}
+                    </td>
+                    <td className="px-2 py-1 text-right tabular-nums">
+                      {p?.distinct != null ? (
+                        <button className="underline decoration-dotted hover:text-accent" onClick={() => setOpen(open === c.name ? null : c.name)} title="Show its most common values" aria-expanded={open === c.name}>
+                          {formatCount(p.distinct)}
+                        </button>
+                      ) : (
+                        <span className="text-muted" title={countable ? "Past the profiled columns" : "Not counted: values of this type can't be compared on every database"}>
+                          —
+                        </span>
+                      )}
+                    </td>
+                    <td className="max-w-[260px] truncate px-2 py-1 font-mono text-[11px]" title={p?.lo != null ? `${p.lo} … ${p.hi}` : undefined}>
+                      {p?.lo != null ? `${p.lo} … ${p.hi}` : ""}
+                    </td>
+                  </>
+                )}
               </tr>
+              {open === c.name && (
+                <tr className="bg-hover/30">
+                  <td colSpan={10}>
+                    <TopValues e={explore} column={c.name} />
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             );
           })}
         </tbody>
@@ -384,6 +434,7 @@ function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote
             ))}
         </div>
       )}
+      </div>
     </div>
   );
 }
@@ -446,6 +497,254 @@ function NotesPart({ conn, notes, onSaved }: { conn: ConnectionView; notes: Note
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ profile and statistics (step 2)
+
+/** What the profile, statistics and count parts need to run their reads. */
+type Explore = { tabId: string; conn: ConnectionView; reference: DdlRef; rowEstimate: number | null; asked: { current: boolean } };
+
+/** How a DuckDB result or attached file is named (as Query names it), else undefined. */
+function localFrom(e: Explore): { from?: string; local?: "results" | "files" } {
+  const { conn, reference } = e;
+  if (conn.config.kind !== "duckdb") return {};
+  const local = reference.schema === RESULTS_SCHEMA_ID ? "results" : reference.schema.endsWith(".files") ? "files" : undefined;
+  return local ? { local, from: objectRef(conn, { schema: reference.schema, name: reference.name, kind: reference.kind }) } : {};
+}
+
+type Ran = { status: "idle" } | { status: "running"; sql: string } | { status: "done"; sql: string; rows: ExploreRows } | { status: "error"; sql: string; message: string };
+
+const ask = (title: string, reasons: string[], confirmLabel: string) =>
+  new Promise<boolean>((resolve) => useStore.getState().askConfirm({ title, reasons, confirmLabel, onConfirm: () => resolve(true), onCancel: () => resolve(false) }));
+
+/**
+ * Run one explorer read on session `{tabId}#{what}`. `heavy`: it reads
+ * every row, so it asks first ({@link readAllReasons}: BigQuery's bill at
+ * each read; production or a large table once per tab). Null when not run.
+ * The session closes when the part goes away, which stops what still runs
+ * on it (a column's top values closed, the columns read again).
+ */
+function useExploreRead(e: Explore, what: string) {
+  const [ran, setRan] = useState<Ran>({ status: "idle" });
+  const { conn, reference, tabId } = e;
+  const kind = conn.config.kind;
+  const key = exploreKey(tabId, what);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      // Strict mode unmounts and mounts again at once: only an unmount that stays closes it.
+      setTimeout(() => !mounted.current && void api.closeTab(key).catch(() => {}), 0);
+    };
+  }, [key]);
+  const read = async (sql: string, heavy: string | null): Promise<ExploreRows | null> => {
+    if (heavy) {
+      const estimate = billsScans(kind) ? await api.estimateCost(conn.id, key, sql).catch(() => null) : undefined;
+      const reasons = readAllReasons({ kind, prod: conn.env === "prod", connName: conn.name, table: reference.name, rowEstimate: e.rowEstimate, asked: e.asked.current, estimate });
+      if (reasons.length) {
+        const after = billsScans(kind) ? "BigQuery asks at each read: each one bills what it scans." : "This tab won't ask again.";
+        if (!(await ask(`${heavy} of ${reference.name}?`, [...reasons, after], "Read it"))) return null;
+      }
+      e.asked.current = true;
+    }
+    setRan({ status: "running", sql });
+    try {
+      const rows = await api.exploreQuery(conn.id, key, sql);
+      setRan({ status: "done", sql, rows });
+      return rows;
+    } catch (err) {
+      setRan({ status: "error", sql, message: toError(err).message });
+      return null;
+    }
+  };
+  // Closing the session stops what runs on it.
+  const stop = () => void api.closeTab(key).catch(() => {});
+  return { ran, setRan, read, stop };
+}
+
+/** The SQL a part ran, with Open in editor (every explorer read is in the history as Explorer too). */
+function RanSql({ e, sql, ms }: { e: Explore; sql: string; ms?: number }) {
+  return (
+    <div className="flex items-start gap-2 border-t border-line px-2 py-1 text-[11px] text-muted">
+      <code className="min-w-0 flex-1 truncate font-mono" title={sql}>
+        {sql.replace(/\s+/g, " ")}
+      </code>
+      {ms != null && <span className="shrink-0">{ms} ms</span>}
+      <button className="btn-ghost shrink-0 py-0 text-[11px]" onClick={() => useStore.getState().newTab({ title: e.reference.name, sql, connection_id: e.conn.id })}>
+        <FileCode2 size={11} /> Open in editor
+      </button>
+    </div>
+  );
+}
+
+/** The profile bar above the columns: Profile columns, its state and SQL. */
+function ProfileBar({ e, detail, onProfile }: { e: Explore; detail: ObjectDetail; onProfile: (p: ReturnType<typeof readProfile> | null) => void }) {
+  const kind = e.conn.config.kind;
+  const { from } = localFrom(e);
+  const built: Built = profileSql(kind, e.reference.schema, e.reference.name, detail.columns, from);
+  const { ran, read, stop } = useExploreRead(e, "profile");
+  const go = async () => {
+    if (!("sql" in built)) return;
+    const rows = await read(built.sql, "Profile the columns");
+    onProfile(rows ? readProfile(rows, Math.min(detail.columns.length, PROFILE_MAX_COLUMNS)) : null);
+  };
+  if (!("sql" in built)) return <div className="border-b border-line px-2 py-1.5 text-[11.5px] text-muted">Profile: not available on {traitsOf(kind).name}: {built.unavailable}.</div>;
+  return (
+    <div className="shrink-0 border-b border-line">
+      <div className="flex flex-wrap items-center gap-2 px-2 py-1.5 text-[12px]">
+        {ran.status === "running" ? (
+          <button className="btn-ghost border border-line py-0.5 text-[12px] text-danger" onClick={stop} title="Stop the profile query">
+            <Square size={11} /> Stop
+          </button>
+        ) : (
+          <button className="btn-ghost border border-line py-0.5 text-[12px]" onClick={() => void go()} title="One query reads every row: non-null share, distinct count, min and max of each column">
+            <BarChart3 size={12} /> {ran.status === "done" ? "Profile again" : "Profile columns"}
+          </button>
+        )}
+        {ran.status === "running" && (
+          <span className="flex items-center gap-1 text-muted">
+            <Loader2 size={12} className="animate-spin" /> Reading every row…
+          </span>
+        )}
+        {ran.status === "idle" && (
+          <span className="text-muted">
+            Non-null share, distinct count{approxDistinct(kind) ? " (approximate)" : ""}, min and max of each column{detail.columns.length > PROFILE_MAX_COLUMNS ? ` (the first ${PROFILE_MAX_COLUMNS})` : ""}: one query that reads every row.
+          </span>
+        )}
+        {ran.status === "error" && (
+          <span className="flex min-w-0 items-start gap-1 text-danger" role="alert">
+            <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {ran.message}
+          </span>
+        )}
+      </div>
+      {ran.status !== "idle" && <RanSql e={e} sql={ran.sql} ms={ran.status === "done" ? ran.rows.duration_ms : undefined} />}
+    </div>
+  );
+}
+
+/** A column's most common values, under its row. */
+function TopValues({ e, column }: { e: Explore; column: string }) {
+  const kind = e.conn.config.kind;
+  const { from } = localFrom(e);
+  const built = topValuesSql(kind, e.reference.schema, e.reference.name, column, from);
+  const { ran, read } = useExploreRead(e, `top:${column}`);
+  const started = useRef(false);
+  useEffect(() => {
+    if (started.current || !("sql" in built)) return;
+    started.current = true;
+    void read(built.sql, "Read the most common values");
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, when opened
+  }, []);
+  if (!("sql" in built)) return <p className="px-3 py-1 text-[11.5px] text-muted">{built.unavailable}</p>;
+  if (ran.status === "idle") return <p className="px-3 py-1 text-[11.5px] text-muted">Not read.</p>;
+  if (ran.status === "running") return <p className="flex items-center gap-1 px-3 py-1 text-[11.5px] text-muted"><Loader2 size={11} className="animate-spin" /> Counting values…</p>;
+  if (ran.status === "error") return <p className="px-3 py-1 text-[11.5px] text-danger" role="alert">{ran.message}</p>;
+  const rows = ran.rows.rows.map((r) => ({ value: r[0], n: num(r[1]) ?? 0 }));
+  const max = Math.max(1, ...rows.map((r) => r.n));
+  return (
+    <div className="px-3 py-1.5">
+      <div className="mb-1 text-[10.5px] uppercase tracking-wide text-muted">The {TOP_VALUES} most common values</div>
+      <ul className="space-y-0.5 text-[11.5px]">
+        {rows.map((r, i) => (
+          <li key={i} className="flex items-center gap-2">
+            <span className="w-48 shrink-0 truncate font-mono" title={r.value ?? "NULL"}>
+              {r.value ?? <span className="italic text-muted">NULL</span>}
+            </span>
+            <span className="h-2 rounded-sm bg-accent/60" style={{ width: `${Math.max(2, (r.n / max) * 160)}px` }} />
+            <span className="tabular-nums text-muted">{formatCount(r.n)}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** The table's statistics from the database's catalog, and an exact count on demand. */
+function StatisticsPart({ explore: e }: { explore: Explore }) {
+  const kind = e.conn.config.kind;
+  const { from, local } = localFrom(e);
+  const built = statisticsSql(kind, e.reference.schema, e.reference.name, e.reference.kind, local);
+  const stats = useExploreRead(e, "stats");
+  const count = useExploreRead(e, "count");
+  const cbuilt = countSql(kind, e.reference.schema, e.reference.name, from);
+  const started = useRef(false);
+  const load = () => "sql" in built && void stats.read(built.sql, null);
+  // The catalog's figures cost nothing: read when the part opens (once; Refresh reads them again).
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, when opened
+  }, []);
+  const exact = count.ran.status === "done" ? num(count.ran.rows.rows[0]?.[0]) : null;
+  const figures =
+    stats.ran.status === "done"
+      ? stats.ran.rows.columns.flatMap((c, i) => {
+          // DESCRIBE DETAIL answers in camelCase; others as aliased (Oracle and Snowflake in upper case).
+          const k = c.toLowerCase();
+          const v = stats.ran.status === "done" ? (stats.ran.rows.rows[0]?.[i] ?? null) : null;
+          if (v == null || v === "" || ["id", "name", "description", "properties", "minreaderversion", "minwriterversion", "tablefeatures", "statistics"].includes(k)) return [];
+          const meta = STAT_LABELS[k];
+          const n = num(v);
+          const text = meta?.format === "bytes" && n != null ? formatBytes(n) : meta?.format === "count" && n != null ? (n < 0 ? "unknown (never analyzed)" : formatCount(n)) : v;
+          return [{ key: k, label: meta?.label ?? c, text, raw: v }];
+        })
+      : [];
+  return (
+    <div className="flex h-full min-h-0 flex-col text-[12px]">
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line px-2 py-1.5">
+        {"sql" in built && (
+          <button className="btn-ghost border border-line py-0.5 text-[12px]" onClick={load} disabled={stats.ran.status === "running"} title="Read the catalog's figures again">
+            <RefreshCw size={12} className={stats.ran.status === "running" ? "animate-spin" : ""} /> Refresh
+          </button>
+        )}
+        {"sql" in cbuilt &&
+          (count.ran.status === "running" ? (
+            <button className="btn-ghost border border-line py-0.5 text-[12px] text-danger" onClick={count.stop}>
+              <Square size={11} /> Stop counting
+            </button>
+          ) : (
+            <button className="btn-ghost border border-line py-0.5 text-[12px]" onClick={() => void count.read(cbuilt.sql, "Count every row")} title="SELECT COUNT(*): reads every row">
+              <Hash size={12} /> Count exactly
+            </button>
+          ))}
+        {exact != null && <span>Exactly {formatCount(exact)} rows</span>}
+        {count.ran.status === "error" && (
+          <span className="text-danger" role="alert">
+            {count.ran.message}
+          </span>
+        )}
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto p-3">
+        {!("sql" in built) ? (
+          <p className="text-muted">Statistics: not available{traitsOf(kind).preview === "sql" ? ` on ${traitsOf(kind).name}` : ""}: {built.unavailable}.</p>
+        ) : stats.ran.status === "running" || stats.ran.status === "idle" ? (
+          <Busy />
+        ) : stats.ran.status === "error" ? (
+          <p className="text-danger" role="alert">
+            The statistics couldn't be read: {stats.ran.message}
+          </p>
+        ) : figures.length === 0 ? (
+          <p className="text-muted">The catalog has no figures for it{stats.ran.rows.rows.length === 0 ? " (it found no such table: Refresh the explorer?)" : ""}.</p>
+        ) : (
+          <dl className="grid max-w-2xl grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
+            {figures.map((f) => (
+              <div key={f.key} className="contents">
+                <dt className="text-muted">{f.label}</dt>
+                <dd className="min-w-0 truncate font-mono text-[11.5px]" title={f.raw}>
+                  {f.text}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {"sql" in built && <p className="mt-3 text-[11px] text-muted">The database's own figures, kept by its catalog: estimates that are as fresh as its last analyze. Count exactly reads every row.</p>}
+      </div>
+      {stats.ran.status !== "idle" && <RanSql e={e} sql={stats.ran.sql} ms={stats.ran.status === "done" ? stats.ran.rows.duration_ms : undefined} />}
+      {count.ran.status !== "idle" && count.ran.status !== "running" && <RanSql e={e} sql={count.ran.sql} ms={count.ran.status === "done" ? count.ran.rows.duration_ms : undefined} />}
     </div>
   );
 }
