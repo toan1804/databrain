@@ -125,6 +125,55 @@ fn beat(renewed: Option<bool>, since: Duration) -> Beat {
     }
 }
 
+/// A run's heartbeat until the run ends (the task is aborted then): every
+/// `poll` it looks for a stop asked from another process for this run;
+/// every `renew` it renews the lease and tells other processes the run is
+/// alive. After a stop is asked it keeps renewing: the run is still
+/// winding down (stopping its statement on the server, rolling a load
+/// back), and a lease run out would let the job start again meanwhile.
+#[allow(clippy::too_many_arguments)]
+async fn heartbeat(ws: Arc<Workspace>, id: String, owner: String, run_id: i64, stop: CancellationToken, jobs: Arc<JobsState>, poll: Duration, renew: Duration) {
+    let mut renewed = Instant::now();
+    let mut tried = Instant::now();
+    let mut stopping = false;
+    loop {
+        tokio::time::sleep(poll).await;
+        // Stop asked from another process (`dbr jobs stop`, the app for the
+        // background runner's run): this run only; an earlier run's is dropped.
+        if !stopping && let Ok(Some((asked, by))) = ws.job_stop_request(&id) {
+            let _ = ws.clear_job_stop(&id);
+            if asked == run_id {
+                let why = if by == "terminal" { STOPPED_FROM_TERMINAL } else { STOPPED_FROM_APP };
+                tracing::info!(job = %id, run = run_id, by, "stop asked from another process");
+                jobs.stop_reasons.lock().entry(id.clone()).or_insert_with(|| why.to_string());
+                stop.cancel();
+                stopping = true;
+            }
+        }
+        if tried.elapsed() < renew {
+            continue;
+        }
+        tried = Instant::now();
+        let why = match beat(renew_lease(&ws, &id, &owner).await, renewed.elapsed()) {
+            Beat::Held => {
+                renewed = Instant::now();
+                None
+            }
+            Beat::Going => None,
+            Beat::Lost => Some(LEASE_LOST),
+            Beat::Unrenewed => Some(LEASE_UNRENEWED),
+        };
+        // The lease is gone (or about to be): nothing left to keep.
+        if let Some(why) = why {
+            tracing::warn!(job = %id, run = run_id, why, "stopping this run");
+            jobs.stop_reasons.lock().entry(id.clone()).or_insert_with(|| why.to_string());
+            stop.cancel();
+            break;
+        }
+        let _ = ws.touch_job_run(run_id, &owner);
+    }
+}
+
 /// After a run or a step is stopped (by the user, a time limit, a lost
 /// lease), how long its work has to end before it is left behind: a
 /// statement the database doesn't let go of can't keep the run (and its
@@ -136,6 +185,47 @@ const STILL_RUNNING: &str = "An earlier try of this step is still running (it di
 /// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
 const LEASE_MS: i64 = 90_000;
 const LEASE_RENEW: Duration = Duration::from_secs(20);
+/// How often a run looks for a stop asked from another process.
+const STOP_POLL: Duration = Duration::from_secs(2);
+/// A run's error when another process asked it to stop.
+const STOPPED_FROM_TERMINAL: &str = "Stopped from a terminal (dbr jobs stop)";
+const STOPPED_FROM_APP: &str = "Stopped from DataBrain";
+
+/// What a stop asked for a job's run did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StopAsked {
+    /// The job isn't running anywhere.
+    NotRunning,
+    /// It runs in this process: stopped at once.
+    Stopped,
+    /// It runs in another process (run id): asked, it stops on its next heartbeat.
+    Asked(i64),
+}
+
+/// Stop `job_id`'s run, wherever it runs: in this process directly; in
+/// another (the app, the background runner, `databrain-jobs run`) by a
+/// request it reads within [`STOP_POLL`]. `by`: `terminal` or `app`.
+pub fn request_stop(ctx: &JobCtx, job_id: &str, by: &str) -> Result<StopAsked> {
+    if ctx.jobs.is_running(job_id) {
+        // Stopped where it was started: plainly stopped, as before (no message).
+        if by == "terminal" {
+            ctx.jobs.stop_for(job_id, STOPPED_FROM_TERMINAL);
+        } else {
+            ctx.jobs.cancel(job_id);
+        }
+        return Ok(StopAsked::Stopped);
+    }
+    // Held by another process, and its latest run is going.
+    let held = ctx.workspace.job_lease(job_id)?.is_some();
+    let run = ctx.workspace.job_runs(job_id, 1)?.into_iter().next().filter(|r| r.status == "running");
+    match (held, run) {
+        (true, Some(r)) => {
+            ctx.workspace.request_job_stop(job_id, r.id, by)?;
+            Ok(StopAsked::Asked(r.id))
+        }
+        _ => Ok(StopAsked::NotRunning),
+    }
+}
 
 /// Jobs running now, cancellable by job id.
 pub struct JobsState {
@@ -688,28 +778,7 @@ fn start_as(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>
         // Keep the lease and tell other processes the run is alive.
         let beat = {
             let (ws, id, owner, stop, jobs) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone(), cancel.clone(), c.jobs.clone());
-            tokio::spawn(async move {
-                let mut renewed = Instant::now();
-                loop {
-                    tokio::time::sleep(LEASE_RENEW).await;
-                    let why = match beat(renew_lease(&ws, &id, &owner).await, renewed.elapsed()) {
-                        Beat::Held => {
-                            renewed = Instant::now();
-                            None
-                        }
-                        Beat::Going => None,
-                        Beat::Lost => Some(LEASE_LOST),
-                        Beat::Unrenewed => Some(LEASE_UNRENEWED),
-                    };
-                    if let Some(why) = why {
-                        tracing::warn!(job = %id, run = run_id, why, "stopping this run");
-                        jobs.stop_reasons.lock().entry(id.clone()).or_insert_with(|| why.to_string());
-                        stop.cancel();
-                        break;
-                    }
-                    let _ = ws.touch_job_run(run_id, &owner);
-                }
-            })
+            tokio::spawn(heartbeat(ws, id, owner, run_id, stop, jobs, STOP_POLL, LEASE_RENEW))
         };
         let (whole, name) = (only.is_none() || r.trigger == "resume", job.name.clone());
         // The jobs after a run the assistant started run under the AI rules too.
@@ -2663,6 +2732,64 @@ pub async fn wait_all(ctx: &JobCtx) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stop asked from another process cancels the run, and the
+    /// heartbeat keeps renewing the lease while the run winds down (a
+    /// lease run out would let the job start twice); a stale request for
+    /// another run is dropped without stopping this one.
+    #[tokio::test]
+    async fn the_lease_is_kept_after_a_stop_from_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Arc::new(Workspace::open(dir.path().join("w.db")).unwrap());
+        let job = ws
+            .save_job(databrain_workspace::Job {
+                id: String::new(),
+                name: "J".into(),
+                nodes: vec![],
+                edges: vec![],
+                schedule: Default::default(),
+                last_scheduled_at: None,
+                params: Default::default(),
+                param_set: None,
+                limits: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        let jobs = Arc::new(JobsState::new("app"));
+        let owner = jobs.owner.clone();
+        assert!(ws.claim_job(&job.id, &owner, now_ms() + 1_000).unwrap());
+        let run = ws.start_job_run(&job.id, "manual").unwrap();
+        let stop = CancellationToken::new();
+        let beat = tokio::spawn(heartbeat(
+            ws.clone(),
+            job.id.clone(),
+            owner.clone(),
+            run.id,
+            stop.clone(),
+            jobs.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        ));
+
+        ws.request_job_stop(&job.id, run.id - 1, "terminal").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!stop.is_cancelled(), "a stale request stopped the run");
+        assert!(ws.job_stop_request(&job.id).unwrap().is_none(), "the stale request is dropped");
+
+        ws.request_job_stop(&job.id, run.id, "terminal").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(stop.is_cancelled());
+        assert_eq!(jobs.stop_reasons.lock().get(&job.id).map(String::as_str), Some(STOPPED_FROM_TERMINAL));
+        // Winding down: the lease is still renewed (its end moves on).
+        let (_, until) = ws.job_lease(&job.id).unwrap().expect("held");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (holder, later) = ws.job_lease(&job.id).unwrap().expect("still held");
+        assert_eq!(holder, owner);
+        assert!(later > until, "the lease wasn't renewed after the stop");
+        assert!(!beat.is_finished());
+        beat.abort();
+    }
     use databrain_connector_core::ConnectorKind::{Duckdb, Mongodb, Mysql, Postgres};
 
     /// A run gets `:run_date` / `:run_time` when it has none; a date given

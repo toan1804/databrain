@@ -69,7 +69,7 @@ describe("the activity bar", () => {
     expect(bar()).toBeNull();
   });
 
-  it("says how many run, and shows the background runner's runs without Stop", () => {
+  it("says how many run, and shows the background runner's runs with Stop", () => {
     render(<ActivityBar />);
     setRun(run("running", [loading]));
     act(() => useJobs.setState({ elsewhere: { k: true } }));
@@ -77,7 +77,8 @@ describe("the activity bar", () => {
     act(() => screen.getByRole("button", { name: /2 running/ }).click());
     const rows = screen.getByRole("dialog", { name: "Background work" });
     expect(rows.textContent).toContain("Running in the background runner");
-    expect(screen.getAllByRole("button", { name: /Stop/ })).toHaveLength(1);
+    // The background runner's run has Stop too: it is asked to stop (a request it reads).
+    expect(screen.getAllByRole("button", { name: /Stop/ })).toHaveLength(2);
   });
 
   it("has no outcome for a run that ended while its tab was shown, nor for one never seen running", () => {

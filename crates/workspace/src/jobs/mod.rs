@@ -9,7 +9,7 @@ mod limits;
 mod model;
 mod node;
 mod schedule;
-mod store;
+pub(crate) mod store;
 
 pub use export::*;
 pub use limits::*;

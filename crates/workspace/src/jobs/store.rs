@@ -304,6 +304,7 @@ impl Workspace {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
         tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM settings WHERE key = ?1", [format!("{JOB_STOP_PREFIX}{id}")])?;
         let specs: Vec<(String, String)> = {
             let mut stmt = tx.prepare("SELECT id, spec_json FROM jobs")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
@@ -646,11 +647,21 @@ impl Workspace {
         let before = now_ms() - STALE_RUN_MS;
         let c = self.conn.lock();
         c.execute("UPDATE jobs SET lease_owner = NULL, lease_until = NULL WHERE lease_until IS NOT NULL AND lease_until < ?1", [now_ms()])?;
-        Ok(c.execute(
+        let closed = c.execute(
             "UPDATE job_runs SET status = 'cancelled', finished_at = COALESCE(heartbeat_at, started_at), error = 'The app or runner was closed while the job ran' \
              WHERE status = 'running' AND COALESCE(heartbeat_at, started_at) < ?1",
             [before],
-        )?)
+        )?;
+        // Stop requests nobody will read: the job is gone, or its run isn't running.
+        c.execute(
+            &format!(
+                "DELETE FROM settings WHERE substr(key, 1, {n}) = '{JOB_STOP_PREFIX}' AND NOT EXISTS (SELECT 1 FROM job_runs r WHERE r.job_id = substr(settings.key, {m}) AND r.id = json_extract(settings.value_json, '$.run_id') AND r.status = 'running')",
+                n = JOB_STOP_PREFIX.len(),
+                m = JOB_STOP_PREFIX.len() + 1
+            ),
+            [],
+        )?;
+        Ok(closed)
     }
 
     /// Take the job for `owner` (a process) until `until` (ms). False when
@@ -692,7 +703,29 @@ impl Workspace {
         self.conn.lock().execute("UPDATE job_runs SET heartbeat_at = ?2, runner = ?3 WHERE id = ?1", params![run_id, now_ms(), runner])?;
         Ok(())
     }
+
+    /// Ask the process running run `run_id` of `job_id` to stop it (`by`:
+    /// `terminal`, `app`): a run belongs to the process that runs it (the
+    /// app, the background runner, `databrain-jobs run`), which reads this
+    /// on its heartbeat ([`Workspace::job_stop_request`]).
+    pub fn request_job_stop(&self, job_id: &str, run_id: i64, by: &str) -> Result<()> {
+        self.set_setting(&format!("{JOB_STOP_PREFIX}{job_id}"), &serde_json::json!({ "run_id": run_id, "by": by, "at": now_ms() }))
+    }
+
+    /// A stop asked for `job_id`'s run: (run id, who asked).
+    pub fn job_stop_request(&self, job_id: &str) -> Result<Option<(i64, String)>> {
+        Ok(self.get_setting(&format!("{JOB_STOP_PREFIX}{job_id}"))?.and_then(|v| Some((v.get("run_id")?.as_i64()?, v.get("by")?.as_str()?.to_string()))))
+    }
+
+    /// The stop asked for `job_id` was acted on (or is for a run that ended).
+    pub fn clear_job_stop(&self, job_id: &str) -> Result<()> {
+        self.conn.lock().execute("DELETE FROM settings WHERE key = ?1", [format!("{JOB_STOP_PREFIX}{job_id}")])?;
+        Ok(())
+    }
 }
+
+/// Settings keys of stop requests (not settings the app shows: left out of `all_settings`).
+pub const JOB_STOP_PREFIX: &str = "job_stop:";
 
 #[cfg(test)]
 mod tests {

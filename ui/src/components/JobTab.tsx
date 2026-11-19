@@ -31,7 +31,8 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   const jobNames = useJobs((s) => s.jobs);
   const taken = useTakenNames(jobId);
   // Running per the run's own events too (the job list can lag behind).
-  const running = useJobs((s) => !!s.running[jobId] || s.runs[jobId]?.status === "running");
+  // Running here, or in the background runner (Stop asks it to stop).
+  const running = useJobs((s) => !!s.running[jobId] || s.runs[jobId]?.status === "running" || !!s.elsewhere[jobId]);
   // The last run, also one from before this session (for "Resume").
   const savedRun = useJobs((s) => s.jobs.find((j) => j.id === jobId)?.last_run ?? undefined);
   const jobSavedAt = useJobs((s) => s.jobs.find((j) => j.id === jobId)?.updated_at ?? 0);

@@ -7,7 +7,12 @@
 //!                                "Run scheduled jobs when DataBrain is closed" is on)
 //! databrain-jobs run <job>       run a job now (name or id) and wait; exit code 1 if it failed
 //! databrain-jobs list            jobs, schedules, next and last runs
+//! databrain-jobs runs <job>      its last runs (--limit N, 5 by default), the latest's steps
+//! databrain-jobs stop <job>      stop its run, wherever it runs (the app, the background
+//!                                runner, another `run`), and wait for it (--no-wait)
 //! ```
+//!
+//! `dbr jobs …` is the same.
 //!
 //! It uses the same workspace, passwords and drivers as the app
 //! (`DATABRAIN_DATA_DIR` points at another data folder). A job runs in one
@@ -26,6 +31,9 @@ use crate::jobs;
 /// on a dead connection (with no time limit) would otherwise stop every
 /// background schedule for good.
 pub const TICK_DEADLINE: Duration = Duration::from_secs(55 * 60);
+
+/// Longest `stop` waits for the run to end.
+const STOP_WAIT: Duration = Duration::from_secs(60);
 
 /// Why the runs still going at [`TICK_DEADLINE`] were stopped.
 const DEADLINE_STOP: &str =
@@ -118,8 +126,109 @@ pub fn tick_report(ws: &Workspace, runs: &[JobRun]) -> TickReport {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: databrain-jobs tick [--force] | run <job name or id> [--set <parameter set>] [--param name=value]... | list");
+    eprintln!(
+        "usage: databrain-jobs tick [--force] | run <job> [--set <parameter set>] [--param name=value]... | list | runs <job> [--limit N] | stop <job> [--no-wait]\n       (also dbr jobs …; <job> is its name, any case, or id)"
+    );
     ExitCode::from(2)
+}
+
+/// The job `which` names (id, or name in any case), else why not.
+fn find_job(state: &crate::api::AppState, which: &str) -> Result<databrain_workspace::JobSummary, String> {
+    let list = state.workspace.list_jobs().unwrap_or_default();
+    list.iter()
+        .find(|j| j.id == which)
+        .or_else(|| list.iter().find(|j| j.name.eq_ignore_ascii_case(which)))
+        .cloned()
+        .ok_or_else(|| format!("no job named {which:?} (databrain-jobs list shows them)"))
+}
+
+/// The job a `runs`/`stop` command names: its first word that isn't an
+/// option or an option's value (`runs --limit 3 Daily` and `runs Daily --limit 3`).
+fn job_arg(args: &[String]) -> Option<&str> {
+    let mut words = args.iter().skip(1);
+    while let Some(a) = words.next() {
+        match a.as_str() {
+            "--limit" => {
+                words.next();
+            }
+            o if o.starts_with("--") => {}
+            _ => return Some(a),
+        }
+    }
+    None
+}
+
+/// `stop <job>`: ask its run to stop, wherever it runs, and wait up to
+/// `wait` for it to end (not with `no_wait`). (exit code, output, errors).
+pub async fn stop(state: &crate::api::AppState, which: &str, no_wait: bool, wait: Duration) -> (u8, String, String) {
+    let job = match find_job(state, which) {
+        Ok(j) => j,
+        Err(e) => return (2, String::new(), format!("databrain-jobs: {e}\n")),
+    };
+    let run = match jobs::request_stop(&state.job_ctx(), &job.id, "terminal") {
+        Ok(jobs::StopAsked::NotRunning) => return (1, String::new(), format!("databrain-jobs: {} isn't running\n", job.name)),
+        Ok(jobs::StopAsked::Stopped) => return (0, format!("Stopped {}\n", job.name), String::new()),
+        Ok(jobs::StopAsked::Asked(run)) => run,
+        Err(e) => return (2, String::new(), format!("databrain-jobs: {}\n", e.message)),
+    };
+    if no_wait {
+        return (0, format!("Asked {} (run #{run}) to stop\n", job.name), String::new());
+    }
+    let mut out = format!("Stopping {} (run #{run})…\n", job.name);
+    // The runner reads the request within a few seconds; a statement may
+    // take longer to stop on its server.
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        match state.workspace.job_run(&job.id, run).ok().flatten() {
+            Some(r) if r.status != "running" => {
+                out.push_str(&format!("{}: {}\n", job.name, r.error.as_deref().unwrap_or(&r.status)));
+                return (0, out, String::new());
+            }
+            _ if tokio::time::Instant::now() >= until => {
+                return (
+                    1,
+                    out,
+                    format!("databrain-jobs: {} was asked to stop and hasn't ended yet (a statement can take a while to stop on its server)\n", job.name),
+                );
+            }
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
+/// "1m 5s", "12s", "850 ms".
+fn took(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{} ms", ms.max(0))
+    } else if ms < 60_000 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+/// A job's last runs, one a line, then the latest's steps: what `runs` prints.
+pub fn runs_text(runs: &[JobRun], now: i64) -> String {
+    let mut out = String::new();
+    if runs.is_empty() {
+        return "never ran\n".into();
+    }
+    for r in runs {
+        let ms = r.finished_at.unwrap_or(now) - r.started_at;
+        let tail = match (&r.error, r.status.as_str()) {
+            (Some(e), _) => format!("  {}", e.lines().next().unwrap_or_default()),
+            (None, "running") => "  (running)".into(),
+            _ => String::new(),
+        };
+        out.push_str(&format!("#{:<6} {}  {:<10} {:<9} {:>8}{tail}\n", r.id, when(r.started_at), r.trigger, r.status, took(ms)));
+    }
+    let latest = &runs[0];
+    out.push_str(&format!("steps of #{}:\n", latest.id));
+    for n in &latest.nodes {
+        let what = n.summary.error.clone().or_else(|| n.summary.rows.map(|r| format!("{r} rows"))).unwrap_or_default();
+        out.push_str(&format!("  {:<24} {:<10} {}\n", n.name, n.summary.status, what.lines().next().unwrap_or_default()));
+    }
+    out
 }
 
 fn when(ms: i64) -> String {
@@ -241,6 +350,34 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
                 }
             }
         }
+        "runs" => {
+            let Some(which) = job_arg(args) else { return usage() };
+            let job = match find_job(state, which) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("databrain-jobs: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let limit = match args.iter().position(|a| a == "--limit").map(|i| args.get(i + 1).and_then(|n| n.parse::<u32>().ok())) {
+                None => 5,
+                Some(Some(n)) if n > 0 => i64::from(n),
+                Some(_) => {
+                    eprintln!("databrain-jobs: --limit takes a number of runs");
+                    return ExitCode::from(2);
+                }
+            };
+            let runs = state.workspace.job_runs(&job.id, limit).unwrap_or_default();
+            print!("{}", runs_text(&runs, databrain_workspace::now_ms()));
+            ExitCode::SUCCESS
+        }
+        "stop" => {
+            let Some(which) = job_arg(args) else { return usage() };
+            let (code, out, err) = stop(state, which, args.iter().any(|a| a == "--no-wait"), STOP_WAIT).await;
+            print!("{out}");
+            eprint!("{err}");
+            ExitCode::from(code)
+        }
         "list" => {
             for j in state.workspace.list_jobs().unwrap_or_default() {
                 let next = if j.schedule.enabled { j.next_run_at.map(when).unwrap_or_else(|| "—".into()) } else { "not scheduled".into() };
@@ -250,5 +387,64 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
             ExitCode::SUCCESS
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use databrain_workspace::{NodeRunRecord, NodeRunSummary};
+
+    #[test]
+    fn runs_one_a_line_then_the_latests_steps() {
+        let step = |name: &str, status: &str, rows: Option<i64>, error: Option<&str>| NodeRunRecord {
+            node_id: name.into(),
+            name: name.into(),
+            summary: NodeRunSummary { status: status.into(), rows, error: error.map(str::to_string), ..Default::default() },
+        };
+        let run = |id: i64, status: &str, ms: Option<i64>, error: Option<&str>, nodes: Vec<NodeRunRecord>| JobRun {
+            id,
+            job_id: "j".into(),
+            trigger: "manual".into(),
+            started_at: 0,
+            finished_at: ms,
+            status: status.into(),
+            nodes,
+            error: error.map(str::to_string),
+            params: Default::default(),
+            ai: false,
+        };
+        let text = runs_text(
+            &[
+                run(
+                    42,
+                    "error",
+                    Some(65_000),
+                    Some("load: permission denied\nmore"),
+                    vec![step("read", "success", Some(1200), None), step("load", "error", None, Some("permission denied"))],
+                ),
+                run(41, "success", Some(850), None, vec![]),
+            ],
+            0,
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("#42") && lines[0].contains("error") && lines[0].contains("1m 5s") && lines[0].ends_with("load: permission denied"),
+            "{text}"
+        );
+        assert!(lines[1].starts_with("#41") && lines[1].contains("850 ms"), "{text}");
+        assert_eq!(lines[2], "steps of #42:");
+        assert!(lines[3].contains("read") && lines[3].contains("1200 rows"), "{text}");
+        assert!(lines[4].contains("load") && lines[4].contains("permission denied"), "{text}");
+        assert_eq!(runs_text(&[], 0), "never ran\n");
+    }
+
+    #[test]
+    fn the_job_is_the_first_word_that_isnt_an_option() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(job_arg(&args(&["runs", "Daily", "--limit", "3"])), Some("Daily"));
+        assert_eq!(job_arg(&args(&["runs", "--limit", "3", "Daily"])), Some("Daily"));
+        assert_eq!(job_arg(&args(&["stop", "--no-wait", "Daily"])), Some("Daily"));
+        assert_eq!(job_arg(&args(&["runs", "--limit", "3"])), None);
     }
 }

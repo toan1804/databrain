@@ -308,6 +308,10 @@ pub fn render_rows(format: Format, columns: &[ColumnMeta], keys: &[String], rows
 }
 
 pub fn main(args: Vec<String>) -> ExitCode {
+    // `dbr jobs …`: the jobs commands (list, run, runs, stop).
+    if args.first().map(String::as_str) == Some("jobs") {
+        return crate::cli::jobs::main(args[1..].to_vec());
+    }
     // A folder is a data source (Delta, Iceberg, Parquet files), whatever its name.
     let opts = match parse(&args, |p| p.is_file() || p.is_dir()) {
         Ok(o) => o,
