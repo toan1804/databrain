@@ -135,8 +135,11 @@ pub fn run_moment_preview(state: &AppState, job: databrain_workspace::Job, node_
     crate::jobs::run_moment_preview(&state.job_ctx(), &job, node_id, date)
 }
 
+/// Stop a job's run: in this process at once; in another (the background
+/// runner, `databrain-jobs run`) by a request it reads within seconds.
+/// False when it isn't running anywhere.
 pub fn cancel_job(state: &AppState, id: &str) -> bool {
-    state.jobs.cancel(id)
+    !matches!(crate::jobs::request_stop(&state.job_ctx(), id, "app"), Ok(crate::jobs::StopAsked::NotRunning) | Err(_))
 }
 
 pub fn cancel_job_step(state: &AppState, id: &str, node_id: &str) -> bool {

@@ -136,6 +136,42 @@ const STILL_RUNNING: &str = "An earlier try of this step is still running (it di
 /// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
 const LEASE_MS: i64 = 90_000;
 const LEASE_RENEW: Duration = Duration::from_secs(20);
+/// How often a run looks for a stop asked from another process.
+const STOP_POLL: Duration = Duration::from_secs(2);
+/// A run's error when another process asked it to stop.
+const STOPPED_FROM_TERMINAL: &str = "Stopped from a terminal (dbr jobs stop)";
+const STOPPED_FROM_APP: &str = "Stopped from DataBrain";
+
+/// What a stop asked for a job's run did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StopAsked {
+    /// The job isn't running anywhere.
+    NotRunning,
+    /// It runs in this process: stopped at once.
+    Stopped,
+    /// It runs in another process (run id): asked, it stops on its next heartbeat.
+    Asked(i64),
+}
+
+/// Stop `job_id`'s run, wherever it runs: in this process directly; in
+/// another (the app, the background runner, `databrain-jobs run`) by a
+/// request it reads within [`STOP_POLL`]. `by`: `terminal` or `app`.
+pub fn request_stop(ctx: &JobCtx, job_id: &str, by: &str) -> Result<StopAsked> {
+    if ctx.jobs.is_running(job_id) {
+        ctx.jobs.stop_for(job_id, if by == "terminal" { STOPPED_FROM_TERMINAL } else { STOPPED_FROM_APP });
+        return Ok(StopAsked::Stopped);
+    }
+    // Held by another process, and its latest run is going.
+    let held = ctx.workspace.job_lease(job_id)?.is_some();
+    let run = ctx.workspace.job_runs(job_id, 1)?.into_iter().next().filter(|r| r.status == "running");
+    match (held, run) {
+        (true, Some(r)) => {
+            ctx.workspace.request_job_stop(job_id, r.id, by)?;
+            Ok(StopAsked::Asked(r.id))
+        }
+        _ => Ok(StopAsked::NotRunning),
+    }
+}
 
 /// Jobs running now, cancellable by job id.
 pub struct JobsState {
@@ -690,8 +726,25 @@ fn start_as(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>
             let (ws, id, owner, stop, jobs) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone(), cancel.clone(), c.jobs.clone());
             tokio::spawn(async move {
                 let mut renewed = Instant::now();
+                let mut tried = Instant::now();
                 loop {
-                    tokio::time::sleep(LEASE_RENEW).await;
+                    tokio::time::sleep(STOP_POLL).await;
+                    // Stop asked from another process (`dbr jobs stop`, the
+                    // app for the background runner's run): this run only.
+                    if let Ok(Some((asked, by))) = ws.job_stop_request(&id) {
+                        let _ = ws.clear_job_stop(&id);
+                        if asked == run_id {
+                            let why = if by == "terminal" { STOPPED_FROM_TERMINAL } else { STOPPED_FROM_APP };
+                            tracing::info!(job = %id, run = run_id, by, "stop asked from another process");
+                            jobs.stop_reasons.lock().entry(id.clone()).or_insert_with(|| why.to_string());
+                            stop.cancel();
+                            break;
+                        }
+                    }
+                    if tried.elapsed() < LEASE_RENEW {
+                        continue;
+                    }
+                    tried = Instant::now();
                     let why = match beat(renew_lease(&ws, &id, &owner).await, renewed.elapsed()) {
                         Beat::Held => {
                             renewed = Instant::now();

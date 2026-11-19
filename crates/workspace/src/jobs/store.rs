@@ -692,7 +692,29 @@ impl Workspace {
         self.conn.lock().execute("UPDATE job_runs SET heartbeat_at = ?2, runner = ?3 WHERE id = ?1", params![run_id, now_ms(), runner])?;
         Ok(())
     }
+
+    /// Ask the process running run `run_id` of `job_id` to stop it (`by`:
+    /// `terminal`, `app`): a run belongs to the process that runs it (the
+    /// app, the background runner, `databrain-jobs run`), which reads this
+    /// on its heartbeat ([`Workspace::job_stop_request`]).
+    pub fn request_job_stop(&self, job_id: &str, run_id: i64, by: &str) -> Result<()> {
+        self.set_setting(&format!("{JOB_STOP_PREFIX}{job_id}"), &serde_json::json!({ "run_id": run_id, "by": by, "at": now_ms() }))
+    }
+
+    /// A stop asked for `job_id`'s run: (run id, who asked).
+    pub fn job_stop_request(&self, job_id: &str) -> Result<Option<(i64, String)>> {
+        Ok(self.get_setting(&format!("{JOB_STOP_PREFIX}{job_id}"))?.and_then(|v| Some((v.get("run_id")?.as_i64()?, v.get("by")?.as_str()?.to_string()))))
+    }
+
+    /// The stop asked for `job_id` was acted on (or is for a run that ended).
+    pub fn clear_job_stop(&self, job_id: &str) -> Result<()> {
+        self.conn.lock().execute("DELETE FROM settings WHERE key = ?1", [format!("{JOB_STOP_PREFIX}{job_id}")])?;
+        Ok(())
+    }
 }
+
+/// Settings keys of stop requests (not settings the app shows: left out of `all_settings`).
+pub const JOB_STOP_PREFIX: &str = "job_stop:";
 
 #[cfg(test)]
 mod tests {

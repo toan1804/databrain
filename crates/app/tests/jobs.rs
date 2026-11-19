@@ -3941,3 +3941,50 @@ async fn a_column_that_keeps_a_load_from_bulk_is_a_warning() {
     })
     .await;
 }
+
+/// A run is stopped from another process (`dbr jobs stop`, the app for
+/// the background runner's run): the request is read on the running
+/// process's heartbeat, within seconds, and the run ends stopped with why.
+/// A job that runs nowhere isn't asked; a stale request for an earlier run
+/// doesn't stop the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_is_stopped_from_another_process() {
+    guarded_within(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let open = |kind: &str| {
+            let mut st = AppState::new(Arc::new(Workspace::open(&path).unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+            st.jobs = Arc::new(databrain_app::jobs::JobsState::new(kind));
+            st
+        };
+        let (runner, terminal) = (open("cli"), open("terminal"));
+        let a = sqlite(&runner, "A", &dir.path().join("a.db"), false);
+        let slow = "with recursive c(i) as (select 1 union all select i + 1 from c where i < 300000000) select count(*) from c";
+        let job = runner.workspace.save_job(plain_job("Slow", vec![node("n1", "slow_step", JobNodeKind::Query, Some(&a), slow)])).unwrap();
+
+        // Not running anywhere: nothing to ask.
+        assert_eq!(databrain_app::jobs::request_stop(&terminal.job_ctx(), &job.id, "terminal").unwrap(), databrain_app::jobs::StopAsked::NotRunning);
+        // A stale request (an earlier run) doesn't stop the next run.
+        terminal.workspace.request_job_stop(&job.id, -1, "terminal").unwrap();
+
+        api::run_job(&runner, &job.id, None).unwrap();
+        until("the slow step running", 30, || step_status(&runner, &job.id, "n1").as_deref() == Some("running")).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(step_status(&runner, &job.id, "n1").as_deref(), Some("running"), "a stale request stopped it");
+        assert!(terminal.workspace.job_stop_request(&job.id).unwrap().is_none(), "the stale request is cleared");
+
+        // Asked from the other process: it stops within a few seconds, saying why.
+        let asked = databrain_app::jobs::request_stop(&terminal.job_ctx(), &job.id, "terminal").unwrap();
+        assert!(matches!(asked, databrain_app::jobs::StopAsked::Asked(_)), "{asked:?}");
+        let started = std::time::Instant::now();
+        let run = finished_within(&runner, &job.id, Duration::from_secs(30)).await;
+        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
+        assert_eq!(run.status, "cancelled", "{run:?}");
+        assert_eq!(run.error.as_deref(), Some("Stopped from a terminal (dbr jobs stop)"));
+        assert!(terminal.workspace.job_stop_request(&job.id).unwrap().is_none());
+        // Stop requests aren't settings the app shows.
+        terminal.workspace.request_job_stop(&job.id, 1, "app").unwrap();
+        assert!(!terminal.workspace.all_settings().unwrap().keys().any(|k| k.starts_with("job_stop:")));
+    })
+    .await;
+}

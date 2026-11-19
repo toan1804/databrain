@@ -133,9 +133,11 @@ export function ActivityBar() {
         key: `bg:${id}`,
         icon: <Workflow size={13} className="shrink-0 text-accent" />,
         title: name(id),
-        line: "Running in the background runner (it stops there, not here)",
+        line: "Running in the background runner",
         short: name(id),
         fraction: null,
+        // Asked to stop: the runner reads it on its next heartbeat.
+        onStop: () => void useJobs.getState().cancel(id),
         onOpen: () => useJobs.getState().open(id, name(id)),
       })),
   ];
