@@ -15,6 +15,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 - **A job edit could be lost when a run ended:** a run's step results were written over the job as it was read when the run ended, so a save made in that moment (the editor, the assistant, the background runner) was undone. Results and saves are now each one write; a save also keeps the latest run's results instead of the ones its copy had.
 - **Two saves of a job at the same moment could both pass:** the editor and the assistant checked that the job hadn't changed since they read it, then saved; a save from another window or process between the two was overwritten. The check is now part of the save. Two jobs given the same step name at the same moment can't both keep it either.
+- **Edits to a job step the assistant deleted were dropped silently:** when the job tab keeps your unsaved changes over a version saved since ("Keep my changes"), a step deleted there whose SQL you had changed is now kept (it is yours; delete it again if it should go), unless a new step took its name there (the new one is kept, as for a step changed on both sides); either way, and for other changes to a deleted step, a message names it, instead of the step and your changes disappearing without a word.
 
 ## 0.4.5 - 2026-11-19
 
