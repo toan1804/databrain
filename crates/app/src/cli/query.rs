@@ -10,11 +10,13 @@
 //!
 //! A table in the terminal shows up to 1,000 rows (more is unreadable and
 //! fills the scrollback): CSV, JSON and TSV, for files and pipes, print
-//! every row (`--limit` caps them). When stdout is not a terminal the
-//! default is CSV. The connection's read-only setting and production
-//! confirmation apply (asked here, `--yes` without a terminal), the table
-//! access rules too, and every run goes to the query history (Terminal).
-//! Exit codes: 0 done, 1 a statement failed, 2 bad arguments, 130 stopped.
+//! every row (`--limit` caps them), a page at a time as they are read. When
+//! stdout is not a terminal the default is CSV. It runs as SQL run in the
+//! app's editor does: the connection's read-only setting and production
+//! confirmation apply (asked here, `--yes` without a terminal); the table
+//! access rules and PII masking are the AI's and don't. Every run goes to
+//! the query history (Terminal). Exit codes: 0 done, 1 a statement failed,
+//! 2 bad arguments, 130 stopped (Ctrl-C).
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -99,7 +101,8 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
                 let (k, val) = v.split_once('=').ok_or_else(|| format!("{a} takes name=value, not {v:?}"))?;
                 o.params.insert(k.trim().trim_start_matches(':').to_string(), ParamValue { value: val.to_string(), raw: false });
             }
-            f if f.starts_with('-') && f.len() > 1 && !f.contains(' ') => return Err(format!("unknown option {f:?}")),
+            // An option is one word: SQL starting with a `--` comment is SQL.
+            f if f.starts_with('-') && f.len() > 1 && !f.contains(char::is_whitespace) => return Err(format!("unknown option {f:?}")),
             s if exists(Path::new(s)) => o.sources.push(Source::File(PathBuf::from(s))),
             s => o.sources.push(Source::Sql(s.to_string())),
         }
@@ -147,15 +150,33 @@ pub fn find_connection<'a>(all: &'a [ConnectionProfile], name: &str) -> Result<&
     }
 }
 
-/// `s` cut to `w` characters (the last one `…` when cut).
-fn fit(s: &str, w: usize) -> String {
-    let n = s.chars().count();
-    if n <= w {
-        return s.to_string();
+/// Columns `s` takes on screen (East Asian wide characters take two).
+fn cols(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// `s` cut to `w` screen columns (the last one `…` when cut), padded to
+/// `w` on the left (`right`) or the right.
+fn fit(s: &str, w: usize, right: bool) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    if cols(s) <= w {
+        out.push_str(s);
+        used = cols(s);
+    } else {
+        for c in s.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + cw + 1 > w {
+                break;
+            }
+            out.push(c);
+            used += cw;
+        }
+        out.push('…');
+        used += 1;
     }
-    let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    let pad = " ".repeat(w.saturating_sub(used));
+    if right { format!("{pad}{out}") } else { format!("{out}{pad}") }
 }
 
 /// One line of a cell (line breaks and tabs shown as spaces).
@@ -171,7 +192,7 @@ pub fn render_table(columns: &[ColumnMeta], rows: &[Vec<Option<String>>], width:
     let mut w: Vec<usize> = columns
         .iter()
         .enumerate()
-        .map(|(i, c)| cells.iter().map(|r| r.get(i).map_or(0, |s| s.chars().count())).chain([c.name.chars().count()]).max().unwrap_or(1).clamp(1, CELL_MAX))
+        .map(|(i, c)| cells.iter().map(|r| r.get(i).map_or(0, |s| cols(s))).chain([cols(&c.name)]).max().unwrap_or(1).clamp(1, CELL_MAX))
         .collect();
     // " │ " between columns.
     let total = |w: &[usize]| w.iter().sum::<usize>() + 3 * w.len().saturating_sub(1);
@@ -183,18 +204,8 @@ pub fn render_table(columns: &[ColumnMeta], rows: &[Vec<Option<String>>], width:
         w[i] = max - 1;
     }
     let right: Vec<bool> = columns.iter().map(|c| c.family == TypeFamily::Number).collect();
-    let line = |vals: Vec<String>| -> String {
-        vals.iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let v = fit(v, w[i]);
-                if right[i] { format!("{v:>width$}", width = w[i]) } else { format!("{v:<width$}", width = w[i]) }
-            })
-            .collect::<Vec<_>>()
-            .join(" │ ")
-            .trim_end()
-            .to_string()
-    };
+    let line =
+        |vals: Vec<String>| -> String { vals.iter().enumerate().map(|(i, v)| fit(v, w[i], right[i])).collect::<Vec<_>>().join(" │ ").trim_end().to_string() };
     let mut out = line(columns.iter().map(|c| flat(&c.name)).collect());
     out.push('\n');
     out.push_str(&w.iter().map(|n| "─".repeat(*n)).collect::<Vec<_>>().join("─┼─"));
@@ -223,18 +234,54 @@ fn tsv_field(v: Option<&str>) -> String {
     }
 }
 
-/// A JSON value: numbers and booleans as such, NULL as null, the rest strings.
+/// `s` as a JSON number when one holds it exactly: an integer that fits 64
+/// bits, or a decimal whose double reads back as the same value (trailing
+/// zeros aside). Others (a DECIMAL(38,19), a HUGEINT, NaN) stay text, so
+/// nothing is rounded on the way.
+fn exact_number(s: &str) -> Option<serde_json::Value> {
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(i.into());
+    }
+    if let Ok(u) = s.parse::<u64>() {
+        return Some(u.into());
+    }
+    let f = s.parse::<f64>().ok().filter(|f| f.is_finite())?;
+    let trim = |t: &str| -> String {
+        if t.contains('.') && !t.contains(['e', 'E']) { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t.to_string() }
+    };
+    let back = serde_json::Number::from_f64(f)?;
+    (trim(&back.to_string()) == trim(s.trim_start_matches('+'))).then_some(serde_json::Value::Number(back))
+}
+
+/// A JSON value: numbers (held exactly) and booleans as such, NULL as null, the rest strings.
 fn json_value(v: Option<&str>, family: TypeFamily) -> serde_json::Value {
     match (v, family) {
         (None, _) => serde_json::Value::Null,
-        (Some(s), TypeFamily::Number) => s.parse::<f64>().ok().filter(|f| f.is_finite()).and_then(|_| serde_json::from_str(s).ok()).unwrap_or_else(|| s.into()),
+        (Some(s), TypeFamily::Number) => exact_number(s).unwrap_or_else(|| s.into()),
         (Some(s), TypeFamily::Bool) if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") => s.eq_ignore_ascii_case("true").into(),
         (Some(s), _) => s.into(),
     }
 }
 
-/// Rows in a format meant for files and pipes (a header line for CSV and TSV).
-pub fn render_rows(format: Format, columns: &[ColumnMeta], rows: &[Vec<Option<String>>], header: bool) -> String {
+/// JSON keys for the columns: their names, a repeated one numbered
+/// (`id`, `id_2`), so no column is lost from an object.
+pub fn json_keys(columns: &[ColumnMeta]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::with_capacity(columns.len());
+    for c in columns {
+        let mut k = c.name.clone();
+        let mut n = 1;
+        while keys.contains(&k) {
+            n += 1;
+            k = format!("{}_{n}", c.name);
+        }
+        keys.push(k);
+    }
+    keys
+}
+
+/// Rows in a format meant for files and pipes (a header line for CSV and
+/// TSV when `header`); `keys` name JSON's fields ([`json_keys`]).
+pub fn render_rows(format: Format, columns: &[ColumnMeta], keys: &[String], rows: &[Vec<Option<String>>], header: bool) -> String {
     let mut out = String::new();
     let join = |vals: Vec<String>, sep: &str| vals.join(sep) + "\n";
     match format {
@@ -250,7 +297,7 @@ pub fn render_rows(format: Format, columns: &[ColumnMeta], rows: &[Vec<Option<St
         Format::Json => {
             for r in rows {
                 let obj: serde_json::Map<String, serde_json::Value> =
-                    columns.iter().zip(r).map(|(c, v)| (c.name.clone(), json_value(v.as_deref(), c.family))).collect();
+                    columns.iter().zip(keys).zip(r).map(|((c, k), v)| (k.clone(), json_value(v.as_deref(), c.family))).collect();
                 out.push_str(&serde_json::Value::Object(obj).to_string());
                 out.push('\n');
             }
@@ -261,7 +308,8 @@ pub fn render_rows(format: Format, columns: &[ColumnMeta], rows: &[Vec<Option<St
 }
 
 pub fn main(args: Vec<String>) -> ExitCode {
-    let opts = match parse(&args, |p| p.is_file() || p.is_dir() && p.extension().is_some()) {
+    // A folder is a data source (Delta, Iceberg, Parquet files), whatever its name.
+    let opts = match parse(&args, |p| p.is_file() || p.is_dir()) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("dbr: {e}\n{USAGE}");
@@ -286,14 +334,6 @@ pub fn main(args: Vec<String>) -> ExitCode {
     rt.block_on(run(opts))
 }
 
-/// A statement's SQL, from where it came.
-struct Job {
-    label: String,
-    sql: String,
-    /// Data files are read by the local DuckDB, whatever `-c` says.
-    local: bool,
-}
-
 async fn run(opts: Opts) -> ExitCode {
     let dir = background::data_dir();
     crate::logging::init("databrain-query", Some(&dir), false);
@@ -304,70 +344,8 @@ async fn run(opts: Opts) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let terminal = Terminal { out: std::io::stdout().is_terminal(), input: std::io::stdin().is_terminal() };
-    let mut stdout = std::io::stdout().lock();
-    let code = run_with(&state, opts, &mut stdout, terminal).await;
-    let _ = stdout.flush();
-    crate::api::remove_spill_folders(&state.engine);
-    ExitCode::from(code)
-}
-
-/// Where `dbr` runs: rows printed to a terminal (else a pipe or file), and
-/// a terminal to ask a question in.
-#[derive(Debug, Clone, Copy)]
-pub struct Terminal {
-    pub out: bool,
-    pub input: bool,
-}
-
-/// Run what `opts` asks on `state`, the rows to `out`, messages to stderr;
-/// the exit code (0 done, 1 a statement failed, 2 bad arguments, 130 stopped).
-pub async fn run_with(state: &AppState, opts: Opts, out: &mut dyn Write, terminal: Terminal) -> u8 {
-    let format = format_for(opts.format, terminal.out);
-    let limit = match row_limit(format, opts.limit) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("dbr: {e}");
-            return 2;
-        }
-    };
-    // What to run, in order.
-    let mut jobs = Vec::new();
-    for s in &opts.sources {
-        match s {
-            Source::Sql(sql) => jobs.push(Job { label: "SQL".into(), sql: sql.clone(), local: false }),
-            Source::File(p) if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) => match std::fs::read_to_string(p) {
-                Ok(sql) => jobs.push(Job { label: p.display().to_string(), sql, local: false }),
-                Err(e) => {
-                    eprintln!("dbr: cannot read {}: {e}", p.display());
-                    return 2;
-                }
-            },
-            Source::File(p) => match file_sql(p) {
-                Ok(sql) => jobs.push(Job { label: p.display().to_string(), sql, local: true }),
-                Err(e) => {
-                    eprintln!("dbr: {}: {e}", p.display());
-                    return 2;
-                }
-            },
-        }
-    }
-    let all = state.workspace.list_connections().unwrap_or_default();
-    let named = match opts.conn.as_deref().map(|n| find_connection(&all, n)) {
-        Some(Ok(c)) => Some(c.clone()),
-        Some(Err(e)) => {
-            eprintln!("dbr: {e}");
-            return 2;
-        }
-        None => None,
-    };
-    let local = || -> Result<ConnectionProfile, EngineError> {
-        // The "Local files (DuckDB)" connection the app reads files with, else Results.
-        match all.iter().find(|c| c.config.kind == databrain_connector_core::ConnectorKind::Duckdb && c.config.file_path.is_none()) {
-            Some(c) => Ok(c.clone()),
-            None => state.engine.results_connection(),
-        }
-    };
+    // Ctrl-C: the statement stops on the server, reading and printing stop,
+    // a question waiting for an answer is left.
     let cancel = databrain_connector_core::CancellationToken::new();
     {
         let cancel = cancel.clone();
@@ -377,19 +355,137 @@ pub async fn run_with(state: &AppState, opts: Opts, out: &mut dyn Write, termina
             }
         });
     }
+    let terminal = Terminal { out: std::io::stdout().is_terminal(), width: terminal_width() };
+    let ask = |q: &str| ask_on_terminal(q, std::io::stdin().is_terminal());
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr();
+    let code = run_with(&state, opts, Io { out: &mut stdout, err: &mut stderr, ask: &ask, cancel: cancel.clone() }, terminal).await;
+    let _ = stdout.flush();
+    crate::api::remove_spill_folders(&state.engine);
+    ExitCode::from(code)
+}
+
+/// Where `dbr` prints: to a terminal (else a pipe or file), how wide.
+#[derive(Debug, Clone, Copy)]
+pub struct Terminal {
+    pub out: bool,
+    pub width: usize,
+}
+
+/// A question's answer: yes, no, or no terminal to ask in (refused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Yes,
+    No,
+    NoTerminal,
+}
+
+/// What `dbr` reads and writes: the rows, the messages, a yes/no question
+/// (production), and Ctrl-C.
+pub struct Io<'a> {
+    pub out: &'a mut dyn Write,
+    pub err: &'a mut dyn Write,
+    pub ask: &'a (dyn Fn(&str) -> Answer + Sync),
+    pub cancel: databrain_connector_core::CancellationToken,
+}
+
+/// Exit codes.
+const DONE: u8 = 0;
+const FAILED: u8 = 1;
+const BAD_ARGS: u8 = 2;
+const STOPPED: u8 = 130;
+
+/// A statement's SQL, from where it came.
+struct Job {
+    label: String,
+    sql: String,
+    /// Data files are read by the local DuckDB, whatever `-c` says.
+    local: bool,
+}
+
+/// Run what `opts` asks on `state`: the rows to `io.out`, messages to
+/// `io.err`; the exit code (0 done, 1 a statement failed, 2 bad arguments
+/// or a question refused, 130 stopped).
+pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Terminal) -> u8 {
+    let Io { out, err, ask, cancel } = io;
+    macro_rules! say {
+        ($($t:tt)*) => {{ let _ = writeln!(err, $($t)*); }};
+    }
+    let format = format_for(opts.format, terminal.out);
+    let limit = match row_limit(format, opts.limit) {
+        Ok(l) => l,
+        Err(e) => {
+            say!("dbr: {e}");
+            return BAD_ARGS;
+        }
+    };
+    // What to run, in order.
+    let mut jobs = Vec::new();
+    for s in &opts.sources {
+        match s {
+            Source::Sql(sql) => jobs.push(Job { label: "SQL".into(), sql: sql.clone(), local: false }),
+            Source::File(p) if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) => match std::fs::read_to_string(p) {
+                Ok(sql) => jobs.push(Job { label: p.display().to_string(), sql, local: false }),
+                Err(e) => {
+                    say!("dbr: cannot read {}: {e}", p.display());
+                    return BAD_ARGS;
+                }
+            },
+            // A data file or folder (Delta, Iceberg, Parquet): by its full
+            // path, so the SQL kept in the history runs again from anywhere.
+            Source::File(p) => match std::path::absolute(p).map_err(|e| e.to_string()).and_then(|full| file_sql(&full)) {
+                Ok(sql) => jobs.push(Job { label: p.display().to_string(), sql, local: true }),
+                Err(e) => {
+                    say!("dbr: {}: {e}", p.display());
+                    return BAD_ARGS;
+                }
+            },
+        }
+    }
+    let all = state.workspace.list_connections().unwrap_or_default();
+    let named = match opts.conn.as_deref().map(|n| find_connection(&all, n)) {
+        Some(Ok(c)) => Some(c.clone()),
+        Some(Err(e)) => {
+            say!("dbr: {e}");
+            return BAD_ARGS;
+        }
+        None => None,
+    };
+    // The app's "Local files (DuckDB)" connection (not a user's own
+    // in-memory DuckDB), else Results.
+    let local = || -> Result<ConnectionProfile, EngineError> {
+        match all.iter().find(|c| c.name == LOCAL_FILES && c.config.kind == databrain_connector_core::ConnectorKind::Duckdb && c.config.file_path.is_none()) {
+            Some(c) => Ok(c.clone()),
+            None => state.engine.results_connection(),
+        }
+    };
     let mut failed = false;
-    let width = std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(120);
     for job in &jobs {
         let conn = match (&named, job.local) {
             (Some(c), false) => c.clone(),
             _ => match local() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("dbr: {}", e.message);
-                    return 2;
+                    say!("dbr: {}", e.message);
+                    return BAD_ARGS;
                 }
             },
         };
+        // A `:name` with no value is a bad command line, found before anything runs.
+        let missing: Vec<String> = databrain_connector_core::sql::find_parameters(&job.sql, conn.config.kind)
+            .into_iter()
+            .map(|p| p.name)
+            .filter(|n| !opts.params.contains_key(n))
+            .fold(Vec::new(), |mut v, n| {
+                if !v.contains(&n) {
+                    v.push(n);
+                }
+                v
+            });
+        if !missing.is_empty() {
+            say!("dbr: give a value for {} with -p name=value", missing.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "));
+            return BAD_ARGS;
+        }
         let req = |confirmed: bool| RunRequest {
             connection_id: conn.id.clone(),
             tab_id: format!("cli:{}", uuid::Uuid::new_v4().simple()),
@@ -403,27 +499,35 @@ pub async fn run_with(state: &AppState, opts: Opts, out: &mut dyn Write, termina
             params: opts.params.clone(),
             output_masks: None,
         };
-        let started = std::time::Instant::now();
         let mut res = state.engine.run_and_wait(&state.hub, req(false), Some(cancel.clone())).await;
         // Production (or a write the connection asks about): asked here, or --yes.
         if let Err(e) = &res
             && e.code.as_deref() == Some("needs_confirmation")
         {
-            let go = opts.yes || (terminal.input && ask(&format!("{}\nRun it on \"{}\"? [y/N] ", e.message, conn.name)));
-            if !go {
-                eprintln!("dbr: not run on \"{}\": {} (--yes runs it without asking)", conn.name, e.message);
-                return 2;
+            let answer = if opts.yes { Answer::Yes } else { asked(ask, &format!("{}\nRun it on \"{}\"? [y/N] ", e.message, conn.name), &cancel).await };
+            if cancel.is_cancelled() {
+                say!("dbr: stopped");
+                return STOPPED;
+            }
+            if answer != Answer::Yes {
+                say!(
+                    "dbr: not run on \"{}\": {}{}",
+                    conn.name,
+                    e.message,
+                    if answer == Answer::NoTerminal { " (no terminal to ask in: --yes runs it)" } else { "" }
+                );
+                return BAD_ARGS;
             }
             res = state.engine.run_and_wait(&state.hub, req(true), Some(cancel.clone())).await;
         }
         if cancel.is_cancelled() {
-            eprintln!("dbr: stopped");
-            return 130;
+            say!("dbr: stopped");
+            return STOPPED;
         }
         let outcomes = match res {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("dbr: {}: {}", job.label, e.message);
+                say!("dbr: {}: {}", job.label, e.message);
                 failed = true;
                 continue;
             }
@@ -434,7 +538,7 @@ pub async fn run_with(state: &AppState, opts: Opts, out: &mut dyn Write, termina
                 let _ = writeln!(out, "-- statement {} of {n}", o.index + 1);
             }
             if let Some(e) = &o.error {
-                eprintln!("dbr: {}statement {}: {}", if jobs.len() > 1 { format!("{}: ", job.label) } else { String::new() }, o.index + 1, e.message);
+                say!("dbr: {}statement {}: {}", if jobs.len() > 1 { format!("{}: ", job.label) } else { String::new() }, o.index + 1, e.message);
                 failed = true;
                 continue;
             }
@@ -444,43 +548,91 @@ pub async fn run_with(state: &AppState, opts: Opts, out: &mut dyn Write, termina
                 if format == Format::Table {
                     let _ = writeln!(out, "{affected} · {} · {} ms", conn.name, o.duration_ms);
                 } else {
-                    eprintln!("{affected}");
+                    say!("{affected}");
                 }
                 continue;
             };
-            let rows = match read_rows(state, &r.id, r.total_rows).await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("dbr: {}", e.message);
-                    failed = true;
-                    continue;
+            let read = if format == Format::Table {
+                // Up to 1,000 rows: read, then fitted to the terminal.
+                let mut rows = Vec::new();
+                let r2 = for_each_page(state, &r.id, r.total_rows, &cancel, |page| rows.extend_from_slice(page)).await;
+                if r2.is_ok() {
+                    let _ = out.write_all(render_table(&r.columns, &rows, terminal.width).as_bytes());
+                    let more = if r.truncated { format!(" (more not read: --limit up to {TABLE_MAX}, or --csv for every row)") } else { String::new() };
+                    let _ = writeln!(out, "{} row{}{more} · {} · {} ms", rows.len(), if rows.len() == 1 { "" } else { "s" }, conn.name, o.duration_ms);
                 }
-            };
-            if format == Format::Table {
-                let _ = out.write_all(render_table(&r.columns, &rows, width).as_bytes());
-                let more = if r.truncated { format!(" (more not read: --limit up to {TABLE_MAX}, or --csv for every row)") } else { String::new() };
-                let _ =
-                    writeln!(out, "{} row{}{more} · {} · {} ms", rows.len(), if rows.len() == 1 { "" } else { "s" }, conn.name, started.elapsed().as_millis());
+                r2
             } else {
-                let _ = out.write_all(render_rows(format, &r.columns, &rows, true).as_bytes());
+                // Every row, a page at a time: printed as read (a pipe gets the
+                // first rows at once, and the rows are never all in memory).
+                let keys = json_keys(&r.columns);
+                let mut header = true;
+                let mut broken = false;
+                for_each_page(state, &r.id, r.total_rows, &cancel, |page| {
+                    if broken {
+                        return;
+                    }
+                    let text = render_rows(format, &r.columns, &keys, page, header);
+                    header = false;
+                    // The reader went away (`| head`): stop reading.
+                    if out.write_all(text.as_bytes()).is_err() {
+                        broken = true;
+                    }
+                })
+                .await
+            };
+            match read {
+                Ok(()) => {}
+                Err(e) if cancel.is_cancelled() || e.kind == "cancelled" => {
+                    say!("dbr: stopped");
+                    return STOPPED;
+                }
+                Err(e) => {
+                    say!("dbr: {}", e.message);
+                    failed = true;
+                }
             }
         }
     }
     let _ = out.flush();
-    if failed { 1 } else { 0 }
+    if failed { FAILED } else { DONE }
 }
 
-/// Every row of a stored result, a page at a time.
-async fn read_rows(state: &AppState, id: &str, total: usize) -> Result<Vec<Vec<Option<String>>>, EngineError> {
-    let mut rows = Vec::with_capacity(total.min(100_000));
-    while rows.len() < total {
-        let page = crate::api::fetch_page(state, id.to_string(), ViewSpec::default(), rows.len(), 5_000).await?;
+/// The name of the DuckDB connection the app reads local files with.
+const LOCAL_FILES: &str = "Local files (DuckDB)";
+
+/// Each page of a stored result (5,000 rows), in order, until Ctrl-C.
+async fn for_each_page(
+    state: &AppState,
+    id: &str,
+    total: usize,
+    cancel: &databrain_connector_core::CancellationToken,
+    mut each: impl FnMut(&[Vec<Option<String>>]),
+) -> Result<(), EngineError> {
+    let mut at = 0;
+    while at < total {
+        if cancel.is_cancelled() {
+            return Err(EngineError::new("cancelled", "stopped"));
+        }
+        let page = crate::api::fetch_page(state, id.to_string(), ViewSpec::default(), at, 5_000).await?;
         if page.rows.is_empty() {
             break;
         }
-        rows.extend(page.rows);
+        at += page.rows.len();
+        each(&page.rows);
     }
-    Ok(rows)
+    Ok(())
+}
+
+/// Ask `question`, unless Ctrl-C comes first.
+async fn asked(ask: &(dyn Fn(&str) -> Answer + Sync), question: &str, cancel: &databrain_connector_core::CancellationToken) -> Answer {
+    // The question reads a line (blocking): off the runtime, raced with Ctrl-C.
+    let q = question.to_string();
+    let ask_ptr: &(dyn Fn(&str) -> Answer + Sync) = ask;
+    tokio::select! {
+        a = async { tokio::task::block_in_place(|| ask_ptr(&q)) } => a,
+        _ = cancel.cancelled() => Answer::No,
+    }
 }
 
 /// The SQL that reads a data file every row (CSV, Parquet, JSON, Excel's first sheet, Delta/Iceberg folders).
@@ -495,12 +647,66 @@ fn file_sql(p: &Path) -> Result<String, String> {
     Err("this DataBrain reads data files with DuckDB, which isn't built in: query them in the app with a DuckDB library installed".into())
 }
 
-/// Ask a yes/no question on the terminal (no means no).
-fn ask(question: &str) -> bool {
+/// Ask a yes/no question on the terminal (no means no); none: refused.
+fn ask_on_terminal(question: &str, terminal: bool) -> Answer {
+    if !terminal {
+        return Answer::NoTerminal;
+    }
     eprint!("{question}");
     let _ = std::io::stderr().flush();
     let mut line = String::new();
-    std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    if std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim().to_lowercase().as_str(), "y" | "yes") { Answer::Yes } else { Answer::No }
+}
+
+/// The terminal's width in columns: `COLUMNS` when set, else what the
+/// terminal says (stdout, then stderr), else 120.
+pub fn terminal_width() -> usize {
+    if let Some(c) = std::env::var("COLUMNS").ok().and_then(|c| c.trim().parse::<usize>().ok()).filter(|c| *c > 0) {
+        return c;
+    }
+    os_width().filter(|w| *w > 0).unwrap_or(120)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn os_width() -> Option<usize> {
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        let mut ws: libc::winsize = unsafe_zeroed_winsize();
+        // SAFETY: TIOCGWINSZ writes a winsize into the struct it is given
+        // and reads nothing else; a non-terminal fd makes it fail (checked).
+        #[allow(unsafe_code)]
+        let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0;
+        if ok && ws.ws_col > 0 {
+            return Some(ws.ws_col as usize);
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unsafe_zeroed_winsize() -> libc::winsize {
+    libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 }
+}
+
+#[cfg(windows)]
+fn os_width() -> Option<usize> {
+    use windows_sys::Win32::System::Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: the handle is the process's own stdout; the call fills the
+    // struct it is given (zeroed first) and fails when it isn't a console.
+    #[allow(unsafe_code)]
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(h, &mut info) != 0 {
+            let w = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+            return usize::try_from(w).ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn os_width() -> Option<usize> {
+    None
 }
 
 #[cfg(test)]
@@ -531,6 +737,8 @@ mod tests {
         assert!(parse(&args(&["-i", "--limit", "many", "x"]), files).unwrap_err().contains("--limit takes"));
         assert!(parse(&args(&["-i", "-p", "day", "x"]), files).unwrap_err().contains("name=value"));
         assert!(parse(&args(&["-x", "x"]), files).unwrap_err().contains("unknown option"));
+        // SQL that starts with a `--` comment is SQL, not an option.
+        assert_eq!(parse(&args(&["-i", "--x\nselect\n1"]), files).unwrap().sources, [Source::Sql("--x\nselect\n1".into())]);
         assert!(parse(&args(&["--help"]), files).unwrap().help);
     }
 
@@ -588,20 +796,46 @@ mod tests {
         );
         // Narrow: the widest column gives way first, every line fits.
         let narrow = render_table(&cols, &rows, 30);
-        assert!(narrow.lines().all(|l| l.chars().count() <= 30), "{narrow}");
+        assert!(narrow.lines().all(|l| super::cols(l) <= 30), "{narrow}");
+        // Wide characters take two columns: the bars stay in line.
+        let cjk = render_table(
+            &[col("名前", TypeFamily::Text), col("n", TypeFamily::Number)],
+            &[vec![Some("東京".into()), Some("1".into())], vec![Some("ab".into()), Some("22".into())]],
+            80,
+        );
+        let bars: Vec<usize> = cjk.lines().filter(|l| l.contains('│')).map(|l| super::cols(l.split('│').next().unwrap())).collect();
+        assert!(bars.windows(2).all(|w| w[0] == w[1]), "{cjk}");
     }
 
     #[test]
     fn formats_for_files_and_pipes() {
         let cols = [col("id", TypeFamily::Number), col("name", TypeFamily::Text), col("ok", TypeFamily::Bool)];
         let rows = vec![vec![Some("1".into()), Some("a, \"b\"".into()), Some("true".into())], vec![Some("2.5".into()), None, Some("false".into())]];
-        assert_eq!(render_rows(Format::Csv, &cols, &rows, true), "id,name,ok\n1,\"a, \"\"b\"\"\",true\n2.5,,false\n");
-        assert_eq!(render_rows(Format::Tsv, &cols, &rows, true), "id\tname\tok\n1\ta, \"b\"\ttrue\n2.5\t\\N\tfalse\n");
+        let keys = json_keys(&cols);
+        assert_eq!(render_rows(Format::Csv, &cols, &keys, &rows, true), "id,name,ok\n1,\"a, \"\"b\"\"\",true\n2.5,,false\n");
+        assert_eq!(render_rows(Format::Tsv, &cols, &keys, &rows, true), "id\tname\tok\n1\ta, \"b\"\ttrue\n2.5\t\\N\tfalse\n");
         assert_eq!(
-            render_rows(Format::Json, &cols, &rows, true),
+            render_rows(Format::Json, &cols, &keys, &rows, true),
             "{\"id\":1,\"name\":\"a, \\\"b\\\"\",\"ok\":true}\n{\"id\":2.5,\"name\":null,\"ok\":false}\n"
         );
-        // A number that isn't one JSON reads (NaN, huge text) stays a string.
-        assert_eq!(json_value(Some("NaN"), TypeFamily::Number), serde_json::Value::from("NaN"));
+        // A page after the first: no header again.
+        assert_eq!(render_rows(Format::Csv, &cols, &keys, &rows[1..], false), "2.5,,false\n");
+        // Two columns of one name: both kept.
+        let twice = [col("id", TypeFamily::Number), col("id", TypeFamily::Number)];
+        assert_eq!(render_rows(Format::Json, &twice, &json_keys(&twice), &[vec![Some("1".into()), Some("2".into())]], true), "{\"id\":1,\"id_2\":2}\n");
+    }
+
+    #[test]
+    fn json_numbers_are_never_rounded() {
+        let n = |s: &str| json_value(Some(s), TypeFamily::Number);
+        assert_eq!(n("42"), serde_json::json!(42));
+        assert_eq!(n("-9223372036854775808"), serde_json::json!(i64::MIN));
+        assert_eq!(n("18446744073709551615"), serde_json::json!(u64::MAX));
+        assert_eq!(n("120.50"), serde_json::json!(120.5), "trailing zeros aside");
+        assert_eq!(n("2.5"), serde_json::json!(2.5));
+        // What a double can't hold exactly stays text.
+        assert_eq!(n("0.1000000000000000055"), serde_json::json!("0.1000000000000000055"));
+        assert_eq!(n("123456789012345678901234"), serde_json::json!("123456789012345678901234"));
+        assert_eq!(n("NaN"), serde_json::json!("NaN"));
     }
 }
