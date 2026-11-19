@@ -172,6 +172,7 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
       saved_query_id: init?.saved_query_id ?? null,
       output_ref: init?.output_ref ?? null,
       ddl: init?.ddl ?? null,
+      table: init?.table ?? null,
       lineage: init?.lineage ?? null,
       job_id: init?.job_id ?? null,
       plan: init?.plan ?? null,
@@ -222,7 +223,7 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     // Remembered to reopen (not empty scratch tabs); the editor text and
     // parameters come back, the result doesn't (its session was closed).
     const closed = s.tabs[idx];
-    const keep = !!(closed.sql.trim() || closed.notebook_id || closed.output_ref || closed.ddl || closed.job_id || closed.saved_query_id);
+    const keep = !!(closed.sql.trim() || closed.notebook_id || closed.output_ref || closed.ddl || closed.table || closed.job_id || closed.saved_query_id);
     const closedTabs = keep ? [...s.closedTabs, { tab: closed, index: idx, params: s.params[id] }].slice(-20) : s.closedTabs;
     set({ tabs, activeTabId, runs, params, closedTabs, txOpen });
     persistParams(params);

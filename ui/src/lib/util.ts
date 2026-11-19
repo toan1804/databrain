@@ -23,6 +23,14 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(total / 60)}m ${total % 60}s`;
 }
 
+/** "1.2M", "34K", "980". */
+export function shortCount(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e10 ? 0 : 1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
+  if (n >= 1e4) return `${Math.round(n / 1e3)}K`;
+  return formatCount(n);
+}
+
 export function formatCount(n: number): string {
   return n.toLocaleString("en-US");
 }
@@ -221,6 +229,26 @@ export function selectTopSql(kind: ConnectorKind, schema: string, table: string,
       return `SELECT *\nFROM ${q}\nFETCH FIRST ${n} ROWS ONLY`;
     default:
       return `SELECT *\nFROM ${q}\nLIMIT ${n};`;
+  }
+}
+
+/**
+ * Sample rows of a table for the table explorer: its first `n` rows, only
+ * those matching `where` (an SQL condition) when given. MongoDB and Neo4j
+ * take no condition here (their own languages): the plain preview.
+ */
+export function sampleSql(kind: ConnectorKind, schema: string, table: string, n: number, where?: string): string {
+  const t = traitsOf(kind);
+  const cond = where?.trim().replace(/;+\s*$/, "");
+  if (!cond || t.preview === "mongo_find" || t.preview === "cypher") return selectTopSql(kind, schema, table, n);
+  const q = qualifiedName(kind, schema, table);
+  switch (t.row_limit) {
+    case "top":
+      return `SELECT TOP ${n} *\nFROM ${q}\nWHERE ${cond};`;
+    case "fetch_first":
+      return `SELECT *\nFROM ${q}\nWHERE ${cond}\nFETCH FIRST ${n} ROWS ONLY`;
+    default:
+      return `SELECT *\nFROM ${q}\nWHERE ${cond}\nLIMIT ${n};`;
   }
 }
 

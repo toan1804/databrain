@@ -2,7 +2,7 @@
 // ER diagram): kept apart from their components so that menus and editors
 // can open them without loading the components up front.
 import { traitsOf } from "../lib/sourceTraits";
-import type { CompareSpec } from "../lib/types";
+import type { CompareSpec, ConnectionView, DbObject } from "../lib/types";
 import { useStore, type CompareRef, type DiffRef } from "../store";
 import { editorBridge } from "../editorBridge";
 
@@ -52,4 +52,12 @@ export function openErDiagram(connectionId: string, schema: string, label: strin
   const open = st.tabs.find((t) => t.er && t.connection_id === connectionId && t.er.schema === schema);
   if (open) return st.setActiveTab(open.id);
   st.newTab({ title: `ER · ${label}`, sql: "", connection_id: connectionId, er: { schema, label } });
+}
+
+/** Open the table explorer of `obj` (or show its tab if it is open). */
+export function openTable(conn: ConnectionView, obj: Pick<DbObject, "schema" | "name" | "kind">) {
+  const st = useStore.getState();
+  const open = st.tabs.find((t) => t.table && t.connection_id === conn.id && t.table.schema === obj.schema && t.table.name === obj.name);
+  if (open) return st.setActiveTab(open.id);
+  st.newTab({ title: obj.name, sql: "", connection_id: conn.id, table: { schema: obj.schema, name: obj.name, kind: obj.kind } });
 }

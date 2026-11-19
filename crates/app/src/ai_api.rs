@@ -560,6 +560,17 @@ pub fn knowledge(state: &AppState, connection_id: &str) -> Result<KnowledgeView>
     Ok(KnowledgeView { state: st, notes: state.workspace.kn_notes(connection_id)? })
 }
 
+/// The notes about one table (or its columns), approved and proposed, as
+/// the AI matches them to it (`target_mentions`): the table explorer's Notes.
+pub fn table_notes(state: &AppState, connection_id: &str, schema: &str, name: &str) -> Result<Vec<databrain_workspace::KnNote>> {
+    Ok(state
+        .workspace
+        .kn_notes(connection_id)?
+        .into_iter()
+        .filter(|n| n.target.as_deref().is_some_and(|t| databrain_workspace::target_mentions(t, schema, name)))
+        .collect())
+}
+
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export)]
 pub struct KnObjectPage {

@@ -129,6 +129,11 @@ pub(crate) async fn kn_get(state: State<'_, AppState>, connection_id: String) ->
 }
 
 #[tauri::command]
+pub(crate) async fn kn_table_notes(state: State<'_, AppState>, connection_id: String, schema: String, name: String) -> R<Vec<databrain_workspace::KnNote>> {
+    ai_api::table_notes(&state, &connection_id, &schema, &name)
+}
+
+#[tauri::command]
 pub(crate) async fn kn_objects(state: State<'_, AppState>, connection_id: String, filter: String, offset: usize, limit: usize) -> R<ai_api::KnObjectPage> {
     ai_api::knowledge_objects(&state, &connection_id, &filter, offset, limit)
 }

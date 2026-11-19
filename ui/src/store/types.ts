@@ -17,6 +17,8 @@ export interface Tab extends TabState {
   file_mtime?: number;
   /** Read-only DDL view of an object (explorer "Show DDL"); not saved across restarts. */
   ddl?: DdlRef | null;
+  /** Table explorer of a table or view (explorer double-click, "Open table"); not saved across restarts. */
+  table?: DdlRef | null;
   /** Lineage diagram of SQL from an editor (`sql` holds the analysed text); not saved across restarts. */
   lineage?: LineageRef | null;
   /** Job editor (the job is saved in the workspace); not saved across restarts. */
@@ -83,7 +85,7 @@ export interface DdlRef {
 }
 
 /** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
-export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.diff && !t.er && !t.dashboard_id;
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.table && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.diff && !t.er && !t.dashboard_id;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 

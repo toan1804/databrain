@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { openTable } from "../openTabs";
 import { ClipboardCopy, Columns3, Eye, FunctionSquare, KeyRound, ListOrdered, Play, Table2, TextCursorInput } from "lucide-react";
 import { api, toError } from "../../lib/api";
 import type { ConnectionView, DbObject } from "../../lib/types";
@@ -200,7 +201,8 @@ export function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: Connecti
         active={focused}
         meta={shown.short}
         onClick={toggle}
-        onDoubleClick={() => editorBridge.insert(activeTab(), quoteIdent(conn.config.kind, obj.name))}
+        // A table or view opens its explorer; other objects go into the editor ("Insert table path" in the menu inserts any).
+        onDoubleClick={() => (isRelation ? openTable(conn, obj) : editorBridge.insert(activeTab(), quoteIdent(conn.config.kind, obj.name)))}
         onContextMenu={(e) => {
           e.preventDefault();
           setMenu({ x: e.clientX, y: e.clientY });

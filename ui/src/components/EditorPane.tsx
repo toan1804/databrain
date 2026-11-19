@@ -141,6 +141,7 @@ export function EditorPane() {
 // Tabs opened now and then are loaded on first use, keeping them out of the
 // bundle read at startup.
 const DdlTab = lazy(() => import("./DdlTab").then((m) => ({ default: m.DdlTab })));
+const TableTab = lazy(() => import("./TableTab").then((m) => ({ default: m.TableTab })));
 const JobTab = lazy(() => import("./JobTab").then((m) => ({ default: m.JobTab })));
 const LineageTab = lazy(() => import("./LineageTab").then((m) => ({ default: m.LineageTab })));
 const CompareTab = lazy(() => import("./CompareTab").then((m) => ({ default: m.CompareTab })));
@@ -159,6 +160,8 @@ const TabSlot = memo(function TabSlot({ tab: t, active }: { tab: Tab; active: bo
       ? ["output", <OutputTab tabId={t.id} reference={t.output_ref} visible={active} />]
       : t.ddl
         ? ["DDL view", <DdlTab tabId={t.id} reference={t.ddl} visible={active} />]
+        : t.table
+          ? ["table", <TableTab tabId={t.id} reference={t.table} visible={active} />]
         : t.job_id
           ? ["job", <JobTab tabId={t.id} jobId={t.job_id} visible={active} />]
           : t.lineage
@@ -274,6 +277,8 @@ function TabBar() {
               <Table2 size={12} className="shrink-0 text-muted" />
             ) : t.ddl ? (
               <FileCode2 size={12} className="shrink-0 text-muted" />
+            ) : t.table ? (
+              <Table2 size={12} className="shrink-0 text-accent" />
             ) : t.lineage ? (
               <Network size={12} className="shrink-0 text-muted" />
             ) : t.plan ? (

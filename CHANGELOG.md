@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **Table explorer:** double-click a table or view (or right-click → "Open table") for a tab of its own: its path, kind, connection, row estimate and comment, then Data (its first 100–10,000 rows in the result grid, filtered by a `where` condition), Columns (types, keys, defaults, comments, notes), DDL and Notes (the knowledge base's notes on it; add one). Double-click used to insert the table's name: "Insert table path" in its menu does that.
+
 ## 0.4.5 - 2026-11-19
 
 ### Added

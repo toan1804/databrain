@@ -462,6 +462,8 @@ export const api = {
   mcpConfig: () => call<unknown>("mcp_config"),
 
   knGet: (connectionId: string) => call<KnowledgeView>("kn_get", { connectionId }),
+  /** The notes about one table or its columns (approved and proposed). */
+  knTableNotes: (connectionId: string, schema: string, name: string) => call<KnNote[]>("kn_table_notes", { connectionId, schema, name }),
   /** Tables the AI may use matching `filter` (schema.name or comment), one page at a time. */
   knObjects: (connectionId: string, filter: string, offset: number, limit: number) =>
     call<KnObjectPage>("kn_objects", { connectionId, filter, offset, limit }),

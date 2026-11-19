@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { isRelationKind } from "../lib/catalog";
+import { openTable } from "./openTabs";
 import { AlertCircle, ChevronDown, Eye, Loader2, Play, Search, Table2, TextCursorInput, X } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { RESULTS_SCHEMA_ID, cachedHits, matchRange, objectMatches, rankHits, splitSchema, tablePath } from "../lib/catalog";
@@ -347,7 +349,9 @@ function HitRow({
       }}
       onDoubleClick={() => {
         clearTimeout(clickTimer.current);
-        onInsert();
+        // A table or view opens its explorer; other objects go into the editor.
+        if (isRelationKind(obj.kind)) openTable(conn, obj);
+        else onInsert();
       }}
       onContextMenu={(e) => {
         e.preventDefault();
