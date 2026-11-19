@@ -168,3 +168,68 @@ test("on a production connection the sample asks once per tab before it reads", 
   await expect.poll(async () => (await calls(page, "run_query")).length).toBe(2);
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
+
+test("Relations and Usage: keys both ways, learned joins, job steps and queries from the history", async ({ page }) => {
+  await openApp(
+    page,
+    backend({
+      run_query: {
+        status: "started",
+        job_id: "job-t",
+        statements: [{ index: 0, sql: "SELECT …", start: 0, end: 8, classification: { kind: "read", missing_where: false, keyword: "SELECT" } }],
+      },
+      fetch_page: { view_rows: ROWS.length, total_rows: ROWS.length, offset: 0, row_ids: ROWS.map((_, i) => i), rows: ROWS },
+      schema_tables: {
+        offline: null,
+        stale: false,
+        tables: [
+          { table: "orders", columns: [{ name: "id", data_type: "integer", nullable: false, is_primary_key: true }], foreign_keys: [] },
+          { table: "order_items", columns: [{ name: "order_id", data_type: "integer", nullable: false, is_primary_key: false }], foreign_keys: [{ columns: ["order_id"], ref_schema: "public", ref_table: "orders", ref_columns: ["id"] }] },
+        ],
+      },
+      kn_learned: {
+        supported: true,
+        enabled: true,
+        state: null,
+        tables: [{ table: "public.orders", queries: 4, days: 3, last_seen: Date.now() - 3_600_000 }],
+        joins: [
+          { shown: true, hidden_reason: null, id: 1, left_table: "public.orders", left_columns: ["region"], right_table: "public.regions", right_columns: ["code"], status: "confirmed", declared: false, queries: 3, days: 2, ai_queries: 0, kinds: {}, first_seen: 1, last_seen: 2, documented: null },
+        ],
+      },
+      kn_table_notes: { target: "public.orders", notes: [] },
+      table_usage: {
+        learned: { table: "public.orders", queries: 4, days: 3, last_seen: Date.now() - 3_600_000 },
+        steps: [{ job_id: "j1", job_name: "Nightly", step_id: "n1", step_name: "load_orders", reads: false, writes: true, sure: false }],
+        history: [
+          { id: 1, origin: "user", connection_id: "conn-shop", connection_name: "Shop", sql: "select * from orders", started_at: Date.now() - 60_000, duration_ms: 3, rows: 2, status: "success", error: null, output_handle: null, result_id: null },
+          { id: 2, origin: "job", connection_id: "conn-shop", connection_name: "Shop", sql: "SELECT * FROM orders", started_at: Date.now() - 120_000, duration_ms: 3, rows: 2, status: "success", error: null, output_handle: null, result_id: null },
+          { id: 3, origin: "user", connection_id: "conn-shop", connection_name: "Shop", sql: "select * from orders_archive", started_at: Date.now(), duration_ms: 3, rows: 2, status: "success", error: null, output_handle: null, result_id: null },
+        ],
+      },
+    }),
+  );
+  const tree = page.getByRole("treeitem");
+  await tree.filter({ hasText: "Shop" }).first().click();
+  await tree.filter({ hasText: /^orders/ }).dblclick();
+  const tab = page.getByLabel(/^Table .*orders/);
+  await expect(tab).toBeVisible();
+
+  await tab.getByRole("tab", { name: /^Relations/ }).click();
+  await expect(tab.getByText("order_items")).toBeVisible();
+  await expect(tab.getByText(/approved · 3 queries on 2 days/)).toBeVisible();
+  await expect(tab.getByText("· given to the AI")).toBeVisible();
+  await tab.getByRole("button", { name: /ER diagram around it/ }).click();
+  await expect(page.getByRole("tab", { name: /ER · public/ })).toBeVisible();
+
+  await page.getByRole("tab", { name: /orders/ }).first().click();
+  await tab.getByRole("tab", { name: /^Usage/ }).click();
+  await expect(tab.getByText(/4 different queries on 3 days/)).toBeVisible();
+  await expect(tab.getByRole("button", { name: "Nightly" })).toBeVisible();
+  await expect(tab.getByText("writes it")).toBeVisible();
+  // Named without its schema: hedged.
+  await expect(tab.getByText(/may be another schema's orders/)).toBeVisible();
+  // The two spellings of one query are one line, run twice; orders_archive isn't this table.
+  await expect(tab.getByText("×2")).toBeVisible();
+  await expect(tab.getByText(/orders_archive/)).toHaveCount(0);
+  expect(await calls(page, "table_usage")).toContainEqual({ connectionId: "conn-shop", schema: "public", name: "orders" });
+});

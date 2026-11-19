@@ -312,6 +312,7 @@ pub fn run() {
             commands::outputs::chart_data,
             commands::library::list_notebooks,
             commands::jobs::list_jobs,
+            commands::jobs::table_usage,
             commands::jobs::get_job,
             commands::jobs::save_job,
             commands::jobs::delete_job,

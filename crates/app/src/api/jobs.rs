@@ -192,3 +192,158 @@ pub fn reset_job_watermark(state: &AppState, id: &str, node_id: &str) -> Result<
 pub fn job_runs(state: &AppState, id: &str, limit: Option<i64>) -> Result<Vec<databrain_workspace::JobRun>> {
     Ok(state.workspace.job_runs(id, limit.unwrap_or(30).clamp(1, databrain_workspace::jobs::RUNS_KEPT))?)
 }
+
+/// A job step that reads or writes a table (the table explorer's Usage).
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TableJobStep {
+    pub job_id: String,
+    pub job_name: String,
+    pub step_id: String,
+    pub step_name: String,
+    /// Its SQL on the table's connection reads the table.
+    pub reads: bool,
+    /// It loads into the table, or its SQL on the table's connection writes it.
+    pub writes: bool,
+    /// Named with its schema, so it is this table. False: by its name alone
+    /// (or after a `USE`), which is this table only when the session's
+    /// default schema is this one.
+    pub sure: bool,
+}
+
+/// How `t` (a name as written, its parts) names `schema.name` (`schema`
+/// may be `catalog.schema`): `Some(true)` for sure (it gives every part, all
+/// matching), `Some(false)` with fewer parts (`orders`, or `dbo.orders` for
+/// `db.dbo`: the session's default may be another schema or database),
+/// `None` not this table. Any case.
+fn names_table(t: &[String], schema: &str, name: &str) -> Option<bool> {
+    let want: Vec<&str> = schema.split('.').chain([name]).collect();
+    if t.is_empty() || t.len() > want.len() {
+        return None;
+    }
+    let tail = &want[want.len() - t.len()..];
+    t.iter().zip(tail).all(|(a, b)| a.eq_ignore_ascii_case(b)).then_some(t.len() == want.len())
+}
+
+/// A load target as typed (`schema.table`, `"a.b"`, `[a].[b]`, backticks)
+/// as name parts: dots inside quotes don't split.
+fn target_parts(target: &str) -> Vec<String> {
+    let (mut parts, mut cur, mut close) = (Vec::new(), String::new(), None::<char>);
+    for ch in target.trim().chars() {
+        match (close, ch) {
+            (Some(c), _) if ch == c => close = None,
+            (Some(_), _) => cur.push(ch),
+            (None, '"') => close = Some('"'),
+            (None, '`') => close = Some('`'),
+            (None, '[') => close = Some(']'),
+            (None, '.') => parts.push(std::mem::take(&mut cur)),
+            (None, _) => cur.push(ch),
+        }
+    }
+    parts.push(cur);
+    parts.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+}
+
+/// The job steps that read or write table `schema.name` of connection
+/// `connection_id`, from the steps' SQL as written (local: nothing is asked
+/// of the server). SQL that can't be read (a procedure call, dynamic SQL)
+/// isn't counted. A load step's own SQL runs on DuckDB over `results.*`,
+/// so only its before/after SQL and target count.
+pub fn table_job_steps(ws: &databrain_workspace::Workspace, connection_id: &str, schema: &str, name: &str) -> Result<Vec<TableJobStep>> {
+    let kind = ws.get_connection(connection_id)?.config.kind;
+    let mut out = Vec::new();
+    for summary in ws.list_jobs()? {
+        let Ok(job) = ws.get_job(&summary.id) else { continue };
+        for n in &job.nodes {
+            let (mut reads, mut writes, mut sure) = (false, false, true);
+            let mut scan = |sql: &str| {
+                let refs = databrain_connector_core::tables::table_refs(sql, kind);
+                for (list, flag) in [(&refs.reads, &mut reads), (&refs.writes, &mut writes)] {
+                    for t in list {
+                        if let Some(qualified) = names_table(t, schema, name) {
+                            *flag = true;
+                            sure &= qualified && !refs.changes_default;
+                        }
+                    }
+                }
+            };
+            if n.kind == databrain_workspace::JobNodeKind::Query && n.connection_id.as_deref() == Some(connection_id) {
+                scan(&n.sql);
+            }
+            if n.kind == databrain_workspace::JobNodeKind::Load && n.target_connection_id.as_deref() == Some(connection_id) {
+                for sql in [&n.load_before_sql, &n.load_after_sql].into_iter().flatten() {
+                    scan(sql);
+                }
+                if let Some(q) = n.target_table.as_deref().and_then(|t| names_table(&target_parts(t), schema, name)) {
+                    writes = true;
+                    sure &= q;
+                }
+            }
+            if reads || writes {
+                out.push(TableJobStep {
+                    job_id: job.id.clone(),
+                    job_name: job.name.clone(),
+                    step_id: n.id.clone(),
+                    step_name: n.name.clone(),
+                    reads,
+                    writes,
+                    sure,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What the table explorer's Usage shows of a table, all from DataBrain's
+/// own records (nothing is asked of the database).
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TableUsageView {
+    /// The learned figures of the user's and jobs' queries on it (when the
+    /// connection learns from its history and it was seen).
+    pub learned: Option<databrain_workspace::TableUsage>,
+    /// The latest entries on its connection whose SQL contains its name
+    /// (the UI keeps those naming it as a word).
+    pub history: Vec<databrain_workspace::HistoryEntry>,
+    pub steps: Vec<TableJobStep>,
+}
+
+/// History entries read for Usage.
+const USAGE_HISTORY: u32 = 1000;
+
+/// [`TableUsageView`] of `schema.name` on `connection_id`.
+pub fn table_usage(ws: &databrain_workspace::Workspace, connection_id: &str, schema: &str, name: &str) -> Result<TableUsageView> {
+    // The knowledge base names a table `schema.name` (or `catalog.schema.name`), as the explorer does.
+    let learned =
+        ws.table_usage(connection_id)?.into_iter().find(|u| names_table(&target_parts(&u.table), schema, name).is_some() && target_parts(&u.table).len() >= 2);
+    Ok(TableUsageView {
+        learned,
+        history: ws.history_mentioning(connection_id, name, USAGE_HISTORY)?,
+        steps: table_job_steps(ws, connection_id, schema, name)?,
+    })
+}
+
+#[cfg(test)]
+mod table_name_tests {
+    use super::*;
+
+    #[test]
+    fn names_and_targets() {
+        let p = |s: &str| target_parts(s);
+        assert_eq!(p(r#""a.b".c"#), vec!["a.b", "c"]);
+        assert_eq!(p("[db].[dbo].[orders]"), vec!["db", "dbo", "orders"]);
+        assert_eq!(p("`proj.ds`.t"), vec!["proj.ds", "t"]);
+        assert_eq!(p(" sales . orders "), vec!["sales", "orders"]);
+        let n = |t: &str, s: &str| names_table(&p(t), s, "orders");
+        assert_eq!(n("sales.orders", "sales"), Some(true));
+        assert_eq!(n("SALES.Orders", "sales"), Some(true));
+        assert_eq!(n("orders", "sales"), Some(false));
+        assert_eq!(n("db.dbo.orders", "db.dbo"), Some(true));
+        assert_eq!(n("dbo.orders", "db.dbo"), Some(false));
+        assert_eq!(n("otherdb.dbo.orders", "db.dbo"), None);
+        assert_eq!(n("hr.orders", "sales"), None);
+        assert_eq!(n("x.sales.orders", "sales"), None);
+        assert_eq!(n("sales.orders_old", "sales"), None);
+    }
+}

@@ -39,6 +39,8 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
   const [filter, setFilter] = useState("");
   const box = useRef<HTMLDivElement>(null);
   const seq = useRef(0);
+  /** A table to trace once the diagram is read. */
+  const pending = useRef<string | null>(ref?.focus_at ? (ref.focus ?? null) : null);
   const fitted = useRef(false);
 
   const run = useCallback(async () => {
@@ -51,7 +53,9 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
       if (my !== seq.current) return;
       setLoad({ status: "ready", tables: r.tables, offline: r.offline, stale: r.stale });
       setPos({});
-      setFocus(null);
+      // A table asked for before the diagram was read (the explorer opening it): traced now, once.
+      setFocus(pending.current ? { node: `${ref.schema}.${pending.current}` } : null);
+      pending.current = null;
     } catch (e) {
       if (my === seq.current) setLoad({ status: "error", message: toError(e).message });
     }
@@ -63,6 +67,19 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
   useEffect(() => {
     void runOnce();
   }, [tab?.connection_id, schema, runOnce]);
+
+  // A table to trace, asked for by the table explorer (each ask, even of the
+  // same table, traces it again; a refresh doesn't bring an old trace back).
+  // Shown whatever the filter: the filter and "linked only" are cleared.
+  const askedAt = ref?.focus_at;
+  useEffect(() => {
+    if (!askedAt || !ref?.focus) return;
+    setFilter("");
+    setLinkedOnly(false);
+    if (load.status === "ready") setFocus({ node: `${ref.schema}.${ref.focus}` });
+    else pending.current = ref.focus;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- each ask (its time), not the whole ref (a new object at every tab change)
+  }, [askedAt]);
 
   const er = useMemo(() => (load.status === "ready" && ref ? erGraph(ref.schema, load.tables) : null), [load, ref]);
   /** What the diagram draws: the filter and "linked only" applied. */

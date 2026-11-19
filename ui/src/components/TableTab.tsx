@@ -1,7 +1,7 @@
 // Table explorer: one tab per table or view that gathers what DataBrain
 // knows and can read about it: sample rows, columns with their profile,
-// statistics, DDL and notes (see docs/TODO.md "Table explorer" for the later
-// parts: relations, history, usage).
+// statistics, relations, usage, DDL and notes (see docs/TODO.md "Table
+// explorer" for the later parts: history and indexes).
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, BarChart3, FileCode2, Hash, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Square, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
@@ -12,11 +12,12 @@ import { approxDistinct, billsScans, columnClass, countSql, exploreKey, num, pro
 import { formatBytes, formatCount, relativeTime, sampleSql, shortCount } from "../lib/util";
 import { useStore, type DdlRef } from "../store";
 import { DdlTab } from "./DdlTab";
+import { RelationsPart, UsagePart } from "./TableRelations";
 import { ResultsPanel } from "./ResultsPanel";
 import { ConnDot, EnvBadge } from "./ui";
 import { objectRef, selectTop } from "./CatalogSearch";
 
-type Part = "data" | "columns" | "stats" | "ddl" | "notes";
+type Part = "data" | "columns" | "stats" | "relations" | "usage" | "ddl" | "notes";
 type Detail = { status: "loading" } | { status: "ready"; detail: ObjectDetail } | { status: "error"; message: string };
 type Notes = { status: "loading" } | { status: "ready"; notes: TableNotes } | { status: "error"; message: string };
 
@@ -72,6 +73,8 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
     { key: "data", label: "Data" },
     { key: "columns", label: "Columns", count: d ? columns.length : undefined },
     { key: "stats", label: "Statistics" },
+    { key: "relations", label: "Relations" },
+    { key: "usage", label: "Usage" },
     { key: "ddl", label: "DDL" },
     { key: "notes", label: "Notes", count: noteList.length || undefined },
   ];
@@ -159,6 +162,8 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
           ),
         )}
         {slot("stats", <StatisticsPart explore={explore} />)}
+        {slot("relations", <RelationsPart conn={conn} reference={reference} detail={d} />)}
+        {slot("usage", <UsagePart conn={conn} reference={reference} />)}
         {/* The DDL view as Show DDL opens it, in this tab (read once). */}
         {slot("ddl", <DdlTab tabId={tabId} reference={reference} visible={visible && part === "ddl"} />)}
         {slot("notes", <NotesPart conn={conn} notes={notes} onSaved={() => setNotesSeq((n) => n + 1)} />)}

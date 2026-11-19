@@ -46,12 +46,15 @@ export function openOutputCompare(spec: CompareSpec, title: string, sources?: Di
   useStore.getState().newTab({ title, sql: "", connection_id: null, diff: { spec, sources } });
 }
 
-/** Open (or show the open) ER diagram of a schema. */
-export function openErDiagram(connectionId: string, schema: string, label: string) {
+/** Open (or show the open) ER diagram of a schema; `focus`: a table of it to trace. */
+export function openErDiagram(connectionId: string, schema: string, label: string, focus?: string) {
   const st = useStore.getState();
   const open = st.tabs.find((t) => t.er && t.connection_id === connectionId && t.er.schema === schema);
-  if (open) return st.setActiveTab(open.id);
-  st.newTab({ title: `ER · ${label}`, sql: "", connection_id: connectionId, er: { schema, label } });
+  if (open) {
+    if (focus && open.er) st.updateTab(open.id, { er: { ...open.er, focus, focus_at: Date.now() } });
+    return st.setActiveTab(open.id);
+  }
+  st.newTab({ title: `ER · ${label}`, sql: "", connection_id: connectionId, er: { schema, label, focus: focus ?? null, focus_at: focus ? Date.now() : null } });
 }
 
 /** Open the table explorer of `obj` (or show its tab if it is open). */
