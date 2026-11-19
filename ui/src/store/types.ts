@@ -39,6 +39,10 @@ export interface Tab extends TabState {
 export interface ErRef {
   schema: string;
   label: string;
+  /** A table to trace when the diagram opens (its links highlighted): the table explorer's "ER diagram around it". */
+  focus?: string | null;
+  /** When it was asked for: asking again (the same table) traces it again. */
+  focus_at?: number | null;
 }
 
 /** The two schemas a compare tab shows (the script changes `target`). */

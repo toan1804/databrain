@@ -220,6 +220,20 @@ impl Workspace {
         Ok(rows)
     }
 
+    /// The latest `limit` entries on `connection_id` whose SQL contains
+    /// `text` (not case-sensitive for ASCII; the SQL only, not the error or
+    /// the connection's name, as [`Workspace::list_history`] searches).
+    pub fn history_mentioning(&self, connection_id: &str, text: &str, limit: u32) -> Result<Vec<HistoryEntry>> {
+        let c = self.conn.lock();
+        let like = format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = c.prepare(&format!(
+            "SELECT {HISTORY_COLUMNS} FROM query_history h LEFT JOIN connections c ON c.id = h.connection_id \
+             WHERE h.connection_id = ?1 AND h.sql LIKE ?2 ESCAPE '\\' ORDER BY h.id DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![connection_id, like, limit.min(5000)], history_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Delete one history entry; returns its result id (to drop the result too).
     pub fn delete_history_entry(&self, id: i64) -> Result<Option<String>> {
         let c = self.conn.lock();
@@ -274,5 +288,42 @@ impl Workspace {
         let del = format!("DELETE FROM query_history WHERE {cond}");
         let n = if uses_cutoff { c.execute(&del, params![cutoff])? } else { c.execute(&del, [])? };
         Ok((n, ids))
+    }
+}
+
+#[cfg(test)]
+mod mentioning_tests {
+    use super::*;
+
+    /// The table explorer's Usage reads the entries whose SQL contains a
+    /// name: the SQL only (not the error or the connection's name), on that
+    /// connection, `%` and `_` taken literally, newest first.
+    #[test]
+    fn history_mentioning_reads_the_sql_only() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let add = |conn: &str, sql: &str, error: Option<&str>| {
+            ws.add_history(NewHistory {
+                origin: Origin::User,
+                connection_id: Some(conn.into()),
+                sql: sql.into(),
+                started_at: 1,
+                duration_ms: 1,
+                rows: None,
+                status: Some(if error.is_some() { RunStatus::Error } else { RunStatus::Success }),
+                error: error.map(str::to_string),
+                output_handle: None,
+                result_id: None,
+            })
+            .unwrap()
+        };
+        add("a", "select * from orders", None);
+        add("a", "select 1", Some("relation orders does not exist"));
+        add("b", "select * from orders", None);
+        add("a", "select * from order_s", None);
+        add("a", "select * from orderXs", None);
+        let got: Vec<String> = ws.history_mentioning("a", "orders", 10).unwrap().into_iter().map(|h| h.sql).collect();
+        assert_eq!(got, vec!["select * from orders"]);
+        let got: Vec<String> = ws.history_mentioning("a", "order_s", 10).unwrap().into_iter().map(|h| h.sql).collect();
+        assert_eq!(got, vec!["select * from order_s"], "_ is literal");
     }
 }

@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ExploreRows,
+  TableUsageView,
   Job,
   JobRun,
   JobRunEvent,
@@ -352,6 +353,8 @@ export const api = {
     call<void>("move_to_folder", { kind, itemId, folderId }),
 
   listJobs: () => call<{ jobs: JobSummary[]; running: string[]; elsewhere?: string[] }>("list_jobs"),
+  /** The table explorer's Usage of a table: learned figures, history naming it, job steps (all local). */
+  tableUsage: (connectionId: string, schema: string, name: string) => call<TableUsageView>("table_usage", { connectionId, schema, name }),
   getJob: (id: string) => call<Job>("get_job", { id }),
   saveJob: (job: Job) => call<Job>("save_job", { job }),
   deleteJob: (id: string) => call<void>("delete_job", { id }),

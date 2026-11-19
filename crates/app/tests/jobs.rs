@@ -4036,3 +4036,61 @@ async fn a_run_is_stopped_from_another_process() {
     })
     .await;
 }
+
+/// The table explorer's Usage lists the job steps that read or write a
+/// table, from their SQL and load targets as written: its own name in any
+/// case, qualified by its schema or not; not a table of the same name in
+/// another schema, a longer name, or SQL on another connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn table_job_steps_lists_steps_reading_or_loading_a_table() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let a = sqlite(&st, "A", &dir.path().join("a.db"), false);
+        let b = sqlite(&st, "B", &dir.path().join("b.db"), false);
+        let mut load = node("n3", "load_orders", JobNodeKind::Load, None, "select * from results.reads_orders");
+        load.target_connection_id = Some(a.clone());
+        load.target_table = Some("\"main\".\"Orders\"".into());
+        let mut cleanup = node("n4", "load_other", JobNodeKind::Load, None, "select 1 as x");
+        cleanup.target_connection_id = Some(a.clone());
+        cleanup.target_table = Some("audit".into());
+        cleanup.load_before_sql = Some("delete from orders where id < 0".into());
+        let job = st
+            .workspace
+            .save_job(plain_job(
+                "Daily",
+                vec![
+                    node("n1", "reads_orders", JobNodeKind::Query, Some(&a), "select o.id from main.orders o join customers c on c.id = o.customer_id"),
+                    node("n2", "old_orders", JobNodeKind::Query, Some(&a), "select * from orders_old union all select * from other.orders"),
+                    load,
+                    cleanup,
+                    node("n5", "on_b", JobNodeKind::Query, Some(&b), "select * from orders"),
+                ],
+            ))
+            .unwrap();
+        let steps = |conn: &str, table: &str| -> Vec<(String, bool, bool, bool)> {
+            api::table_job_steps(&st.workspace, conn, "main", table).unwrap().into_iter().map(|s| (s.step_name, s.reads, s.writes, s.sure)).collect()
+        };
+        // (step, reads, writes, named with its schema)
+        assert_eq!(
+            steps(&a, "orders"),
+            vec![("reads_orders".into(), true, false, true), ("load_orders".into(), false, true, true), ("load_other".into(), false, true, false)],
+            "job {}",
+            job.id
+        );
+        assert_eq!(steps(&a, "customers"), vec![("reads_orders".into(), true, false, false)]);
+        assert_eq!(steps(&b, "orders"), vec![("on_b".into(), true, false, false)]);
+        // Usage: the steps, no learned figures yet.
+        let u = api::table_usage(&st.workspace, &a, "main", "orders").unwrap();
+        assert_eq!(u.steps.len(), 3);
+        assert!(u.learned.is_none());
+        // Learned figures of the user's queries, found for the table whichever its rank.
+        for i in 0..25 {
+            st.workspace.record_table_use(&a, &format!("main.t{i}"), &format!("f{i}"), 1, databrain_workspace::Origin::User).unwrap();
+        }
+        st.workspace.record_table_use(&a, "main.orders", "fx", 1, databrain_workspace::Origin::User).unwrap();
+        let learned = api::table_usage(&st.workspace, &a, "main", "orders").unwrap().learned.expect("learned");
+        assert_eq!((learned.table.as_str(), learned.queries), ("main.orders", 1));
+    })
+    .await;
+}

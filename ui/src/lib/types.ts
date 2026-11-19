@@ -67,6 +67,8 @@ import type { RunResponse } from "./bindings/RunResponse";
 import type { PlannedStatement } from "./bindings/PlannedStatement";
 import type { EngineError } from "./bindings/EngineError";
 import type { ExploreRows } from "./bindings/ExploreRows";
+import type { TableJobStep } from "./bindings/TableJobStep";
+import type { TableUsageView } from "./bindings/TableUsageView";
 import type { JobEvent } from "./bindings/JobEvent";
 import type { TestResult } from "./bindings/TestResult";
 import type { OutputInfo } from "./bindings/OutputInfo";
@@ -261,6 +263,8 @@ export type {
   PlannedStatement,
   EngineError,
   ExploreRows,
+  TableJobStep,
+  TableUsageView,
   JobEvent,
   TestResult,
   OutputInfo,

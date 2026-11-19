@@ -9,6 +9,13 @@ pub(crate) async fn list_jobs(state: State<'_, AppState>) -> R<api::JobListing> 
 }
 
 #[tauri::command]
+pub(crate) async fn table_usage(state: State<'_, AppState>, connection_id: String, schema: String, name: String) -> R<api::TableUsageView> {
+    // Reads every job and up to a thousand history entries: off the async runtime.
+    let ws = state.workspace.clone();
+    api::blocking(move || api::table_usage(&ws, &connection_id, &schema, &name)).await
+}
+
+#[tauri::command]
 pub(crate) async fn get_job(state: State<'_, AppState>, id: String) -> R<databrain_workspace::Job> {
     api::get_job(&state, &id)
 }
