@@ -174,20 +174,33 @@ impl Workspace {
         Ok(self.job_step_names()?.into_iter().find(|(n, _)| *n == key).map(|(_, o)| o))
     }
 
-    /// Mark every step of `job` as the AI's SQL, keeping the rest of the
-    /// job and its edit time (the schedule counts from it).
-    pub(crate) fn set_ai_sql_all(&self, job: &Job) -> Result<()> {
-        let mut spec = Spec::of(job);
+    /// Mark every step of job `id` as the AI's SQL, keeping the rest of the
+    /// job and its edit time (the schedule counts from it). Read and written
+    /// in one write transaction, so a save meanwhile (another process) isn't
+    /// undone. Returns the job's name when a step wasn't marked yet.
+    pub(crate) fn set_ai_sql_all(&self, id: &str) -> Result<Option<String>> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let job = Self::read_job(&tx, id)?;
+        if job.nodes.iter().all(|n| n.ai_sql) {
+            return Ok(None);
+        }
+        let mut spec = Spec::of(&job);
         for n in &mut spec.nodes {
             n.ai_sql = true;
         }
         let spec = serde_json::to_string(&spec).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![job.id, spec])?;
-        Ok(())
+        tx.execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![id, spec])?;
+        tx.commit()?;
+        Ok(Some(job.name))
     }
 
     pub fn get_job(&self, id: &str) -> Result<Job> {
-        let c = self.conn.lock();
+        Self::read_job(&self.conn.lock(), id)
+    }
+
+    /// [`Workspace::get_job`] on a connection (or transaction) already held.
+    fn read_job(c: &rusqlite::Connection, id: &str) -> Result<Job> {
         c.query_row("SELECT id, name, spec_json, last_scheduled_at, created_at, updated_at FROM jobs WHERE id = ?1", [id], |r| {
             let spec: Spec = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
             Ok(Job {
@@ -250,6 +263,16 @@ impl Workspace {
         // at the same moment waits, then sees this one.
         let mut c = self.conn.lock();
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // A step's last results are the runs', not the editor's: the stored
+        // ones are kept, so a save made with a copy read before a run ended
+        // doesn't put back the results that run replaced.
+        if let Ok(stored) = Self::read_job(&tx, &job.id) {
+            for n in &mut job.nodes {
+                if let Some(s) = stored.nodes.iter().find(|s| s.id == n.id) {
+                    n.last_run = s.last_run.clone();
+                }
+            }
+        }
         let others = after_lists(&tx, &job.id)?;
         let mut after: Vec<String> = Vec::new();
         for a in std::mem::take(&mut job.schedule.after_jobs) {
@@ -530,14 +553,22 @@ impl Workspace {
 
     /// Save each node's last outcome into the job (without touching `updated_at`).
     pub fn set_job_node_results(&self, id: &str, results: &[NodeRunRecord]) -> Result<()> {
-        let mut job = self.get_job(id)?;
+        // Read and written in one write transaction: a save (this process or
+        // another) between the read and the write would otherwise be undone,
+        // its spec replaced by the older one read here. The version
+        // (`updated_at`) stays: a run's results aren't an edit, so a save
+        // based on the version before them isn't refused.
+        let mut c = self.conn.lock();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut job = Self::read_job(&tx, id)?;
         for n in &mut job.nodes {
             if let Some(r) = results.iter().find(|r| r.node_id == n.id) {
                 n.last_run = Some(r.summary.clone());
             }
         }
         let spec = serde_json::to_string(&Spec::of(&job)).map_err(|e| Error::Invalid(e.to_string()))?;
-        self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![id, spec])?;
+        tx.execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![id, spec])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -890,6 +921,15 @@ mod tests {
         assert_eq!(back.updated_at, j.updated_at);
         assert_eq!(ws.job_runs(&j.id, 10).unwrap()[0].nodes[0].summary.rows, Some(3));
         assert_eq!(ws.list_jobs().unwrap()[0].last_run.as_ref().unwrap().status, "success");
+        // A save made with a copy read before the run ended (no results)
+        // keeps the run's results; its own edits are saved.
+        let mut stale = j.clone();
+        stale.updated_at = back.updated_at;
+        stale.nodes[1].last_run = None;
+        stale.nodes[1].sql = "select 2".into();
+        let saved = ws.save_job(stale).unwrap();
+        assert_eq!(saved.nodes[1].sql, "select 2");
+        assert_eq!(saved.nodes[1].last_run.as_ref().unwrap().rows, Some(3), "a save put back the results before the run");
 
         // Run log: saved whole, read back per run of its job.
         assert!(ws.job_run_log(&j.id, run.id).unwrap().is_empty());
@@ -1105,5 +1145,39 @@ mod tests {
         j.nodes.remove(0);
         let j = ws.save_job(j).unwrap();
         assert_eq!(ws.job_watermark(&j.id, "n0", "id").unwrap(), None);
+    }
+
+    /// A run's results written while saves of the job go on (another
+    /// process, here a second handle on the same file) never put back a
+    /// spec older than the last save: the read and the write of the results
+    /// are one write transaction.
+    #[test]
+    fn results_written_during_saves_keep_the_last_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        let a = Workspace::open(&path).unwrap();
+        let b = Workspace::open(&path).unwrap();
+        let j = a.save_job(job(vec![node("orders")], vec![])).unwrap();
+        let rec = vec![NodeRunRecord {
+            node_id: j.nodes[0].id.clone(),
+            name: "orders".into(),
+            summary: NodeRunSummary { status: "success".into(), rows: Some(1), ..Default::default() },
+        }];
+        let id = j.id.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..300 {
+                b.set_job_node_results(&id, &rec).unwrap();
+            }
+        });
+        let mut last = String::new();
+        for i in 0..300 {
+            let mut now = a.get_job(&j.id).unwrap();
+            last = format!("select {i}");
+            now.nodes[0].sql = last.clone();
+            a.save_job(now).unwrap();
+            assert_eq!(a.get_job(&j.id).unwrap().nodes[0].sql, last, "save {i} was undone");
+        }
+        writer.join().unwrap();
+        assert_eq!(a.get_job(&j.id).unwrap().nodes[0].sql, last);
     }
 }
