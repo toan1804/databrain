@@ -40,6 +40,7 @@ impl From<databrain_workspace::Error> for EngineError {
         let kind = match e {
             databrain_workspace::Error::NotFound(_) => "not_found",
             databrain_workspace::Error::Invalid(_) => "invalid",
+            databrain_workspace::Error::Conflict(_) => "conflict",
             _ => "internal",
         };
         Self::new(kind, e.to_string())

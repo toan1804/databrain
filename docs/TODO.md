@@ -215,7 +215,7 @@ The escapes found by the red-team review are fixed (see CHANGELOG, Security). Le
 
 - **Duplicate across a rebase:** a copy of the assistant's step whose original the assistant changes before the copy is saved is saved as yours (the server finds no step of the assistant's with the copy's older SQL). Narrow window.
 - **Rebase drops your edits to a step the assistant deleted** without saying so.
-- **Check-then-save isn't atomic:** `save_job` and `update_job` check the version, then save; two saves in the same moment can both pass (no step changes owner: marks are judged against the version read).
+- **A job deleted before its open tab saves** is created again by that save (no version to check it against: the editor reads the job first and finds none); deleted between that read and the save, the save is refused.
 - **Approval noise:** renaming an upstream step lists "runs after new (was old)" on every step after it, though their rows don't change.
 - **Not followed:** the assistant's rows reached through `USE results`, a view made earlier, or a table name built from a `:param`; tables the assistant's steps wrote on other databases.
 - **Name check not repeated after approval:** a tab or notebook taking the name meanwhile is refused later (the job step keeps it).

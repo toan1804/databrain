@@ -265,14 +265,20 @@ impl ToolContext {
         // Saved over the version the user approved the change of: when the
         // job was changed meanwhile (the user edited it while the approval
         // waited), this change would undo theirs, so it is asked again.
-        let now = ws.get_job(&old.id)?;
-        if now.updated_at != old.updated_at {
-            return Err(AiError::Policy(format!(
-                "\"{}\" was changed while the change waited for approval; nothing was saved. Read it again (get_job) and send the change again.",
-                old.name
-            )));
-        }
-        let saved = ws.save_job(job)?;
+        // Checked as it is saved (one write transaction), so a save that
+        // comes between a check and the save can't be overwritten either.
+        let saved = match ws.save_job_based_on(job, Some(old.updated_at)) {
+            Err(databrain_workspace::Error::NotFound(_)) => {
+                return Err(AiError::Policy(format!("\"{}\" was deleted while the change waited for approval; nothing was saved.", old.name)));
+            }
+            Err(databrain_workspace::Error::Conflict(_)) => {
+                return Err(AiError::Policy(format!(
+                    "\"{}\" was changed while the change waited for approval; nothing was saved. Read it again (get_job) and send the change again.",
+                    old.name
+                )));
+            }
+            other => other?,
+        };
         let mut text = format!("Updated job \"{}\". It is not run; the user runs it (Run) or its schedule does.\n{preview}", saved.name);
         for n in notes {
             text.push_str(&format!("\nNote: {n}"));
