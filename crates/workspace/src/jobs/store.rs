@@ -304,6 +304,7 @@ impl Workspace {
             tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
         }
         tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM settings WHERE key = ?1", [format!("{JOB_STOP_PREFIX}{id}")])?;
         let specs: Vec<(String, String)> = {
             let mut stmt = tx.prepare("SELECT id, spec_json FROM jobs")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
@@ -646,11 +647,21 @@ impl Workspace {
         let before = now_ms() - STALE_RUN_MS;
         let c = self.conn.lock();
         c.execute("UPDATE jobs SET lease_owner = NULL, lease_until = NULL WHERE lease_until IS NOT NULL AND lease_until < ?1", [now_ms()])?;
-        Ok(c.execute(
+        let closed = c.execute(
             "UPDATE job_runs SET status = 'cancelled', finished_at = COALESCE(heartbeat_at, started_at), error = 'The app or runner was closed while the job ran' \
              WHERE status = 'running' AND COALESCE(heartbeat_at, started_at) < ?1",
             [before],
-        )?)
+        )?;
+        // Stop requests nobody will read: the job is gone, or its run isn't running.
+        c.execute(
+            &format!(
+                "DELETE FROM settings WHERE substr(key, 1, {n}) = '{JOB_STOP_PREFIX}' AND NOT EXISTS (SELECT 1 FROM job_runs r WHERE r.job_id = substr(settings.key, {m}) AND r.id = json_extract(settings.value_json, '$.run_id') AND r.status = 'running')",
+                n = JOB_STOP_PREFIX.len(),
+                m = JOB_STOP_PREFIX.len() + 1
+            ),
+            [],
+        )?;
+        Ok(closed)
     }
 
     /// Take the job for `owner` (a process) until `until` (ms). False when

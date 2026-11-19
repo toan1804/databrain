@@ -98,7 +98,8 @@ impl Workspace {
     pub fn all_settings(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
         let c = self.conn.lock();
         // Stop requests between processes aren't settings (`request_job_stop`).
-        let mut stmt = c.prepare(&format!("SELECT key, value_json FROM settings WHERE key NOT LIKE '{}%'", crate::jobs::store::JOB_STOP_PREFIX))?;
+        let prefix = crate::jobs::store::JOB_STOP_PREFIX;
+        let mut stmt = c.prepare(&format!("SELECT key, value_json FROM settings WHERE substr(key, 1, {}) <> '{prefix}'", prefix.len()))?;
         let mut out = serde_json::Map::new();
         for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (k, v) = row?;

@@ -142,6 +142,60 @@ fn find_job(state: &crate::api::AppState, which: &str) -> Result<databrain_works
         .ok_or_else(|| format!("no job named {which:?} (databrain-jobs list shows them)"))
 }
 
+/// The job a `runs`/`stop` command names: its first word that isn't an
+/// option or an option's value (`runs --limit 3 Daily` and `runs Daily --limit 3`).
+fn job_arg(args: &[String]) -> Option<&str> {
+    let mut words = args.iter().skip(1);
+    while let Some(a) = words.next() {
+        match a.as_str() {
+            "--limit" => {
+                words.next();
+            }
+            o if o.starts_with("--") => {}
+            _ => return Some(a),
+        }
+    }
+    None
+}
+
+/// `stop <job>`: ask its run to stop, wherever it runs, and wait up to
+/// `wait` for it to end (not with `no_wait`). (exit code, output, errors).
+pub async fn stop(state: &crate::api::AppState, which: &str, no_wait: bool, wait: Duration) -> (u8, String, String) {
+    let job = match find_job(state, which) {
+        Ok(j) => j,
+        Err(e) => return (2, String::new(), format!("databrain-jobs: {e}\n")),
+    };
+    let run = match jobs::request_stop(&state.job_ctx(), &job.id, "terminal") {
+        Ok(jobs::StopAsked::NotRunning) => return (1, String::new(), format!("databrain-jobs: {} isn't running\n", job.name)),
+        Ok(jobs::StopAsked::Stopped) => return (0, format!("Stopped {}\n", job.name), String::new()),
+        Ok(jobs::StopAsked::Asked(run)) => run,
+        Err(e) => return (2, String::new(), format!("databrain-jobs: {}\n", e.message)),
+    };
+    if no_wait {
+        return (0, format!("Asked {} (run #{run}) to stop\n", job.name), String::new());
+    }
+    let mut out = format!("Stopping {} (run #{run})…\n", job.name);
+    // The runner reads the request within a few seconds; a statement may
+    // take longer to stop on its server.
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        match state.workspace.job_run(&job.id, run).ok().flatten() {
+            Some(r) if r.status != "running" => {
+                out.push_str(&format!("{}: {}\n", job.name, r.error.as_deref().unwrap_or(&r.status)));
+                return (0, out, String::new());
+            }
+            _ if tokio::time::Instant::now() >= until => {
+                return (
+                    1,
+                    out,
+                    format!("databrain-jobs: {} was asked to stop and hasn't ended yet (a statement can take a while to stop on its server)\n", job.name),
+                );
+            }
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
 /// "1m 5s", "12s", "850 ms".
 fn took(ms: i64) -> String {
     if ms < 1000 {
@@ -297,7 +351,7 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
             }
         }
         "runs" => {
-            let Some(which) = args.get(1) else { return usage() };
+            let Some(which) = job_arg(args) else { return usage() };
             let job = match find_job(state, which) {
                 Ok(j) => j,
                 Err(e) => {
@@ -318,48 +372,11 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
             ExitCode::SUCCESS
         }
         "stop" => {
-            let Some(which) = args.get(1) else { return usage() };
-            let job = match find_job(state, which) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("databrain-jobs: {e}");
-                    return ExitCode::from(2);
-                }
-            };
-            let run = match jobs::request_stop(&ctx, &job.id, "terminal") {
-                Ok(jobs::StopAsked::NotRunning) => {
-                    eprintln!("databrain-jobs: {} isn't running", job.name);
-                    return ExitCode::from(1);
-                }
-                Ok(jobs::StopAsked::Stopped) => return ExitCode::SUCCESS,
-                Ok(jobs::StopAsked::Asked(run)) => run,
-                Err(e) => {
-                    eprintln!("databrain-jobs: {}", e.message);
-                    return ExitCode::from(2);
-                }
-            };
-            if args.iter().any(|a| a == "--no-wait") {
-                println!("Asked {} (run #{run}) to stop", job.name);
-                return ExitCode::SUCCESS;
-            }
-            println!("Stopping {} (run #{run})…", job.name);
-            // The runner reads the request within a few seconds; a statement
-            // may take longer to stop on its server.
-            let until = tokio::time::Instant::now() + STOP_WAIT;
-            loop {
-                let r = state.workspace.job_run(&job.id, run).ok().flatten();
-                match r {
-                    Some(r) if r.status != "running" => {
-                        println!("{}: {}", job.name, r.error.as_deref().unwrap_or(&r.status));
-                        return ExitCode::SUCCESS;
-                    }
-                    _ if tokio::time::Instant::now() >= until => {
-                        eprintln!("databrain-jobs: {} was asked to stop and hasn't ended yet (a statement can take a while to stop on its server)", job.name);
-                        return ExitCode::from(1);
-                    }
-                    _ => tokio::time::sleep(Duration::from_millis(500)).await,
-                }
-            }
+            let Some(which) = job_arg(args) else { return usage() };
+            let (code, out, err) = stop(state, which, args.iter().any(|a| a == "--no-wait"), STOP_WAIT).await;
+            print!("{out}");
+            eprint!("{err}");
+            ExitCode::from(code)
         }
         "list" => {
             for j in state.workspace.list_jobs().unwrap_or_default() {
@@ -420,5 +437,14 @@ mod tests {
         assert!(lines[3].contains("read") && lines[3].contains("1200 rows"), "{text}");
         assert!(lines[4].contains("load") && lines[4].contains("permission denied"), "{text}");
         assert_eq!(runs_text(&[], 0), "never ran\n");
+    }
+
+    #[test]
+    fn the_job_is_the_first_word_that_isnt_an_option() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(job_arg(&args(&["runs", "Daily", "--limit", "3"])), Some("Daily"));
+        assert_eq!(job_arg(&args(&["runs", "--limit", "3", "Daily"])), Some("Daily"));
+        assert_eq!(job_arg(&args(&["stop", "--no-wait", "Daily"])), Some("Daily"));
+        assert_eq!(job_arg(&args(&["runs", "--limit", "3"])), None);
     }
 }

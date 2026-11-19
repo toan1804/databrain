@@ -303,6 +303,8 @@ export const useJobs = create<JobsState>((set, get) => ({
     const away = get().elsewhere[id] && !get().running[id];
     const ok = await api.cancelJob(id).catch(() => false);
     if (away) useStore.getState().toast(ok ? "Asked the background runner to stop this run: it stops within a few seconds" : "The run had already ended", "info");
+    // The runner stops within a few seconds: look again then, so Stop goes away without waiting for the 30 s refresh.
+    if (away && ok) for (const ms of [3_000, 8_000]) setTimeout(() => void get().refresh().catch(() => {}), ms);
   },
   cancelStep: async (id, nodeId) => {
     const toast = useStore.getState().toast;
