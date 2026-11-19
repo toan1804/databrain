@@ -44,6 +44,16 @@ pub fn launch(mode: &str, name: &str) -> ExitCode {
         eprintln!("{name}: couldn't start {}: {e}", exe.display());
         ExitCode::from(127)
     }
+    // Windows: Ctrl-C goes to every process on the console; this launcher
+    // ignores it and waits, so the program (which stops its work on it)
+    // ends first and the prompt doesn't come back while it still prints.
+    #[cfg(windows)]
+    // SAFETY: a null handler with TRUE makes this process ignore Ctrl-C;
+    // it touches no Rust memory.
+    #[allow(unsafe_code)]
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 1);
+    }
     #[cfg(not(unix))]
     match cmd.status() {
         Ok(s) => ExitCode::from(u8::try_from(s.code().unwrap_or(1)).unwrap_or(1)),

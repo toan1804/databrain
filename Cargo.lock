@@ -1863,6 +1863,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "ts-rs",
+ "unicode-width",
  "uuid",
  "windows-sys 0.59.0",
 ]

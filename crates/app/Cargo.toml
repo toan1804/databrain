@@ -26,6 +26,10 @@ path = "src/bin/databrain-mcp.rs"
 name = "databrain-jobs"
 path = "src/bin/databrain-jobs.rs"
 
+[[bin]]
+name = "dbr"
+path = "src/bin/dbr.rs"
+
 [dependencies]
 futures = "0.3.34"
 async-trait = "0.1.92"
@@ -75,6 +79,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 tracing = "0.1"
 ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] }
+# Screen width of table cells in `dbr` (CJK takes two columns); already in Cargo.lock.
+unicode-width = "0.2.2"
 
 # Linux: build OpenSSL from source and link it statically, so the binary
 # does not depend on the distribution's libssl version.
