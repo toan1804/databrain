@@ -147,7 +147,7 @@ Everything the rest of the app needs to know about a database type is declared o
 | Field | Used by |
 |---|---|
 | `language` (`sql`, `cypher`, `mongo_json`), `parser` | statement splitter and read/write classifier (`sql.rs`, `language.rs`), lineage, Format and SQL completion (SQL only) |
-| `quote`, `upper_folding`, `levels`, `whole_path_quotes`, `always_qualify_catalog`, `catalog_noun`, `table_folder`, `view_folder` | identifier quoting and qualified names (Rust `quote_ident`, UI `quoteIdent`/`qualifiedName`), explorer levels and wording, completion |
+| `quote`, `upper_folding`, `levels`, `whole_path_quotes`, `always_qualify_catalog`, `catalog_noun`, `table_folder`, `view_folder` | identifier quoting and qualified names (Rust `quote_ident`, UI `quoteIdent`/`qualifiedName`, which the table explorer's profile and statistics SQL in `ui/src/lib/explore.ts` use), explorer levels and wording, completion |
 | `row_limit`, `preview` | AI row caps, "Select top 100 rows" |
 | `explain` | EXPLAIN checks (`Session::check_sql`, lineage "Check with database"); `None` = no check |
 | `cost_preview` | the editor's cost preview (`Session::estimate_cost`: BigQuery dry run, Snowflake and Databricks EXPLAIN) |

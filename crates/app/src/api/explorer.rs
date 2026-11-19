@@ -489,3 +489,55 @@ pub fn excel_sheets(path: &str) -> Result<Vec<ExcelSheet>> {
         .map(|s| ExcelSheet { left_out: s.left_out(), name: s.name, range: s.range, hidden: s.hidden })
         .collect())
 }
+
+/// Rows a table explorer query gave (a profile, statistics, top values).
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct ExploreRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+}
+
+/// Most rows an explorer query returns (they are shown, not paged).
+const EXPLORE_ROWS: usize = 1000;
+
+/// Run one table explorer query (a column profile, the table's statistics,
+/// a column's top values, an exact count) on the session `key` (the table
+/// tab's, closed with it, which stops it) and return its rows. It goes
+/// through the engine as origin `explorer`: one read or refused (a read
+/// asks nothing on production, so nothing is confirmed here), kept in the
+/// history. Its rows are returned, not kept: the result is dropped once
+/// read, so explorer reads don't fill the results list.
+pub async fn explore_query(state: &AppState, connection_id: &str, key: &str, sql: &str) -> Result<ExploreRows> {
+    let req = databrain_query_engine::RunRequest {
+        connection_id: connection_id.to_string(),
+        tab_id: key.to_string(),
+        sql: sql.to_string(),
+        base_offset: 0,
+        row_limit: Some(EXPLORE_ROWS),
+        confirmed: false,
+        origin: databrain_workspace::Origin::Explorer,
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+    };
+    let outcomes = state.engine.run_and_wait(&state.hub, req, None).await?;
+    let [o] = outcomes.as_slice() else {
+        return Err(EngineError::new("invalid", "The explorer runs one statement"));
+    };
+    if let Some(e) = &o.error {
+        return Err(e.clone());
+    }
+    let Some(r) = &o.result else {
+        return Err(EngineError::new("invalid", "The statement returned no rows"));
+    };
+    let page = fetch_page(state, r.id.clone(), ViewSpec::default(), 0, EXPLORE_ROWS).await;
+    let reg = state.engine.outputs().clone();
+    let id = r.id.clone();
+    let _ = blocking(move || reg.remove(&id)).await;
+    state.engine.outputs_changed();
+    Ok(ExploreRows { columns: r.columns.iter().map(|c| c.name.clone()).collect(), rows: page?.rows, duration_ms: o.duration_ms })
+}
