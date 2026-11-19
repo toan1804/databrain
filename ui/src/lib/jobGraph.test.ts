@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, removeNode, scheduleText, uniqueName, browserSignInConnections, monthDayText, scheduleTimes, toggleMonthDay, triggerText, cronProblem, timeZoneProblem, afterLoopJobs, sameSchedule, rebaseClashes, rebaseJob } from "./jobGraph";
+import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, removeNode, scheduleText, uniqueName, browserSignInConnections, monthDayText, scheduleTimes, toggleMonthDay, triggerText, cronProblem, timeZoneProblem, afterLoopJobs, sameSchedule, rebaseClashes, rebaseDeleted, rebaseJob } from "./jobGraph";
 import type { Job, JobNode, OutputInfo } from "./types";
 
 const n = (id: string, name: string, sql = "", x = 0, y = 0): JobNode => ({ id, name, kind: "query", sql, x, y, load_mode: "append" });
@@ -268,6 +268,64 @@ describe("rebaseJob: edits made here put on top of the version saved since", () 
     created_at: 1,
     updated_at: 1,
     ...extra,
+  });
+
+  it("a step deleted since whose SQL the user changed is kept as the user's, with its links; other edits to it are told, not kept", () => {
+    const base = job([node("a"), node("b", { sql: "select 1", ai_sql: true }), node("c", { ai_sql: true })], { edges: [{ from: "a", to: "b" }, { from: "b", to: "c" }] });
+    const mine = job([node("a"), node("b", { sql: "select 10", ai_sql: true }), node("c", { ai_sql: true, name: "renamed", x: 50 })], { edges: [{ from: "a", to: "b" }, { from: "b", to: "c" }] });
+    // The assistant deleted b and c.
+    const theirs = job([node("a")], { updated_at: 2 });
+    const out = rebaseJob(base, mine, theirs);
+    expect(out.nodes.map((n) => n.id)).toEqual(["a", "b"]);
+    expect(out.nodes[1]).toMatchObject({ sql: "select 10", ai_sql: false });
+    expect(out.edges).toEqual([{ from: "a", to: "b" }]);
+    const d = rebaseDeleted(base, mine, theirs);
+    expect(d.kept.map((n) => n.id)).toEqual(["b"]);
+    expect(d.dropped.map((n) => n.id)).toEqual(["c"]);
+    // A step only moved, or left alone, goes quietly with the deletion.
+    const moved = job([node("a"), node("b", { sql: "select 1", ai_sql: true, x: 99 }), node("c", { ai_sql: true })], { edges: base.edges });
+    expect(rebaseDeleted(base, moved, theirs)).toEqual({ kept: [], replaced: [], dropped: [] });
+    expect(rebaseJob(base, moved, theirs).nodes.map((n) => n.id)).toEqual(["a"]);
+  });
+
+  it("a step replaced by a new one of its name keeps the new one (told), a kept step's links can't close a loop, other edits aren't kept", () => {
+    const base = job([node("a"), node("b", { name: "orders", sql: "select 1", ai_sql: true }), node("c")], { edges: [{ from: "a", to: "b" }, { from: "b", to: "c" }] });
+    const mine = job([node("a"), node("b", { name: "orders", sql: "select 10", ai_sql: true }), node("c", { sql: "select * from results.orders", ai_sql: true })], { edges: base.edges });
+    // The assistant replaced b with z, a new step of the same name that c now follows.
+    const theirs = job([node("a"), node("z", { name: "orders", ai_sql: true }), node("c", { sql: "select * from results.orders", ai_sql: true })], { updated_at: 2, edges: [{ from: "z", to: "c" }] });
+    const d = rebaseDeleted(base, mine, theirs);
+    expect(d.replaced.map((n) => n.id)).toEqual(["b"]);
+    expect(d.kept).toEqual([]);
+    const out = rebaseJob(base, mine, theirs);
+    expect(out.nodes.map((n) => n.id)).toEqual(["a", "z", "c"]);
+    expect(out.nodes[2]).toMatchObject({ sql: "select * from results.orders", ai_sql: true });
+    expect(out.edges).toEqual([{ from: "z", to: "c" }]);
+
+    // Kept (its name is free): its links come back, but not one that closes a loop with a link added since.
+    const looped = job([node("a"), node("c")], { updated_at: 2, edges: [{ from: "c", to: "a" }] });
+    const kept = rebaseJob(base, job([node("a"), node("b", { name: "orders", sql: "select 10" }), node("c"), node("d")], { edges: [...base.edges, { from: "d", to: "b" }] }), looped);
+    expect(kept.nodes.find((n) => n.id === "b")).toMatchObject({ name: "orders", ai_sql: false });
+    expect(kept.edges).toContainEqual({ from: "c", to: "a" });
+    expect(kept.edges).toContainEqual({ from: "d", to: "b" });
+    expect(kept.edges.some((e) => e.from === "a" && e.to === "b") && kept.edges.some((e) => e.from === "b" && e.to === "c")).toBe(false);
+
+    // Only before/after SQL changed: dropped too (the step's SQL is the assistant's).
+    const after = job([node("a"), node("b", { name: "orders", sql: "select 1", ai_sql: true, load_after_sql: "analyze t" }), node("c")], { edges: base.edges });
+    expect(rebaseDeleted(base, after, theirs).dropped.map((n) => n.id)).toEqual(["b"]);
+
+    // Only the connection changed: the assistant's SQL isn't made the user's.
+    const conn = job([node("a"), node("b", { name: "orders", sql: "select 1", ai_sql: true, connection_id: "other" }), node("c")], { edges: base.edges });
+    expect(rebaseDeleted(base, conn, theirs).kept).toEqual([]);
+    expect(rebaseDeleted(base, conn, theirs).dropped.map((n) => n.id)).toEqual(["b"]);
+    expect(rebaseJob(base, conn, theirs).nodes.some((n) => n.id === "b")).toBe(false);
+
+    // Deleted here too: nothing to keep or say.
+    const gone = job([node("a"), node("c")]);
+    expect(rebaseDeleted(base, gone, theirs)).toEqual({ kept: [], replaced: [], dropped: [] });
+    // A link from a kept step to a step deleted on both sides is dropped.
+    const both = job([node("a"), node("b", { name: "orders", sql: "select 10" })], { edges: [{ from: "b", to: "c" }] });
+    const noC = job([node("a")], { updated_at: 2 });
+    expect(rebaseJob(base, both, noC).edges).toEqual([]);
   });
 
   it("keeps the assistant's newer SQL (and its mark) under a step the user only moved or renamed", () => {

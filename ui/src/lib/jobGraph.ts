@@ -569,6 +569,36 @@ const EFFECT_FIELDS = ["target_table", "load_mode", "key_columns", "create_table
 const sameEffect = (a: JobNode, b: JobNode) => sameText(a, b) && EFFECT_FIELDS.every((k) => same(text(a[k]), text(b[k])));
 
 /**
+ * Steps deleted in the version saved since (by the assistant or another
+ * window) that the user changed here:
+ * - `kept`: the user changed its SQL, so the SQL is the user's and
+ *   [`rebaseJob`] keeps the step, with its links.
+ * - `replaced`: the same, but the version since has a new step under its
+ *   name (the assistant replaced it): changed on both sides, so the version
+ *   since stands, as for [`rebaseClashes`] (two steps can't share a name,
+ *   and renaming the kept one would change which step the others read).
+ * - `dropped`: only other settings changed (before/after SQL, connections,
+ *   kind, name, options; not position): the deletion stands, as keeping the
+ *   step would make SQL someone else wrote the user's.
+ * Each is told to the user.
+ */
+export function rebaseDeleted(base: Job, mine: Job, theirs: Job): { kept: JobNode[]; replaced: JobNode[]; dropped: JobNode[] } {
+  const theirIds = new Set(theirs.nodes.map((n) => n.id));
+  const theirNames = new Set(theirs.nodes.map((n) => n.name.toLowerCase()));
+  const baseById = new Map(base.nodes.map((n) => [n.id, n]));
+  const kept: JobNode[] = [];
+  const replaced: JobNode[] = [];
+  const dropped: JobNode[] = [];
+  for (const m of mine.nodes) {
+    const b = baseById.get(m.id);
+    if (!b || theirIds.has(m.id)) continue;
+    if (!same(text(m.sql), text(b.sql))) (theirNames.has(m.name.toLowerCase()) ? replaced : kept).push(m);
+    else if ([...new Set([...Object.keys(m), ...Object.keys(b)])].some((k) => !SERVER_FIELDS.has(k) && k !== "x" && k !== "y" && !same(m[k as keyof JobNode], b[k as keyof JobNode]))) dropped.push(m);
+  }
+  return { kept, replaced, dropped };
+}
+
+/**
  * Steps whose SQL was edited here while the assistant changed the same step
  * (its SQL, connections or where it writes) in the version saved since: the
  * rebase keeps the assistant's version of those (see [`rebaseJob`]).
@@ -636,14 +666,25 @@ export function rebaseJob(base: Job, mine: Job, theirs: Job): Job {
   }
   // Steps the user added.
   for (const m of mine.nodes) if (!baseById.has(m.id) && !theirIds.has(m.id)) nodes.push(m);
+  // Steps deleted since whose SQL the user changed here: kept, as the
+  // user's ([`rebaseDeleted`] says so); their other edits go with the step.
+  const kept = new Set(rebaseDeleted(base, mine, theirs).kept.map((m) => m.id));
+  for (const m of mine.nodes) if (kept.has(m.id)) nodes.push({ ...m, ai_sql: false });
   const ids = new Set(nodes.map((n) => n.id));
   const key = (e: JobEdge) => `${e.from}\u0000${e.to}`;
   const baseEdges = new Set(base.edges.map(key));
   const mineEdges = new Set(mine.edges.map(key));
   const edges = theirs.edges.filter((e) => !(baseEdges.has(key(e)) && !mineEdges.has(key(e))));
   const have = new Set(edges.map(key));
-  for (const e of mine.edges) if (!baseEdges.has(key(e)) && !have.has(key(e))) edges.push(e);
+  // Links the user added, and the links of the steps kept above; one that
+  // would close a loop with links added since is left out.
   out.nodes = nodes;
   out.edges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+  for (const e of mine.edges) {
+    if (have.has(key(e)) || (baseEdges.has(key(e)) && !kept.has(e.from) && !kept.has(e.to)) || !ids.has(e.from) || !ids.has(e.to)) continue;
+    if (edgeProblem(out, e.from, e.to)) continue;
+    out.edges = [...out.edges, e];
+    have.add(key(e));
+  }
   return out;
 }

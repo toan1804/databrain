@@ -7,7 +7,7 @@ import { AlertTriangle, FileDown, ArrowDownToLine, CalendarClock, Copy, Database
 import { api, toError } from "../lib/api";
 import { kbd, modalOpen } from "../lib/platform";
 import type { RunParams, Job, JobEdge, JobNode } from "../lib/types";
-import { NODE_H, NODE_W, actionSettings, addDownstream, addEdge, ancestors, cappedReads, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, rebaseClashes, rebaseJob, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
+import { NODE_H, NODE_W, actionSettings, addDownstream, addEdge, ancestors, cappedReads, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, rebaseClashes, rebaseDeleted, rebaseJob, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
 import { isQueryTab, useStore } from "../store";
 import { useJobs } from "../jobsStore";
 import { openOutput, resultsConnection } from "../outputs";
@@ -107,6 +107,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
         }
         const merged = rebaseJob(base, mine, theirs);
         const clashes = rebaseClashes(base, mine, theirs);
+        const deleted = rebaseDeleted(base, mine, theirs);
         basis.current = theirs;
         latest.current = merged;
         dirty.current = true;
@@ -115,6 +116,12 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
           useStore
             .getState()
             .toast(`Changed elsewhere too, so its new version is kept: ${clashes.join(", ")}. Make your change to ${clashes.length > 1 ? "them" : "it"} again.`, "info");
+        // Deleted elsewhere while edited here: said either way, never silently gone.
+        const say = (list: JobNode[], text: (names: string, many: boolean) => string) =>
+          list.length && useStore.getState().toast(text(list.map((n) => n.name).join(", "), list.length > 1), "info");
+        say(deleted.kept, (names, many) => `Deleted elsewhere, kept here because you changed ${many ? "their" : "its"} SQL: ${names}. Delete ${many ? "them" : "it"} again if ${many ? "they" : "it"} should go.`);
+        say(deleted.replaced, (names, many) => `Deleted elsewhere, and a step of ${many ? "their names" : "that name"} exists there now, so it is kept instead: ${names}. Make your change to ${many ? "them" : "it"} again.`);
+        say(deleted.dropped, (names, many) => `Deleted elsewhere, so your changes to ${names} are gone. Add ${many ? "them" : "it"} again if needed.`);
         asking.current = false;
         await persistRef.current();
       } catch (e) {
