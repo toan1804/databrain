@@ -53,13 +53,16 @@ pub fn get_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job> {
 /// SQL, so it counts as edited).
 pub fn save_job(state: &AppState, mut job: databrain_workspace::Job) -> Result<databrain_workspace::Job> {
     let old = if job.id.is_empty() { None } else { state.workspace.get_job(&job.id).ok() };
+    let conflict = |name: &str| {
+        EngineError::new(
+            "conflict",
+            format!("\"{name}\" was changed elsewhere since it was opened (by the assistant or another window): your changes go on top of that version"),
+        )
+    };
     if let Some(o) = &old
         && o.updated_at != job.updated_at
     {
-        return Err(EngineError::new(
-            "conflict",
-            format!("\"{}\" was changed elsewhere since it was opened (by the assistant or another window): your changes go on top of that version", o.name),
-        ));
+        return Err(conflict(&o.name));
     }
     for n in &mut job.nodes {
         let kept = match old.as_ref().and_then(|o| o.nodes.iter().find(|x| x.id == n.id)) {
@@ -78,7 +81,18 @@ pub fn save_job(state: &AppState, mut job: databrain_workspace::Job) -> Result<d
             return Err(invalid(format!("results.{} is already used by {why}; choose another step name", n.name)));
         }
     }
-    Ok(state.workspace.save_job(job)?)
+    // Checked again as it is saved (one write transaction): a save that came
+    // between the read above and this one (another window, the assistant,
+    // another process) is not overwritten.
+    let base = old.as_ref().map(|o| o.updated_at);
+    let name = job.name.clone();
+    match state.workspace.save_job_based_on(job, base) {
+        Err(databrain_workspace::Error::Conflict(_)) => Err(conflict(old.as_ref().map_or(&name, |o| &o.name))),
+        Err(databrain_workspace::Error::NotFound(_)) => {
+            Err(EngineError::new("not_found", format!("\"{name}\" was deleted since it was opened: nothing was saved")))
+        }
+        other => Ok(other?),
+    }
 }
 
 /// What else uses the output name `name` (outside job `job_id`): another

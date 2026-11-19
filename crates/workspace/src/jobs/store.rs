@@ -150,14 +150,18 @@ impl Workspace {
 
     /// Every step's output name (lowercase) with its owner.
     pub fn job_step_names(&self) -> Result<Vec<(String, StepOwner)>> {
+        Self::step_names_on(&self.conn.lock())
+    }
+
+    /// [`Workspace::job_step_names`] on a connection (or transaction) already held.
+    fn step_names_on(c: &rusqlite::Connection) -> Result<Vec<(String, StepOwner)>> {
         let ids: Vec<String> = {
-            let c = self.conn.lock();
             let mut stmt = c.prepare("SELECT id FROM jobs")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut out = Vec::new();
         for id in ids {
-            let Ok(j) = self.get_job(&id) else { continue };
+            let Ok(j) = Self::read_job(c, &id) else { continue };
             for n in &j.nodes {
                 out.push((
                     n.name.to_ascii_lowercase(),
@@ -223,7 +227,16 @@ impl Workspace {
 
     /// Insert (empty id) or update. Nodes without ids get one; edges to
     /// missing nodes and duplicate edges are dropped.
-    pub fn save_job(&self, mut job: Job) -> Result<Job> {
+    pub fn save_job(&self, job: Job) -> Result<Job> {
+        self.save_job_based_on(job, None)
+    }
+
+    /// [`Workspace::save_job`], refused with [`Error::Conflict`] when `base`
+    /// (the version, `updated_at`, the changes were made on) is no longer
+    /// the stored one: another save came first (the assistant, another
+    /// window, another process). Checked in the same write transaction as
+    /// the save, so two saves on the same version can't both pass.
+    pub fn save_job_based_on(&self, mut job: Job, base: Option<i64>) -> Result<Job> {
         for n in &mut job.nodes {
             if n.id.is_empty() {
                 n.id = new_id();
@@ -239,8 +252,14 @@ impl Workspace {
         }
         job.edges = edges;
         validate(&job)?;
+        // Everything checked against what is stored (the version, the names
+        // other jobs own, the "run after" lists) is read and written in one
+        // write transaction: another process (the background runner, an MCP
+        // client) saving at the same moment waits, then sees this one.
+        let mut c = self.conn.lock();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Output names are unique across jobs: a step owns its name.
-        for (name, owner) in self.job_step_names()? {
+        for (name, owner) in Self::step_names_on(&tx)? {
             if owner.job_id == job.id {
                 continue;
             }
@@ -252,17 +271,22 @@ impl Workspace {
         if job.id.is_empty() {
             job.id = new_id();
             job.created_at = now;
-        } else if let Some(prev) = self.conn.lock().query_row("SELECT updated_at FROM jobs WHERE id = ?1", [&job.id], |r| r.get::<_, i64>(0)).optional()? {
+        } else if let Some((prev, name)) =
+            tx.query_row("SELECT updated_at, name FROM jobs WHERE id = ?1", [&job.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).optional()?
+        {
+            if base.is_some_and(|b| b != prev) {
+                return Err(Error::Conflict(format!("\"{name}\" was changed elsewhere since this version was read")));
+            }
             // Each save is a new version (the editor's saves are refused
             // when based on an older one): two in one millisecond differ too.
             now = now.max(prev + 1);
+        } else if base.is_some() {
+            // Changes based on a version of a job deleted since (the user
+            // deleted it while the assistant's change waited): not saved,
+            // or the job (its runs and links gone) would come back.
+            return Err(Error::NotFound(format!("job {} (deleted since it was read)", job.id)));
         }
         // "Run after" other jobs: existing ones, once each, not itself, no loop.
-        // Read and written in one write transaction: another process (the
-        // background runner, an MCP client) saving the other half of a loop
-        // at the same moment waits, then sees this one.
-        let mut c = self.conn.lock();
-        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // A step's last results are the runs', not the editor's: the stored
         // ones are kept, so a save made with a copy read before a run ended
         // doesn't put back the results that run replaced.
@@ -1179,5 +1203,65 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(a.get_job(&j.id).unwrap().nodes[0].sql, last);
+    }
+
+    /// A save based on a version that is no longer the stored one is
+    /// refused, checked in the save's own transaction: two saves made on the
+    /// same version at the same moment (two processes) can't both pass, and
+    /// two jobs can't both take one step name.
+    #[test]
+    fn saves_on_one_version_and_one_name_are_one_at_a_time() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let j = ws.save_job(job(vec![node("orders")], vec![])).unwrap();
+        let mut a = j.clone();
+        a.nodes[0].sql = "select 1".into();
+        let saved = ws.save_job_based_on(a, Some(j.updated_at)).unwrap();
+        assert!(saved.updated_at > j.updated_at);
+        let mut b = j.clone();
+        b.nodes[0].sql = "select 2".into();
+        let e = ws.save_job_based_on(b.clone(), Some(j.updated_at)).unwrap_err();
+        assert!(matches!(e, Error::Conflict(_)), "{e}");
+        assert_eq!(ws.get_job(&j.id).unwrap().nodes[0].sql, "select 1");
+        // No base: saved as before (the assistant's create, imports).
+        ws.save_job(b).unwrap();
+        // Changes to a job deleted since they were read don't bring it back.
+        let gone = ws.get_job(&j.id).unwrap();
+        ws.delete_job(&j.id).unwrap();
+        let e = ws.save_job_based_on(gone.clone(), Some(gone.updated_at)).unwrap_err();
+        assert!(matches!(e, Error::NotFound(_)), "{e}");
+        assert!(ws.get_job(&j.id).is_err(), "the deleted job came back");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.db");
+        let (p, q) = (Workspace::open(&path).unwrap(), Workspace::open(&path).unwrap());
+        let j = p.save_job(job(vec![node("orders")], vec![])).unwrap();
+        let (p, q) = (std::sync::Arc::new(p), std::sync::Arc::new(q));
+        for round in 0..50 {
+            let base = p.get_job(&j.id).unwrap();
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let save = |ws: std::sync::Arc<Workspace>, sql: String| {
+                let (mut mine, gate) = (base.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    mine.nodes[0].sql = sql;
+                    gate.wait();
+                    ws.save_job_based_on(mine, Some(base.updated_at))
+                })
+            };
+            let (x, y) = (save(p.clone(), format!("select {round}")), save(q.clone(), format!("select -{round}")));
+            let (x, y) = (x.join().unwrap(), y.join().unwrap());
+            assert_eq!(x.is_ok() as u8 + y.is_ok() as u8, 1, "round {round}: both or neither saved: {x:?} {y:?}");
+            // Two new jobs taking the same step name at once: one of them.
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let new = |ws: std::sync::Arc<Workspace>| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    ws.save_job(Job { name: format!("J{round}"), ..job(vec![node(&format!("step_{round}"))], vec![]) })
+                })
+            };
+            let (x, y) = (new(p.clone()), new(q.clone()));
+            let (x, y) = (x.join().unwrap(), y.join().unwrap());
+            assert_eq!(x.is_ok() as u8 + y.is_ok() as u8, 1, "round {round}: a step name taken twice: {x:?} {y:?}");
+        }
     }
 }

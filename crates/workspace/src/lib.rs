@@ -64,6 +64,9 @@ pub enum Error {
     NotFound(String),
     #[error("{0}")]
     Invalid(String),
+    /// A save based on a version that is no longer the stored one.
+    #[error("{0}")]
+    Conflict(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
