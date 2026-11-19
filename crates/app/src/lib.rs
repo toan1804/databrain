@@ -377,6 +377,7 @@ pub fn run() {
             commands::ai::mcp_config,
             commands::ai::kn_get,
             commands::ai::kn_table_notes,
+            commands::ai::check_sample_sql,
             commands::ai::kn_objects,
             commands::ai::ai_scope,
             commands::ai::ai_put_rule,

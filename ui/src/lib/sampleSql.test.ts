@@ -11,6 +11,12 @@ describe("the table explorer's sample rows", () => {
     expect(sampleSql("postgres", "public", "orders", 10, "   ")).toBe('SELECT *\nFROM public.orders\nLIMIT 10;');
   });
 
+  it("read a DuckDB result or file by the name given (not as schema.table)", () => {
+    expect(sampleSql("duckdb", "results.main", "sales", 100, "", "results.sales")).toBe("SELECT *\nFROM results.sales\nLIMIT 100;");
+    expect(sampleSql("duckdb", "results.main", "sales", 100, "x > 1", "results.sales")).toBe("SELECT *\nFROM results.sales\nWHERE x > 1\nLIMIT 100;");
+    expect(sampleSql("duckdb", "data.csv.files", "data.csv", 10, "", "'data.csv'")).toBe("SELECT *\nFROM 'data.csv'\nLIMIT 10;");
+  });
+
   it("leave MongoDB and Neo4j to their own preview (no SQL condition)", () => {
     expect(sampleSql("mongodb", "shop", "orders", 100, "x = 1")).toBe('db.getSiblingDB("shop").getCollection("orders").find({}).limit(100)');
   });

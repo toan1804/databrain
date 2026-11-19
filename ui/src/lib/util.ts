@@ -237,11 +237,14 @@ export function selectTopSql(kind: ConnectorKind, schema: string, table: string,
  * those matching `where` (an SQL condition) when given. MongoDB and Neo4j
  * take no condition here (their own languages): the plain preview.
  */
-export function sampleSql(kind: ConnectorKind, schema: string, table: string, n: number, where?: string): string {
+export function sampleSql(kind: ConnectorKind, schema: string, table: string, n: number, where?: string, from?: string): string {
   const t = traitsOf(kind);
   const cond = where?.trim().replace(/;+\s*$/, "");
-  if (!cond || t.preview === "mongo_find" || t.preview === "cypher") return selectTopSql(kind, schema, table, n);
-  const q = qualifiedName(kind, schema, table);
+  if (t.preview === "mongo_find" || t.preview === "cypher") return selectTopSql(kind, schema, table, n);
+  // `from`: how the table is named when not by schema and name (a DuckDB result or file).
+  if (!cond && !from) return selectTopSql(kind, schema, table, n);
+  const q = from ?? qualifiedName(kind, schema, table);
+  if (!cond) return t.row_limit === "top" ? `SELECT TOP ${n} *\nFROM ${q};` : t.row_limit === "fetch_first" ? `SELECT *\nFROM ${q}\nFETCH FIRST ${n} ROWS ONLY` : `SELECT *\nFROM ${q}\nLIMIT ${n};`;
   switch (t.row_limit) {
     case "top":
       return `SELECT TOP ${n} *\nFROM ${q}\nWHERE ${cond};`;

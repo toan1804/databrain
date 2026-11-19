@@ -2,34 +2,38 @@
 // knows and can read about it: sample rows, columns, DDL and notes (see
 // docs/TODO.md "Table explorer" for the later parts: column profile,
 // statistics, relations, history, usage).
-import { useEffect, useMemo, useRef, useState } from "react";
-import { FileCode2, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Table2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AlertTriangle, FileCode2, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
-import { tablePath } from "../lib/catalog";
+import { RESULTS_SCHEMA_ID, tablePath } from "../lib/catalog";
 import { traitsOf } from "../lib/sourceTraits";
-import type { ConnectionView, KnNote, ObjectDetail } from "../lib/types";
-import { formatCount, relativeTime, sampleSql, shortCount } from "../lib/util";
+import type { ConnectionView, ObjectDetail, TableNote, TableNotes } from "../lib/types";
+import { formatBytes, formatCount, relativeTime, sampleSql, shortCount } from "../lib/util";
 import { useStore, type DdlRef } from "../store";
 import { DdlTab } from "./DdlTab";
 import { ResultsPanel } from "./ResultsPanel";
 import { ConnDot, EnvBadge } from "./ui";
-import { selectTop } from "./CatalogSearch";
-
+import { objectRef, selectTop } from "./CatalogSearch";
 
 type Part = "data" | "columns" | "ddl" | "notes";
 type Detail = { status: "loading" } | { status: "ready"; detail: ObjectDetail } | { status: "error"; message: string };
+type Notes = { status: "loading" } | { status: "ready"; notes: TableNotes } | { status: "error"; message: string };
 
 export function TableTab({ tabId, reference, visible }: { tabId: string; reference: DdlRef; visible: boolean }) {
   const tab = useStore((s) => s.tabs.find((t) => t.id === tabId));
   const conn = useStore((s) => s.connections.find((c) => c.id === tab?.connection_id));
   const [part, setPart] = useState<Part>("data");
+  // Parts opened so far stay mounted (hidden): Data keeps its rows, settings
+  // and SQL, the DDL isn't read again.
+  const [opened, setOpened] = useState<ReadonlySet<Part>>(new Set(["data"]));
   const [detail, setDetail] = useState<Detail>({ status: "loading" });
-  const [notes, setNotes] = useState<KnNote[] | null>(null);
-  const [seq, setSeq] = useState(0);
+  const [notes, setNotes] = useState<Notes>({ status: "loading" });
+  const [detailSeq, setDetailSeq] = useState(0);
+  const [notesSeq, setNotesSeq] = useState(0);
   const kind = conn?.config.kind;
   const path = kind ? tablePath(kind, reference.schema, reference.name) : reference.name;
-
   const connId = conn?.id;
+
   useEffect(() => {
     if (!connId) return setDetail({ status: "error", message: "The connection of this tab no longer exists." });
     let live = true;
@@ -38,26 +42,44 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
       .describeObject(connId, reference.schema, reference.name)
       .then((d) => live && setDetail({ status: "ready", detail: d }))
       .catch((e) => live && setDetail({ status: "error", message: toError(e).message }));
-    api
-      .knTableNotes(connId, reference.schema, reference.name)
-      .then((n) => live && setNotes(n))
-      .catch(() => live && setNotes([]));
     return () => {
       live = false;
     };
-  }, [connId, reference.schema, reference.name, seq]);
+  }, [connId, reference.schema, reference.name, detailSeq]);
+  useEffect(() => {
+    if (!connId) return;
+    let live = true;
+    api
+      .knTableNotes(connId, reference.schema, reference.name)
+      .then((n) => live && setNotes({ status: "ready", notes: n }))
+      .catch((e) => live && setNotes({ status: "error", message: toError(e).message }));
+    return () => {
+      live = false;
+    };
+  }, [connId, reference.schema, reference.name, notesSeq]);
 
   if (!conn || !kind) return <div className="p-4 text-[12.5px] text-muted" style={{ display: visible ? "block" : "none" }}>The connection of this tab no longer exists.</div>;
   const d = detail.status === "ready" ? detail.detail : null;
   const object = d?.object;
   const columns = d?.columns ?? [];
   const loadable = reference.kind === "table" && !!traitsOf(kind).load;
+  const noteList = notes.status === "ready" ? notes.notes.notes : [];
   const parts: { key: Part; label: string; count?: number }[] = [
     { key: "data", label: "Data" },
     { key: "columns", label: "Columns", count: d ? columns.length : undefined },
     { key: "ddl", label: "DDL" },
-    { key: "notes", label: "Notes", count: notes?.length || undefined },
+    { key: "notes", label: "Notes", count: noteList.length || undefined },
   ];
+  const show = (p: Part) => {
+    setPart(p);
+    setOpened((o) => (o.has(p) ? o : new Set(o).add(p)));
+  };
+  const slot = (p: Part, body: ReactNode) =>
+    opened.has(p) && (
+      <div key={p} className="h-full min-h-0" style={{ display: part === p ? "block" : "none" }}>
+        {body}
+      </div>
+    );
 
   return (
     <div className="h-full min-h-0 flex-col" style={{ display: visible ? "flex" : "none" }} aria-label={`Table ${path}`}>
@@ -77,7 +99,15 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
               · ~{shortCount(object.row_estimate)} rows
             </span>
           )}
-          <button className="icon-btn ml-auto h-6 w-6 shrink-0" onClick={() => setSeq((n) => n + 1)} title="Read the table again from the database" aria-label="Refresh">
+          <button
+            className="icon-btn ml-auto h-6 w-6 shrink-0"
+            onClick={() => {
+              setDetailSeq((n) => n + 1);
+              setNotesSeq((n) => n + 1);
+            }}
+            title="Read the table's description and notes again"
+            aria-label="Refresh"
+          >
             <RefreshCw size={12} className={detail.status === "loading" ? "animate-spin" : ""} />
           </button>
         </div>
@@ -103,7 +133,7 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
             key={p.key}
             role="tab"
             aria-selected={part === p.key}
-            onClick={() => setPart(p.key)}
+            onClick={() => show(p.key)}
             className={`-mb-px border-b-2 px-2 py-1.5 text-[12px] ${part === p.key ? "border-accent text-fg" : "border-transparent text-muted hover:text-fg"}`}
           >
             {p.label}
@@ -112,18 +142,20 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
         ))}
       </nav>
       <div className="min-h-0 flex-1">
-        {part === "data" && <DataPart tabId={tabId} conn={conn} reference={reference} />}
-        {part === "columns" &&
-          (detail.status === "loading" ? (
+        {slot("data", <DataPart tabId={tabId} conn={conn} reference={reference} />)}
+        {slot(
+          "columns",
+          detail.status === "loading" ? (
             <Busy />
           ) : detail.status === "error" ? (
             <p className="p-3 text-[12px] text-danger">{detail.message}</p>
           ) : (
-            <ColumnsPart detail={detail.detail} notes={notes ?? []} />
-          ))}
-        {/* The DDL view as Show DDL opens it, in this tab. */}
-        {part === "ddl" && <DdlTab tabId={tabId} reference={reference} visible />}
-        {part === "notes" && <NotesPart conn={conn} path={path} notes={notes} onSaved={() => setSeq((n) => n + 1)} />}
+            <ColumnsPart detail={detail.detail} notes={noteList} />
+          ),
+        )}
+        {/* The DDL view as Show DDL opens it, in this tab (read once). */}
+        {slot("ddl", <DdlTab tabId={tabId} reference={reference} visible={visible && part === "ddl"} />)}
+        {slot("notes", <NotesPart conn={conn} notes={notes} onSaved={() => setNotesSeq((n) => n + 1)} />)}
       </div>
     </div>
   );
@@ -139,26 +171,68 @@ function Busy() {
 
 const SAMPLE_SIZES = [100, 1000, 10000];
 
+/**
+ * A database that bills a query by the bytes it scans, whatever its LIMIT
+ * (BigQuery): its sample doesn't run by itself, and Run says what it reads.
+ */
+export const billsScans = (kind: string) => kind === "bigquery";
+
 /** Sample rows: the first N, filtered by a condition, in the result grid (sort, find, copy, export, load into). */
 function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionView; reference: DdlRef }) {
   const kind = conn.config.kind;
   const filterable = traitsOf(kind).preview !== "mongo_find" && traitsOf(kind).preview !== "cypher";
   const [n, setN] = useState(100);
   const [filter, setFilter] = useState("");
-  const sql = useMemo(() => sampleSql(kind, reference.schema, reference.name, n, filter), [kind, reference.schema, reference.name, n, filter]);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  // A DuckDB result or attached file is named as the Query button names it.
+  const from =
+    kind === "duckdb" && (reference.schema.endsWith(".files") || reference.schema === RESULTS_SCHEMA_ID)
+      ? objectRef(conn, { schema: reference.schema, name: reference.name, kind: reference.kind })
+      : undefined;
+  const sql = useMemo(() => sampleSql(kind, reference.schema, reference.name, n, filter, from), [kind, reference.schema, reference.name, n, filter, from]);
   const run = useStore((s) => s.runs[tabId]);
+  // The SQL whose rows the grid shows ("Open in editor" takes it).
   const [ran, setRan] = useState<string | null>(null);
-  const go = (text = sql) => {
-    setRan(text);
-    void useStore.getState().runSql(tabId, conn.id, text, 0, undefined, undefined, undefined, n);
+  const go = async (text = sql) => {
+    setProblem(null);
+    setChecking(true);
+    try {
+      // One read, no parameters: the condition typed in can't start a write.
+      await api.checkSampleSql(conn.id, text);
+      if (billsScans(kind)) {
+        const est = await api.estimateCost(conn.id, tabId, text).catch(() => null);
+        const ok = await new Promise<boolean>((resolve) =>
+          useStore.getState().askConfirm({
+            title: `Read sample rows of ${reference.name}?`,
+            reasons: [
+              est?.bytes != null
+                ? `This query reads about ${formatBytes(est.bytes)}: BigQuery bills the columns it scans, and LIMIT doesn't lower it.`
+                : "BigQuery bills the columns this query scans, and LIMIT doesn't lower it; the estimate couldn't be read.",
+            ],
+            confirmLabel: "Read rows",
+            onConfirm: () => resolve(true),
+            onCancel: () => resolve(false),
+          }),
+        );
+        if (!ok) return;
+      }
+      setRan(text);
+      void useStore.getState().runSql(tabId, conn.id, text, 0, undefined, undefined, undefined, n);
+    } catch (e) {
+      setProblem(toError(e).message);
+    } finally {
+      setChecking(false);
+    }
   };
-  // The first rows as soon as the tab opens (once: React runs effects twice
-  // in development, and the run isn't in the store yet; Run reads them again).
+  // The first rows as soon as the tab opens, where that costs nothing more
+  // than the rows (once: React runs effects twice in development, and the run
+  // isn't in the store yet; Run reads them again).
   const started = useRef(false);
   useEffect(() => {
-    if (started.current || run) return;
+    if (started.current || run || billsScans(kind)) return;
     started.current = true;
-    go();
+    void go();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- once, when the tab opens; Run reads the rows again
   }, []);
   return (
@@ -167,7 +241,7 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
         className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line px-2 py-1.5 text-[12px]"
         onSubmit={(e) => {
           e.preventDefault();
-          go();
+          void go();
         }}
       >
         <label className="flex items-center gap-1 text-muted">
@@ -190,33 +264,39 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
             onChange={(e) => setFilter(e.target.value)}
           />
         )}
-        <button type="submit" className="btn-primary py-0.5 text-[12px]" disabled={run?.running}>
-          {run?.running ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Run
+        <button type="submit" className="btn-primary py-0.5 text-[12px]" disabled={run?.running || checking}>
+          {run?.running || checking ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Run
         </button>
         <button
           type="button"
           className="btn-ghost py-0.5 text-[12px]"
           onClick={() => useStore.getState().newTab({ title: reference.name, sql: ran ?? sql, connection_id: conn.id })}
-          title="A query tab with this SQL"
+          title={ran ? "A query tab with the SQL of the rows shown" : "A query tab with this SQL"}
         >
           <FileCode2 size={12} /> Open in editor
         </button>
       </form>
+      {problem && (
+        <div className="flex shrink-0 items-start gap-1 border-b border-line bg-danger/5 px-2 py-1 text-[11.5px] text-danger" role="alert">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {problem}
+        </div>
+      )}
       <div className="min-h-0 flex-1">
-        <ResultsPanel tabId={tabId} connectionId={conn.id} title={reference.name} />
+        {!run && billsScans(kind) ? (
+          <p className="p-3 text-[12px] text-muted">Press Run to read sample rows: BigQuery bills the columns a query scans, whatever its LIMIT, so they aren't read on opening.</p>
+        ) : (
+          <ResultsPanel tabId={tabId} connectionId={conn.id} title={reference.name} noEditor />
+        )}
       </div>
     </div>
   );
 }
 
 /** The columns as the database describes them, with keys, comments and notes. */
-function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: KnNote[] }) {
+function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote[] }) {
   const fkOf = (col: string) => detail.foreign_keys.find((f) => f.columns.length === 1 && f.columns[0].toLowerCase() === col.toLowerCase());
-  const noteOf = (col: string) =>
-    notes.find((n) => {
-      const last = (n.target ?? "").split(".").pop()?.replace(/["`[\]]/g, "").toLowerCase();
-      return last === col.toLowerCase();
-    });
+  // The server says which column a note is on (a note on the table is on none).
+  const noteOf = (col: string) => notes.find((n) => n.column?.toLowerCase() === col.toLowerCase());
   if (!detail.columns.length) return <p className="p-3 text-[12px] text-muted">The database lists no columns for it.</p>;
   return (
     <div className="h-full overflow-auto">
@@ -288,16 +368,18 @@ function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: KnNote[] 
 }
 
 /** The knowledge base's notes about the table and its columns; add one (it goes to the AI as the user's note). */
-function NotesPart({ conn, path, notes, onSaved }: { conn: ConnectionView; path: string; notes: KnNote[] | null; onSaved: () => void }) {
+function NotesPart({ conn, notes, onSaved }: { conn: ConnectionView; notes: Notes; onSaved: () => void }) {
   const [body, setBody] = useState("");
-  const [target, setTarget] = useState(path);
+  // The target the server reads back for this table (BigQuery projects, DuckDB results and files included).
+  const base = notes.status === "ready" ? notes.notes.target : "";
+  const [target, setTarget] = useState(base);
   const [saving, setSaving] = useState(false);
-  useEffect(() => setTarget(path), [path]);
+  useEffect(() => setTarget(base), [base]);
   const save = async () => {
-    if (!body.trim()) return;
+    if (!body.trim() || !base) return;
     setSaving(true);
     try {
-      await api.knSaveNote({ id: "", connection_id: conn.id, target: target.trim() || path, body: body.trim(), author: "user", status: "approved", created_at: 0, replaces: null });
+      await api.knSaveNote({ id: "", connection_id: conn.id, target: target.trim() || base, body: body.trim(), author: "user", status: "approved", created_at: 0, replaces: null });
       setBody("");
       onSaved();
       useStore.getState().toast("Note saved: the AI reads it with the table", "success");
@@ -309,13 +391,17 @@ function NotesPart({ conn, path, notes, onSaved }: { conn: ConnectionView; path:
   };
   return (
     <div className="h-full space-y-3 overflow-auto p-3 text-[12px]">
-      {notes === null ? (
+      {notes.status === "loading" ? (
         <Busy />
-      ) : notes.length === 0 ? (
+      ) : notes.status === "error" ? (
+        <p className="text-danger" role="alert">
+          The notes couldn't be read: {notes.message}
+        </p>
+      ) : notes.notes.notes.length === 0 ? (
         <p className="text-muted">No notes about this table yet. A note tells the AI (and whoever reads the exported notes) what the table or a column means.</p>
       ) : (
         <ul className="space-y-1.5">
-          {notes.map((n) => (
+          {notes.notes.notes.map((n) => (
             <li key={n.id} className="rounded-md border border-line px-2 py-1.5">
               <div className="flex items-center gap-2 text-[11px] text-muted">
                 <span className="font-mono">{n.target}</span>
@@ -334,7 +420,7 @@ function NotesPart({ conn, path, notes, onSaved }: { conn: ConnectionView; path:
         <input aria-label="Note about" className="field font-mono text-[11.5px]" value={target} onChange={(e) => setTarget(e.target.value)} title="The table, or table.column for a column" />
         <textarea aria-label="Note" className="field min-h-[64px]" placeholder="e.g. total includes VAT; status 'void' rows are test orders" value={body} onChange={(e) => setBody(e.target.value)} />
         <div className="flex justify-end">
-          <button className="btn-primary py-0.5 text-[12px]" disabled={!body.trim() || saving} onClick={() => void save()}>
+          <button className="btn-primary py-0.5 text-[12px]" disabled={!body.trim() || !base || saving} onClick={() => void save()}>
             {saving ? <Loader2 size={12} className="animate-spin" /> : <NotebookPen size={12} />} Save note
           </button>
         </div>

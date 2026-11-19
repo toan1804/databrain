@@ -33,6 +33,7 @@ import type {
   Folder,
   FolderKind,
   KnNote,
+  TableNotes,
   IndexPlan,
   CredentialStoreKind,
   OracleClientStatus,
@@ -463,7 +464,9 @@ export const api = {
 
   knGet: (connectionId: string) => call<KnowledgeView>("kn_get", { connectionId }),
   /** The notes about one table or its columns (approved and proposed). */
-  knTableNotes: (connectionId: string, schema: string, name: string) => call<KnNote[]>("kn_table_notes", { connectionId, schema, name }),
+  knTableNotes: (connectionId: string, schema: string, name: string) => call<TableNotes>("kn_table_notes", { connectionId, schema, name }),
+  /** The table explorer's sample SQL is one read without parameters (else why not). */
+  checkSampleSql: (connectionId: string, sql: string) => call<void>("check_sample_sql", { connectionId, sql }),
   /** Tables the AI may use matching `filter` (schema.name or comment), one page at a time. */
   knObjects: (connectionId: string, filter: string, offset: number, limit: number) =>
     call<KnObjectPage>("kn_objects", { connectionId, filter, offset, limit }),

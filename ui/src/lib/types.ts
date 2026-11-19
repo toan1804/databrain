@@ -2,6 +2,8 @@
 //
 // Generated from the Rust types (ts-rs, `cargo test` writes ./bindings):
 // change those, not these. The rest of this file is still written by hand.
+import type { TableNotes } from "./bindings/TableNotes";
+import type { TableNote } from "./bindings/TableNote";
 import type { JobNodeKind } from "./bindings/JobNodeKind";
 import type { FileFormat } from "./bindings/FileFormat";
 import type { LoadMode } from "./bindings/LoadMode";
@@ -309,6 +311,8 @@ export type {
   CachedColumns,
   KnObject,
   KnNote,
+  TableNotes,
+  TableNote,
   NoteEntry,
   ImportItem,
   ImportAction,

@@ -7,7 +7,7 @@ import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, table
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
 import { quoteIdent } from "../lib/util";
 import { editorBridge } from "../editorBridge";
-import { useStore } from "../store";
+import { isQueryTab, useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 import { openCompare, openErDiagram, openTable } from "./openTabs";
 
@@ -23,12 +23,16 @@ export async function copyText(text: string, what: string) {
 /** Insert text at the cursor of the active editor (query tab or notebook cell). */
 export function insertText(text: string) {
   const st = useStore.getState();
-  const tab = st.tabs.find((t) => t.id === st.activeTabId);
-  if (!tab || tab.output_ref || tab.ddl) {
+  const active = st.tabs.find((t) => t.id === st.activeTabId);
+  // Into the shown query tab, else the last one (shown then): a table
+  // explorer or DDL view in front has no editor.
+  const tab = isQueryTab(active) ? active : [...st.tabs].reverse().find(isQueryTab);
+  if (!tab) {
     st.toast("Open a query tab to insert into the editor", "info");
     return;
   }
-  editorBridge.insert(st.activeTabId, text);
+  if (tab.id !== st.activeTabId) st.setActiveTab(tab.id);
+  editorBridge.insert(tab.id, text);
 }
 
 /**

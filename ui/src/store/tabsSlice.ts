@@ -195,7 +195,8 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     if (s.txOpen[id] && !window.confirm("This tab has an open transaction. Close it and roll back the uncommitted changes?")) return;
     // What runs on its session stops with it, and says why.
     tabClosing(id);
-    if (isTauri() && isQueryTab(s.tabs[idx])) api.closeTab(id).catch(() => {});
+    // A table explorer runs its sample on its own session too: stopped and closed with it.
+    if (isTauri() && (s.tabs[idx].table || isQueryTab(s.tabs[idx]))) api.closeTab(id).catch(() => {});
     // Dashboards: their charts' sessions and results.
     const dash = s.tabs[idx].dashboard_id;
     if (isTauri() && dash) {

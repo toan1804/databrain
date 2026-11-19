@@ -560,15 +560,67 @@ pub fn knowledge(state: &AppState, connection_id: &str) -> Result<KnowledgeView>
     Ok(KnowledgeView { state: st, notes: state.workspace.kn_notes(connection_id)? })
 }
 
+/// A note about a table, and the column it is about when it names one.
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TableNote {
+    #[serde(flatten)]
+    pub note: databrain_workspace::KnNote,
+    /// The column (as the target writes it), for a note on `table.column`.
+    pub column: Option<String>,
+}
+
+/// The table explorer's notes: the target a new note about the table gets
+/// (a path the matching reads back, whatever the database: BigQuery
+/// projects, DuckDB results and files), and the notes about it.
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TableNotes {
+    pub target: String,
+    pub notes: Vec<TableNote>,
+}
+
 /// The notes about one table (or its columns), approved and proposed, as
-/// the AI matches them to it (`target_mentions`): the table explorer's Notes.
-pub fn table_notes(state: &AppState, connection_id: &str, schema: &str, name: &str) -> Result<Vec<databrain_workspace::KnNote>> {
-    Ok(state
+/// the AI matches them to it (`target_mentions`).
+pub fn table_notes(state: &AppState, connection_id: &str, schema: &str, name: &str) -> Result<TableNotes> {
+    use databrain_workspace::{path_parts, split_target, table_path, target_mentions};
+    let full: Vec<String> = schema.split('.').filter(|s| !s.is_empty()).chain([name]).map(str::to_lowercase).collect();
+    // The column a target names: the table's whole path, then one more part.
+    let column_of = |target: &str| {
+        split_target(target).into_iter().find_map(|(_, p)| {
+            let parts = path_parts(&p);
+            let lower: Vec<String> = parts.iter().map(|x| x.to_lowercase()).collect();
+            (lower.len() == full.len() + 1 && lower.starts_with(&full)).then(|| parts.last().cloned()).flatten()
+        })
+    };
+    let notes = state
         .workspace
         .kn_notes(connection_id)?
         .into_iter()
-        .filter(|n| n.target.as_deref().is_some_and(|t| databrain_workspace::target_mentions(t, schema, name)))
-        .collect())
+        .filter(|n| n.target.as_deref().is_some_and(|t| target_mentions(t, schema, name)))
+        .map(|n| TableNote { column: n.target.as_deref().and_then(column_of), note: n })
+        .collect();
+    Ok(TableNotes { target: table_path(schema, name, None), notes })
+}
+
+/// SQL the table explorer runs for its sample rows (the `where` condition
+/// typed in): one statement, a read, and no `:name` parameter (the tab has
+/// no parameter bar). Refused otherwise, before anything runs: a `;` in the
+/// condition would start another statement.
+pub fn check_sample_sql(state: &AppState, connection_id: &str, sql: &str) -> Result<()> {
+    let profile = state.workspace.get_connection(connection_id)?;
+    let kind = profile.config.kind;
+    let plan = state.engine.plan(&profile, sql);
+    if plan.len() != 1 {
+        return Err(EngineError::new("invalid", "The condition must be one condition: it can't end the statement (`;`) and start another"));
+    }
+    if !plan[0].checked.kind().is_read() {
+        return Err(EngineError::new("invalid", "The condition must only read: this would change data"));
+    }
+    if !databrain_connector_core::sql::find_parameters(sql, kind).is_empty() {
+        return Err(EngineError::new("invalid", "Parameters (:name) aren't available here: write the value"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, ts_rs::TS)]
