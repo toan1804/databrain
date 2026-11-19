@@ -252,6 +252,14 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     const s = get();
     const last = s.closedTabs[s.closedTabs.length - 1];
     if (!last) return false;
+    // One tab per table: a table explorer opened again since it closed is shown, not doubled.
+    const ref = last.tab.table;
+    const same = ref && s.tabs.find((t) => t.table && t.connection_id === last.tab.connection_id && t.table.schema === ref.schema && t.table.name === ref.name);
+    if (same) {
+      set({ closedTabs: s.closedTabs.slice(0, -1) });
+      get().setActiveTab(same.id);
+      return true;
+    }
     // A new id: the old one's session and outputs are gone.
     const tab: Tab = { ...last.tab, id: uid() };
     const savedParams = last.params;

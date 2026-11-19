@@ -575,6 +575,35 @@ async fn read_only_connections_refuse_everything_but_reads() {
     assert!(evs.iter().any(|e| matches!(e, JobEvent::StatementFinished { result: Some(r), .. } if r.total_rows == 1)), "{evs:?}");
 }
 
+/// The table explorer's sample runs one read, and only that, even when
+/// confirmed: a `;` typed in its `where` box can't start a write, and the
+/// read is in the history as the explorer's.
+#[tokio::test]
+async fn explorer_runs_one_read_only() {
+    let f = fixture(EnvTag::Dev);
+    let id = started(f.engine.run(RunRequest { confirmed: true, ..req(&f, "create table t (a int); insert into t values (1)") }).unwrap());
+    wait_job(&f, &id).await;
+    let explorer = |sql: &str| RunRequest { origin: Origin::Explorer, confirmed: true, tab_id: "table:t".into(), ..req(&f, sql) };
+    for sql in [
+        "SELECT *\nFROM t\nWHERE 1=1; delete from t where a > 0\nLIMIT 100;",
+        "SELECT *\nFROM t\nWHERE 1=1; update t set a = 2 where a > 0\nLIMIT 100;",
+        "SELECT *\nFROM t\nWHERE a = 1; -- paid only\nLIMIT 100;",
+        "delete from t",
+        "pragma query_only = off",
+    ] {
+        let e = f.engine.run(explorer(sql)).unwrap_err();
+        assert!(e.message.contains("one read only"), "{sql}: {}", e.message);
+    }
+    let id = started(f.engine.run(explorer("SELECT *\nFROM t\nWHERE a = 1 -- the first\nLIMIT 100;")).unwrap());
+    let evs = wait_job(&f, &id).await;
+    assert!(evs.iter().any(|e| matches!(e, JobEvent::StatementFinished { result: Some(r), .. } if r.total_rows == 1)), "{evs:?}");
+    let id = started(f.engine.run(req(&f, "select count(*) from t")).unwrap());
+    let evs = wait_job(&f, &id).await;
+    assert!(evs.iter().any(|e| matches!(e, JobEvent::StatementFinished { result: Some(r), .. } if r.total_rows == 1)), "nothing was deleted: {evs:?}");
+    let origins: Vec<Origin> = f.ws.list_history(&Default::default()).unwrap().into_iter().map(|h| h.origin).collect();
+    assert!(origins.contains(&Origin::Explorer), "{origins:?}");
+}
+
 /// A statement's stored result is kept only when it finished: an error, a
 /// stream that ends without `Done` and an abandoned read all remove it.
 #[tokio::test]

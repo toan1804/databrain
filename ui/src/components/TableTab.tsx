@@ -194,31 +194,38 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
   const run = useStore((s) => s.runs[tabId]);
   // The SQL whose rows the grid shows ("Open in editor" takes it).
   const [ran, setRan] = useState<string | null>(null);
+  // A production connection asks once per tab before the first sample.
+  const prod = conn.env === "prod";
+  const prodAsked = useRef(false);
+  const ask = (title: string, reasons: string[]) =>
+    new Promise<boolean>((resolve) =>
+      useStore.getState().askConfirm({ title, reasons, confirmLabel: "Read rows", onConfirm: () => resolve(true), onCancel: () => resolve(false) }),
+    );
   const go = async (text = sql) => {
     setProblem(null);
     setChecking(true);
     try {
-      // One read, no parameters: the condition typed in can't start a write.
+      // One read, no parameters: the condition typed in can't start a write
+      // (the engine refuses it again for the explorer's runs).
       await api.checkSampleSql(conn.id, text);
       if (billsScans(kind)) {
         const est = await api.estimateCost(conn.id, tabId, text).catch(() => null);
-        const ok = await new Promise<boolean>((resolve) =>
-          useStore.getState().askConfirm({
-            title: `Read sample rows of ${reference.name}?`,
-            reasons: [
-              est?.bytes != null
-                ? `This query reads about ${formatBytes(est.bytes)}: BigQuery bills the columns it scans, and LIMIT doesn't lower it.`
-                : "BigQuery bills the columns this query scans, and LIMIT doesn't lower it; the estimate couldn't be read.",
-            ],
-            confirmLabel: "Read rows",
-            onConfirm: () => resolve(true),
-            onCancel: () => resolve(false),
-          }),
-        );
+        const reasons = [
+          est?.bytes != null
+            ? `This query reads about ${formatBytes(est.bytes)}: BigQuery bills the columns it scans, and LIMIT doesn't lower it.`
+            : "BigQuery bills the columns this query scans, and LIMIT doesn't lower it; the estimate couldn't be read.",
+        ];
+        if (est?.over_limit != null) reasons.push(`That is over the connection's limit of ${formatBytes(est.over_limit)} billed: BigQuery will refuse it.`);
+        if (prod) reasons.push(`"${conn.name}" is a production connection.`);
+        if (!(await ask(`Read sample rows of ${reference.name}?`, reasons))) return;
+        prodAsked.current = true;
+      } else if (prod && !prodAsked.current) {
+        const ok = await ask(`Read sample rows of ${reference.name}?`, [`"${conn.name}" is a production connection: this reads up to ${formatCount(n)} rows of it${reference.kind === "table" ? "" : " (a view runs its query)"}. This tab won't ask again.`]);
         if (!ok) return;
+        prodAsked.current = true;
       }
       setRan(text);
-      void useStore.getState().runSql(tabId, conn.id, text, 0, undefined, undefined, undefined, n);
+      void useStore.getState().runSql(tabId, conn.id, text, 0, undefined, undefined, undefined, n, undefined, "explorer");
     } catch (e) {
       setProblem(toError(e).message);
     } finally {
@@ -226,11 +233,12 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
     }
   };
   // The first rows as soon as the tab opens, where that costs nothing more
-  // than the rows (once: React runs effects twice in development, and the run
-  // isn't in the store yet; Run reads them again).
+  // than the rows and needn't ask (once: React runs effects twice in
+  // development, and the run isn't in the store yet; Run reads them again).
+  const waits = billsScans(kind) || prod;
   const started = useRef(false);
   useEffect(() => {
-    if (started.current || run || billsScans(kind)) return;
+    if (started.current || run || waits) return;
     started.current = true;
     void go();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- once, when the tab opens; Run reads the rows again
@@ -255,6 +263,11 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
           </select>
           rows
         </label>
+        {!filterable && (
+          <span className="text-muted" title={`A where condition is SQL, and ${traitsOf(kind).name} has its own query language`}>
+            No condition on {traitsOf(kind).name}: Open in editor to filter
+          </span>
+        )}
         {filterable && (
           <input
             aria-label="Where condition"
@@ -282,8 +295,12 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
         </div>
       )}
       <div className="min-h-0 flex-1">
-        {!run && billsScans(kind) ? (
-          <p className="p-3 text-[12px] text-muted">Press Run to read sample rows: BigQuery bills the columns a query scans, whatever its LIMIT, so they aren't read on opening.</p>
+        {!run && waits ? (
+          <p className="p-3 text-[12px] text-muted">
+            {billsScans(kind)
+              ? "Press Run to read sample rows: BigQuery bills the columns a query scans, whatever its LIMIT, so they aren't read on opening."
+              : `Press Run to read sample rows: "${conn.name}" is a production connection, so they aren't read on opening.`}
+          </p>
         ) : (
           <ResultsPanel tabId={tabId} connectionId={conn.id} title={reference.name} noEditor />
         )}
@@ -296,7 +313,11 @@ function DataPart({ tabId, conn, reference }: { tabId: string; conn: ConnectionV
 function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote[] }) {
   const fkOf = (col: string) => detail.foreign_keys.find((f) => f.columns.length === 1 && f.columns[0].toLowerCase() === col.toLowerCase());
   // The server says which column a note is on (a note on the table is on none).
-  const noteOf = (col: string) => notes.find((n) => n.column?.toLowerCase() === col.toLowerCase());
+  // An approved note before a proposed one.
+  const noteOf = (col: string) => {
+    const on = notes.filter((n) => n.column?.toLowerCase() === col.toLowerCase());
+    return on.find((n) => n.status !== "proposed") ?? on[0];
+  };
   if (!detail.columns.length) return <p className="p-3 text-[12px] text-muted">The database lists no columns for it.</p>;
   return (
     <div className="h-full overflow-auto">
@@ -342,8 +363,8 @@ function ColumnsPart({ detail, notes }: { detail: ObjectDetail; notes: TableNote
                 <td className="max-w-[320px] px-2 py-1 text-[11.5px]">
                   {c.comment && <div className="truncate text-muted" title={c.comment}>{c.comment}</div>}
                   {note && (
-                    <div className="flex items-start gap-1 truncate text-accent" title={note.body}>
-                      <NotebookPen size={10} className="mt-0.5 shrink-0" /> {note.body}
+                    <div className={`flex items-start gap-1 truncate ${note.status === "proposed" ? "text-warning" : "text-accent"}`} title={note.status === "proposed" ? `Proposed, to review in Knowledge: ${note.body}` : note.body}>
+                      <NotebookPen size={10} className="mt-0.5 shrink-0" /> {note.status === "proposed" && <span className="shrink-0">(proposed)</span>} {note.body}
                     </div>
                   )}
                 </td>
@@ -417,7 +438,7 @@ function NotesPart({ conn, notes, onSaved }: { conn: ConnectionView; notes: Note
       )}
       <div className="space-y-1.5 rounded-md border border-line p-2">
         <div className="text-[11px] font-medium uppercase tracking-wide text-muted">Add a note</div>
-        <input aria-label="Note about" className="field font-mono text-[11.5px]" value={target} onChange={(e) => setTarget(e.target.value)} title="The table, or table.column for a column" />
+        <input aria-label="Note about" className="field font-mono text-[11.5px]" value={target} onChange={(e) => setTarget(e.target.value)} title="This table's path as given, or that path followed by .column for a note on a column" />
         <textarea aria-label="Note" className="field min-h-[64px]" placeholder="e.g. total includes VAT; status 'void' rows are test orders" value={body} onChange={(e) => setBody(e.target.value)} />
         <div className="flex justify-end">
           <button className="btn-primary py-0.5 text-[12px]" disabled={!body.trim() || !base || saving} onClick={() => void save()}>

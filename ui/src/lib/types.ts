@@ -104,6 +104,7 @@ import type { ExportOptions } from "./bindings/ExportOptions";
 import type { BatchLimits } from "./bindings/BatchLimits";
 import type { SavedQuery } from "./bindings/SavedQuery";
 import type { HistoryEntry } from "./bindings/HistoryEntry";
+import type { Origin } from "./bindings/Origin";
 import type { HistoryQuery } from "./bindings/HistoryQuery";
 import type { HistoryClear } from "./bindings/HistoryClear";
 import type { TabState } from "./bindings/TabState";
@@ -296,6 +297,7 @@ export type {
   BatchLimits,
   SavedQuery,
   HistoryEntry,
+  Origin,
   HistoryQuery,
   HistoryClear,
   TabState,

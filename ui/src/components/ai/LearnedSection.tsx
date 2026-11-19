@@ -427,7 +427,7 @@ export function LearnedSection({
                                 <div key={h.id}>
                                   <span className="text-muted">
                                     {relativeTime(h.started_at)}
-                                    {h.origin === "ai" || h.origin === "mcp" ? " · run by the AI" : h.origin === "job" ? " · job" : ""}
+                                    {h.origin === "ai" || h.origin === "mcp" ? " · run by the AI" : h.origin === "job" ? " · job" : h.origin === "explorer" ? " · table explorer" : ""}
                                   </span>
                                   <pre className="line-clamp-3 whitespace-pre-wrap break-all font-mono text-[11px]">{h.sql}</pre>
                                 </div>

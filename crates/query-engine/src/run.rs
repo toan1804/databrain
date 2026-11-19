@@ -96,6 +96,11 @@ impl QueryEngine {
             return Err(EngineError::new("invalid", "Nothing to run"));
         }
         Self::bind_parameters(&mut plan, profile.config.kind, &req.params)?;
+        // The table explorer's sample: one read, whatever its `where` box
+        // held (a `;` in it would start another statement).
+        if req.origin == Origin::Explorer && !(plan.len() == 1 && plan[0].classification().kind.is_read()) {
+            return Err(EngineError::new("invalid", "The table explorer runs one read only: the condition can't end the statement (`;`) or change data"));
+        }
         if let Some(h) = replaces {
             let o = self.outputs.get(h).ok_or_else(|| EngineError::new("not_found", format!("output {h} not found")))?;
             if o.tab_id != req.tab_id {

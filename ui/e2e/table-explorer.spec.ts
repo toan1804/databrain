@@ -34,7 +34,9 @@ test.describe("table explorer", () => {
     await expect(page.getByRole("tab", { name: /orders/ }).first()).toBeVisible();
     // Data: the first 100 rows run at once, on the table tab's own run.
     await expect.poll(async () => (await calls(page, "run_query")).length).toBe(1);
-    const req = (await calls(page, "run_query"))[0].req as { tab_id: string; sql: string; row_limit: number };
+    const req = (await calls(page, "run_query"))[0].req as { tab_id: string; sql: string; row_limit: number; origin?: string };
+    // As the explorer's: one read only, and so in the history.
+    expect(req.origin).toBe("explorer");
     expect(req.sql).toMatch(/FROM .*orders/i);
     expect(req.sql).toMatch(/LIMIT 100/i);
     expect(req.row_limit).toBe(100);
@@ -137,4 +139,32 @@ test("on BigQuery the sample doesn't run on opening, and Run says what it bills 
   await expect(dialog).toContainText("about 5.0 GB");
   await dialog.getByRole("button", { name: "Read rows" }).click();
   await expect.poll(async () => (await calls(page, "run_query")).length).toBe(1);
+});
+
+test("on a production connection the sample asks once per tab before it reads", async ({ page }) => {
+  const prod = { ...SHOP, env: "prod" };
+  await openApp(
+    page,
+    backend({
+      list_connections: [prod],
+      run_query: { status: "started", job_id: "job-p", statements: [{ index: 0, sql: "SELECT …", start: 0, end: 8, classification: { kind: "read", missing_where: false, keyword: "SELECT" } }] },
+      kn_table_notes: { target: "public.orders", notes: [] },
+    }),
+  );
+  const tree = page.getByRole("treeitem");
+  await tree.filter({ hasText: "Shop" }).first().click();
+  await tree.filter({ hasText: /^orders/ }).dblclick();
+  const tab = page.getByLabel(/^Table .*orders/);
+  await expect(tab.getByText(/production connection, so they aren't read on opening/)).toBeVisible();
+  expect(await calls(page, "run_query")).toHaveLength(0);
+  await tab.getByRole("button", { name: "Run" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("production connection");
+  await dialog.getByRole("button", { name: "Read rows" }).click();
+  await expect.poll(async () => (await calls(page, "run_query")).length).toBe(1);
+  await emit(page, "job-event", { type: "job_finished", job_id: "job-p", tab_id: ((await calls(page, "run_query"))[0].req as { tab_id: string }).tab_id, status: "success", duration_ms: 5, in_transaction: false });
+  // Asked once: the next Run reads at once.
+  await tab.getByRole("button", { name: "Run" }).click();
+  await expect.poll(async () => (await calls(page, "run_query")).length).toBe(2);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
 });
