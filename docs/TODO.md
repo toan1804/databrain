@@ -87,7 +87,7 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 - **chrono / chrono-tz are unmaintained** (RUSTSEC-2026-0543, -0555; ignored in `deny.toml`): DataBrain's own uses (job schedules and their time zones, `databrain-jobs`, export file names, the Neo4j, Oracle and Databricks connectors) could move to `jiff`, but arrow, parquet, neo4rs and russh keep chrono in the build, so it would add a crate without removing one. Revisit when arrow moves off chrono or a vulnerability is reported.
 - **Run date:** the step panel's `:run_date` examples for Snowflake, BigQuery and Databricks follow their documentation and aren't run against a live server (the others are, in `run_date_examples_give_what_they_say`); the assistant's `run_job` can't run for a given date (no `run_date` argument); a range of days ("run for 1–15 November") is one "Run for this date" per day; the `current_date` hint reads the step's SQL text only (not a parameter set's `{}` expressions such as `current_date - 1`); a queued "run after" start takes the date of the other job's latest success, which a newer run of it may have replaced meanwhile.
 
-## `dbr` command (idea, 2026-11-18; flags 2026-11-19)
+## `dbr` command (2026-11-18; flags 2026-11-19; terminal mode done 2026-11-19)
 
 A short command that opens files in DataBrain or queries from a terminal, for what DuckDB's own CLI can't do: DataBrain's file reading (Excel sheets, blank headers, Delta/Iceberg), its grid, charts, export and AI on the result, and its saved connections with their rules.
 
@@ -129,6 +129,13 @@ $ dbr -c "Sales PG" -i "select id, status, total from orders order by id"
 - **Exit codes:** 0 done, 1 the query failed, 2 bad arguments (unknown connection, missing parameter), 130 stopped.
 
 To build: a launcher like `databrain-mcp` / `databrain-jobs` (`dbr` → `databrain open …` / `databrain query …`; almost no app size); the single-instance plugin to pass "open these files" to a running window; a file association for `.sql` (and optionally `.parquet`, `.csv`) in `tauri.conf.json`; an "Install the `dbr` command" item (as VS Code's `code`), since the launchers aren't on PATH; and in the build without bundled DuckDB, a clear message when no DuckDB library is installed. The terminal mode reuses the engine the jobs runner uses (sessions, the safety checks, history), with no window. Order: open files and `.sql` in the app; then `-c … -i` (the part DuckDB's CLI can't do: saved connections with their credentials and rules); then the formats and parameters.
+
+Done: the terminal mode (`-i`, `-c`, the formats, `--limit`, `-p`, `-e`, data files, the production prompt and `--yes`, history as "Terminal", the exit codes), as `dbr` and `databrain query`; a table shows at most 1,000 rows (CSV/JSON/TSV every row). Left:
+
+- **Opening in the app** (no `-i`): files and `.sql` in tabs, the query in a new tab on `-c`'s connection; needs the single-instance plugin (a new dependency: weigh its size) to hand them to a running window, and file associations.
+- **"Install the `dbr` command"** in the app (a link on PATH, as VS Code's `code`): today it is used from the app bundle's folder.
+- **Jobs from `dbr`:** `dbr jobs list`, `dbr jobs run <job>` (the existing `databrain-jobs` commands), `dbr jobs runs <job>` (the last runs, each step's status and error) and `dbr jobs stop <job>`. Stopping needs something new: a run belongs to the process that runs it (the app or the background runner), so `stop` records a stop request in the workspace that the running process reads on its lease heartbeat and acts on ("Stopped from a terminal"); the same lets the app stop the background runner's runs, which it can't today.
+- **Ctrl-C** stops the statement; a second Ctrl-C doesn't force an exit yet. No `--width` (the table reads `COLUMNS`, else 120).
 
 ## Loads into other databases (review of 2026-11-17, checked against vendor docs)
 

@@ -26,6 +26,10 @@ path = "src/bin/databrain-mcp.rs"
 name = "databrain-jobs"
 path = "src/bin/databrain-jobs.rs"
 
+[[bin]]
+name = "dbr"
+path = "src/bin/dbr.rs"
+
 [dependencies]
 futures = "0.3.34"
 async-trait = "0.1.92"

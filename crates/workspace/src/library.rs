@@ -18,6 +18,8 @@ pub enum Origin {
     /// The table explorer's sample rows: one read only (the engine refuses
     /// anything else, whatever was typed in its `where` box).
     Explorer,
+    /// A query run from a terminal (`dbr -i`), with the connection's own rules.
+    Cli,
 }
 
 impl Origin {
@@ -28,6 +30,7 @@ impl Origin {
             Origin::Mcp => "mcp",
             Origin::Job => "job",
             Origin::Explorer => "explorer",
+            Origin::Cli => "cli",
         }
     }
     pub(crate) fn parse(s: &str) -> Self {
@@ -36,6 +39,7 @@ impl Origin {
             "mcp" => Origin::Mcp,
             "job" => Origin::Job,
             "explorer" => Origin::Explorer,
+            "cli" => Origin::Cli,
             _ => Origin::User,
         }
     }

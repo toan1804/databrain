@@ -177,8 +177,10 @@ impl QueryEngine {
         let (waiter, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let statements = match self.start_run(req, Some(waiter))? {
             RunResponse::Started { job_id, statements } => (job_id, statements),
+            // Code `needs_confirmation`: a caller that can ask (the terminal's
+            // `dbr`) asks and runs it again confirmed; the others report it.
             RunResponse::NeedsConfirmation { reasons, .. } => {
-                return Err(EngineError::new("invalid", reasons.join(" ")));
+                return Err(EngineError { code: Some("needs_confirmation".into()), ..EngineError::new("invalid", reasons.join(" ")) });
             }
         };
         let (job_id, plan) = statements;

@@ -11,12 +11,15 @@ use std::process::ExitCode;
 
 pub mod jobs;
 pub mod mcp;
+pub mod query;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mode {
     App,
     Mcp(Vec<String>),
     Jobs(Vec<String>),
+    /// `databrain query` / `dbr`: SQL from a terminal.
+    Query(Vec<String>),
 }
 
 /// The mode `args` ask for (the program's arguments, its name first): a
@@ -29,8 +32,10 @@ pub fn mode(args: Vec<OsString>) -> Mode {
     match (name.as_str(), rest.first().map(String::as_str)) {
         ("databrain-mcp", _) => Mode::Mcp(rest),
         ("databrain-jobs", _) => Mode::Jobs(rest),
+        ("dbr", _) => Mode::Query(rest),
         (_, Some("mcp")) => Mode::Mcp(rest[1..].to_vec()),
         (_, Some("jobs")) => Mode::Jobs(rest[1..].to_vec()),
+        (_, Some("query")) => Mode::Query(rest[1..].to_vec()),
         _ => Mode::App,
     }
 }
@@ -49,6 +54,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Mode::App => None,
         Mode::Mcp(rest) => Some(mcp::main(rest)),
         Mode::Jobs(rest) => Some(jobs::main(rest)),
+        Mode::Query(rest) => Some(query::main(rest)),
     }
 }
 
@@ -70,6 +76,8 @@ mod tests {
         assert_eq!(m(&["C:\\Program Files\\DataBrain\\databrain.exe", "jobs", "run", "Daily load"]), Mode::Jobs(v(&["run", "Daily load"])));
         assert_eq!(m(&["/usr/bin/databrain-mcp"]), Mode::Mcp(vec![]));
         assert_eq!(m(&["DataBrain-Jobs.exe", "list"]), Mode::Jobs(v(&["list"])));
+        assert_eq!(m(&["/usr/local/bin/dbr", "-c", "Sales", "-i", "select 1"]), Mode::Query(v(&["-c", "Sales", "-i", "select 1"])));
+        assert_eq!(m(&["databrain", "query", "-i", "select 1"]), Mode::Query(v(&["-i", "select 1"])));
         // macOS passes arguments of its own to apps; they open the app.
         assert_eq!(m(&["databrain", "-psn_0_12345"]), Mode::App);
         assert_eq!(m(&[]), Mode::App);
