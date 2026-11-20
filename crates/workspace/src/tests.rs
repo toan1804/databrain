@@ -101,6 +101,95 @@ fn connections_crud() {
     assert!(ws.save_connection(profile("  ")).is_err());
 }
 
+/// Deleting a connection leaves nothing of what only belonged to it: every
+/// table with a `connection_id` but those kept on purpose (their
+/// connection becomes unset), and its settings. A table added later is
+/// checked too.
+#[test]
+fn deleting_a_connection_leaves_nothing_of_it() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let mut p = profile("Prod DB");
+    let saved = ws.save_connection(p.clone()).unwrap();
+    let id = saved.id.clone();
+    let other = ws.save_connection(profile("Other")).unwrap().id;
+    let fill = |c: &str| {
+        let col = |n: &str| databrain_connector_core::ColumnInfo {
+            name: n.into(),
+            data_type: "int".into(),
+            nullable: true,
+            is_primary_key: false,
+            default: None,
+            comment: None,
+        };
+        let k = KnObject {
+            schema: "s".into(),
+            name: "t".into(),
+            kind: "table".into(),
+            comment: None,
+            row_estimate: None,
+            columns: vec![col("id")],
+            foreign_keys: vec![],
+        };
+        ws.meta_put_schemas(c, None, &[databrain_connector_core::SchemaInfo { name: "s".into(), is_default: true, catalog: None }]).unwrap();
+        ws.meta_put_schema(c, "s", &[DbObject { schema: "s".into(), name: "v".into(), kind: ObjectKind::View, comment: None, row_estimate: None }]).unwrap();
+        ws.meta_view_sql_put(c, "s", "v", "select 1").unwrap();
+        ws.kn_replace_schema(c, "s", std::slice::from_ref(&k)).unwrap();
+        ws.kn_set_state(&KnState { connection_id: c.into(), indexed_at: 1, objects: 1, schemas: vec!["s".into()], error: None }).unwrap();
+        ws.kn_save_note(KnNote {
+            id: String::new(),
+            connection_id: c.into(),
+            target: Some("s.t".into()),
+            body: "rows of t".into(),
+            author: "user".into(),
+            status: NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        })
+        .unwrap();
+        // A schema list without `s`: its tables are kept for the AI (ai_kept).
+        ws.meta_put_schemas(c, None, &[]).unwrap();
+        ws.kn_set_fingerprint(c, "s", Some("f")).unwrap();
+        // And a schema still listed, with a view's definition.
+        ws.meta_put_schema(c, "u", &[DbObject { schema: "u".into(), name: "v".into(), kind: ObjectKind::View, comment: None, row_estimate: None }]).unwrap();
+        ws.meta_put_table(c, "u", "v", &[col("id")], Some(&[])).unwrap();
+        ws.meta_view_sql_put(c, "u", "v", "select 1").unwrap();
+    };
+    fill(&id);
+    fill(&other);
+    // Pointed elsewhere: the next index asks (a setting of the connection).
+    p.id = id.clone();
+    p.created_at = saved.created_at;
+    p.config.host = Some("elsewhere.local".into());
+    ws.save_connection(p).unwrap();
+    assert!(ws.ai_index_must_choose(&id));
+    fill(&id);
+
+    ws.delete_connection(&id).unwrap();
+    // Kept on purpose, their connection unset: the user's queries, history,
+    // notebooks, outputs, tabs and AI conversations and audit.
+    const KEPT: [&str; 7] = ["saved_queries", "query_history", "tabs", "ai_sessions", "ai_audit", "notebooks", "outputs"];
+    let c = ws.conn.lock();
+    let tables: Vec<String> = c
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND sql LIKE '%connection_id%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(tables.len() > 15, "{tables:?}");
+    for t in tables.iter().filter(|t| !KEPT.contains(&t.as_str())) {
+        let left: i64 = c.query_row(&format!("SELECT count(*) FROM \"{t}\" WHERE connection_id = ?1"), [&id], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "{t} keeps rows of the deleted connection");
+    }
+    let settings: i64 = c.query_row("SELECT count(*) FROM settings WHERE instr(key, ?1) > 0", [&id], |r| r.get(0)).unwrap();
+    assert_eq!(settings, 0, "a setting of the deleted connection is left");
+    // The other connection keeps everything.
+    for t in ["meta_objects", "meta_columns", "meta_views", "kn_notes", "kn_state", "kn_schema_state", "ai_scope", "ai_kept"] {
+        let n: i64 = c.query_row(&format!("SELECT count(*) FROM {t} WHERE connection_id = ?1"), [&other], |r| r.get(0)).unwrap();
+        assert!(n > 0, "{t} of the other connection");
+    }
+}
+
 #[test]
 fn saved_queries_and_folders() {
     let ws = Workspace::open_in_memory().unwrap();

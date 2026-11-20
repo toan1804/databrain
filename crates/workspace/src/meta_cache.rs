@@ -78,7 +78,7 @@ pub struct ExplorerCacheState {
 /// Which server a connection points at (kind, address, database, user,
 /// options, SSH hop). A change makes the cached explorer meaningless.
 /// Settings key: the connection moved; its next index asks first.
-fn index_ask_key(connection_id: &str) -> String {
+pub(crate) fn index_ask_key(connection_id: &str) -> String {
     format!("ai_index_ask.{connection_id}")
 }
 
