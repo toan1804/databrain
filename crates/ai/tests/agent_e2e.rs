@@ -1654,6 +1654,44 @@ async fn index_tables_adds_missing_tables_after_approval() {
     assert!(f.ws.kn_state(&f.conn).unwrap().is_some_and(|s| s.objects == 2));
 }
 
+/// Offline, describe_table answers from what is cached (the tables kept
+/// after the cache was cleared), says so, and doesn't wait on the server
+/// again for every table.
+#[tokio::test]
+async fn describe_table_offline_answers_from_the_cache_without_waiting_each_time() {
+    let f = fixture(1, AiPolicy::default()).await;
+    let ctx = || databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+        provider_id: None,
+    };
+    // The cache was cleared: both tables are kept for the AI (stale).
+    f.ws.meta_clear(&f.conn).unwrap();
+    // The database can't be opened (a folder where its file was; the
+    // connection itself is unchanged).
+    let db = std::path::PathBuf::from(f.ws.get_connection(&f.conn).unwrap().config.file_path.unwrap());
+    let moved = db.with_extension("moved");
+    std::fs::rename(&db, &moved).unwrap();
+    std::fs::create_dir(&db).unwrap();
+    f.engine.disconnect(&f.conn);
+    let o = ctx().call("describe_table", &json!({"table": "orders"})).await;
+    assert!(o.content.contains("customer_id") && o.content.contains("couldn't be reached") && o.content.contains("Not seen on the server"), "{}", o.content);
+    // Back: within the minute the server isn't asked again (the answer is
+    // still the cached one), so an offline turn waits once, not per table.
+    std::fs::remove_dir(&db).unwrap();
+    std::fs::rename(&moved, &db).unwrap();
+    let o = ctx().call("describe_table", &json!({"table": "customers"})).await;
+    assert!(o.content.contains("email") && o.content.contains("couldn't be reached"), "{}", o.content);
+    let kept = f.ws.ai_catalog(&f.conn).get("customers").unwrap().unwrap();
+    assert!(f.ws.ai_catalog(&f.conn).missing_since(&kept.schema, &kept.name).unwrap().is_some(), "not read from the server");
+}
+
 /// A bare name in several schemas is read from the one the AI's scope
 /// allows (not the explorer cache's first); a database that can't be
 /// reached is said as such, not "not available".

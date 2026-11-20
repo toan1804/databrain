@@ -417,7 +417,7 @@ async fn describe_named(
 
 /// The database couldn't be reached or signed in to: says nothing about
 /// the table, so it is told as it is.
-fn unreachable_error(e: &databrain_query_engine::EngineError) -> bool {
+pub(crate) fn unreachable_error(e: &databrain_query_engine::EngineError) -> bool {
     matches!(e.kind.as_str(), "connection" | "auth" | "reauth_required" | "timeout")
 }
 
