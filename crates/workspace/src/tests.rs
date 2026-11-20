@@ -190,6 +190,52 @@ fn deleting_a_connection_leaves_nothing_of_it() {
     }
 }
 
+/// A note and its search row are written together: an import that fails
+/// halfway changes nothing, and a save that can't write the search row
+/// leaves no note the AI can't find.
+#[test]
+fn note_writes_are_all_or_nothing() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let note = |body: &str| KnNote {
+        id: String::new(),
+        connection_id: "c".into(),
+        target: Some("s.t".into()),
+        body: body.into(),
+        author: "user".into(),
+        status: NoteStatus::Approved,
+        created_at: 0,
+        replaces: None,
+    };
+    let old = ws.kn_save_note(note("t holds orders")).unwrap();
+    let found = |q: &str| ws.ai_catalog("c").search(q, 10).unwrap().iter().filter(|h| h.source == "note").count();
+    let entry = |body: &str| NoteEntry { target: Some("s.t".into()), body: body.into(), author: None };
+    let replace = ImportAction { incoming: entry("t holds invoices"), action: "replace".into(), existing_ids: vec![old.id.clone()], body: None, target: None };
+    // The replace, then an action it can't read: nothing applied.
+    let bad = ImportAction { action: "rename".into(), ..replace.clone() };
+    assert!(ws.kn_import_apply("c", &[replace.clone(), bad]).is_err());
+    assert_eq!(ws.kn_notes("c").unwrap().iter().map(|n| n.body.as_str()).collect::<Vec<_>>(), vec!["t holds orders"]);
+    assert_eq!((found("orders"), found("invoices")), (1, 0));
+    // Alone it applies: the old note and its search row go, the new one is found.
+    assert_eq!(ws.kn_import_apply("c", std::slice::from_ref(&replace)).unwrap(), 1);
+    assert_eq!(ws.kn_notes("c").unwrap().iter().map(|n| n.body.as_str()).collect::<Vec<_>>(), vec!["t holds invoices"]);
+    assert_eq!((found("orders"), found("invoices")), (0, 1));
+    // An import can't remove another connection's note (nor its search row).
+    let theirs = ws.kn_save_note(KnNote { connection_id: "d".into(), ..note("d's note on payroll") }).unwrap();
+    let steal = ImportAction { existing_ids: vec![theirs.id.clone()], ..replace.clone() };
+    ws.kn_import_apply("c", &[steal]).unwrap();
+    assert_eq!(ws.kn_notes("d").unwrap().len(), 1);
+    assert_eq!(ws.ai_catalog("d").search("payroll", 5).unwrap().len(), 1);
+    // Nor can an approved update that names it.
+    ws.kn_save_note(KnNote { replaces: Some(theirs.id.clone()), ..note("c's update") }).unwrap();
+    assert_eq!(ws.ai_catalog("d").search("payroll", 5).unwrap().len(), 1);
+    // The search row can't be written: no note either.
+    ws.conn.lock().execute_batch("DROP TABLE kn_fts").unwrap();
+    assert!(ws.kn_save_note(note("t is partitioned by day")).is_err());
+    assert!(!ws.kn_notes("c").unwrap().iter().any(|n| n.body.contains("partitioned")));
+    assert!(ws.kn_delete_note(&theirs.id).is_err());
+    assert_eq!(ws.kn_notes("d").unwrap().len(), 1, "a delete that can't drop the search row keeps the note");
+}
+
 #[test]
 fn saved_queries_and_folders() {
     let ws = Workspace::open_in_memory().unwrap();

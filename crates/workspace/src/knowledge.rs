@@ -862,14 +862,25 @@ impl Workspace {
             n.created_at = now_ms();
         }
         n.target = n.target.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        let c = self.conn.lock();
+        // The note and its search row change together, or neither does.
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let n = Self::save_note_tx(&tx, n)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// [`Self::kn_save_note`] inside the caller's transaction (`n` checked and given an id).
+    fn save_note_tx(c: &rusqlite::Transaction<'_>, mut n: KnNote) -> Result<KnNote> {
         // Approving an update: the new text takes the old note's place.
         if n.status == NoteStatus::Approved
             && let Some(old) = n.replaces.take()
             && old != n.id
         {
-            c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![old, n.connection_id])?;
-            c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&old])?;
+            // Only a note of the same connection (and so only its search row).
+            if c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![old, n.connection_id])? > 0 {
+                c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&old])?;
+            }
         }
         c.execute(
             "INSERT INTO kn_notes (id, connection_id, target, body, author, status, created_at, replaces) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
@@ -914,9 +925,11 @@ impl Workspace {
     }
 
     pub fn kn_delete_note(&self, id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM kn_notes WHERE id = ?1", [id])?;
-        c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM kn_notes WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -948,8 +961,12 @@ impl Workspace {
         Ok(plan_import(&existing, &file.notes))
     }
 
-    /// Apply the user's choices. Returns how many notes were added or changed.
+    /// Apply the user's choices, all of them or none (a failure halfway
+    /// left some notes replaced and others not). Returns how many notes
+    /// were added or changed.
     pub fn kn_import_apply(&self, connection_id: &str, actions: &[ImportAction]) -> Result<usize> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
         let mut n = 0;
         for a in actions {
             let body = a.body.clone().unwrap_or_else(|| a.incoming.body.clone());
@@ -961,27 +978,32 @@ impl Workspace {
                     }
                     if a.action != "add" {
                         for id in &a.existing_ids {
-                            // Only this connection's notes.
-                            let c = self.conn.lock();
-                            c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![id, connection_id])?;
-                            c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+                            // Only this connection's notes (and so only their search rows).
+                            if tx.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![id, connection_id])? > 0 {
+                                tx.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+                            }
                         }
                     }
-                    self.kn_save_note(KnNote {
-                        id: String::new(),
-                        connection_id: connection_id.to_string(),
-                        target: a.target.clone().or_else(|| a.incoming.target.clone()),
-                        body,
-                        author: if a.action == "merge" { "merged".into() } else { a.incoming.author.clone().unwrap_or_else(|| "import".into()) },
-                        status: NoteStatus::Approved,
-                        created_at: 0,
-                        replaces: None,
-                    })?;
+                    let target = a.target.clone().or_else(|| a.incoming.target.clone()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                    Self::save_note_tx(
+                        &tx,
+                        KnNote {
+                            id: new_id(),
+                            connection_id: connection_id.to_string(),
+                            target,
+                            body,
+                            author: if a.action == "merge" { "merged".into() } else { a.incoming.author.clone().unwrap_or_else(|| "import".into()) },
+                            status: NoteStatus::Approved,
+                            created_at: now_ms(),
+                            replaces: None,
+                        },
+                    )?;
                     n += 1;
                 }
                 other => return Err(Error::Invalid(format!("unknown import action {other}"))),
             }
         }
+        tx.commit()?;
         Ok(n)
     }
 
