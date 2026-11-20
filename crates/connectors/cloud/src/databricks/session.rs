@@ -14,6 +14,14 @@ use super::metadata::{cell, databricks_stat_rows, split_schema};
 
 /// A string literal in Databricks's own escaping: a backslash is an escape
 /// there, so a name holding `\'` must not end the literal early.
+/// Databricks ran the statement and it failed (`wait` gives its error
+/// code, an empty one when the answer has none): an answer about the SQL,
+/// such as a catalog that isn't there. Not a server that couldn't be
+/// reached, a statement still running or a result cut short.
+fn statement_failed(e: &ConnectorError) -> bool {
+    e.kind == databrain_connector_core::ErrorKind::Query && e.code.is_some()
+}
+
 fn quote_literal(s: &str) -> String {
     databrain_connector_core::sql::quote_string(s, databrain_connector_core::ConnectorKind::Databricks)
 }
@@ -78,8 +86,11 @@ impl Session for DbxSession {
             .await;
         let rows = match rows {
             Ok(r) => r,
+            // Workspaces without Unity Catalog: hive_metastore only. Any
+            // other failure is an error: a shorter list would be taken as
+            // the complete one, and the schemas it lacks forgotten.
+            Err(e) if !statement_failed(&e) => return Err(e),
             Err(_) => {
-                // Workspaces without Unity Catalog: hive_metastore only.
                 let r = self.0.run_small("SHOW SCHEMAS IN hive_metastore").await?;
                 r.into_iter().map(|x| vec![json!("hive_metastore"), x.first().cloned().unwrap_or_default()]).collect()
             }
@@ -100,6 +111,9 @@ impl Session for DbxSession {
         let default_cat = self.0.catalog.lock().await.clone();
         let rows = match self.0.run_small("SHOW CATALOGS").await {
             Ok(r) => r,
+            // No Unity Catalog. Unreachable or cut short: an error, not a
+            // list without the other catalogs.
+            Err(e) if !statement_failed(&e) => return Err(e),
             Err(_) => vec![vec![json!("hive_metastore")]],
         };
         let mut out: Vec<databrain_connector_core::CatalogInfo> = rows
@@ -461,6 +475,19 @@ fn explain_cost_estimate(text: &str) -> Result<CostEstimate> {
 
 #[cfg(test)]
 mod tests {
+    /// Only a statement Databricks answered as failed lets the schema and
+    /// catalog lists fall back to hive_metastore.
+    #[test]
+    fn only_a_failed_statement_falls_back_to_hive_metastore() {
+        use super::statement_failed;
+        use databrain_connector_core::ConnectorError;
+        assert!(statement_failed(&ConnectorError::query("[TABLE_OR_VIEW_NOT_FOUND] system.information_schema.schemata").with_code("")));
+        assert!(statement_failed(&ConnectorError::query("no such catalog").with_code("BAD_REQUEST")));
+        assert!(!statement_failed(&ConnectorError::connection("timed out")), "unreachable");
+        assert!(!statement_failed(&ConnectorError::query("Databricks returned only the first 100000 rows of this metadata query")), "cut short");
+        assert!(!statement_failed(&ConnectorError::cancelled()));
+    }
+
     use super::*;
 
     #[test]

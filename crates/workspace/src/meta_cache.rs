@@ -82,10 +82,34 @@ fn index_ask_key(connection_id: &str) -> String {
     format!("ai_index_ask.{connection_id}")
 }
 
+/// Options that say how a connection reaches its server or runs there (the
+/// compute it uses, how results come back, the driver, TLS, a one-time
+/// passcode), not which server, database or user it is: changing one keeps
+/// the cached explorer, the AI's tables and its scope. Every other option
+/// counts as part of what the connection points at, so one a connector
+/// adds later clears them until it is listed here.
+const SAME_SERVER_OPTIONS: &[&str] = &[
+    "warehouse",
+    "warehouse_id",
+    "cluster_id",
+    "http_path",
+    "fetch_parallel",
+    "result_transfer",
+    "maximum_bytes_billed",
+    "passcode",
+    "tls",
+    "trust_cert",
+    "driver",
+    "client_lib_dir",
+];
+
 fn identity(cfg: &ConnectionConfig) -> String {
     // Session handling (timeouts) doesn't change what the connection points at.
-    let options: std::collections::BTreeMap<&String, &String> =
-        cfg.options.iter().filter(|(k, _)| !databrain_connector_core::SESSION_OPTIONS.contains(&k.as_str())).collect();
+    let options: std::collections::BTreeMap<&String, &String> = cfg
+        .options
+        .iter()
+        .filter(|(k, _)| !databrain_connector_core::SESSION_OPTIONS.contains(&k.as_str()) && !SAME_SERVER_OPTIONS.contains(&k.as_str()))
+        .collect();
     let mut v = serde_json::json!({
         "kind": cfg.kind, "host": cfg.host, "port": cfg.port, "database": cfg.database,
         "file": cfg.file_path, "auth": cfg.auth, "options": options,
@@ -212,9 +236,23 @@ impl Workspace {
             st.query_map(params![connection_id, schema], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         let mut del = tx.prepare_cached("DELETE FROM meta_columns WHERE connection_id = ?1 AND schema_name = ?2 AND table_name = ?3")?;
+        let mut lost = false;
         for t in cached.iter().filter(|t| !present.contains(t.as_str())) {
             del.execute(params![connection_id, schema, t])?;
+            lost = true;
         }
+        if lost {
+            Self::index_unread_tx(tx, connection_id, Some(schema))?;
+        }
+        Ok(())
+    }
+
+    /// Columns an index run read are gone from the cache (`schema`, or the
+    /// whole connection): the fingerprint the run left no longer says the
+    /// schema is read, so the next run reads it again instead of skipping
+    /// it as unchanged.
+    pub(crate) fn index_unread_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, schema: Option<&str>) -> Result<()> {
+        tx.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1 AND (?2 IS NULL OR schema_name = ?2)", params![connection_id, schema])?;
         Ok(())
     }
 
@@ -327,7 +365,8 @@ impl Workspace {
         for t in ["meta_objects", "meta_columns", "meta_schemas"] {
             tx.execute(&format!("DELETE FROM {t} WHERE connection_id = ?1 AND schema_name = ?2"), params![connection_id, schema])?;
         }
-        // Nothing left there for the AI either.
+        // Nothing left there for the AI either, and nothing an index run read.
+        Self::index_unread_tx(tx, connection_id, Some(schema))?;
         Self::ai_refresh_tx(tx, connection_id, Some(schema))?;
         Ok(())
     }
@@ -894,6 +933,7 @@ impl Workspace {
         tx.execute("DELETE FROM meta_views WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
+        Self::index_unread_tx(tx, connection_id, None)?;
         tx.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
         // The tables the AI could use are gone with them (its scope stays).
         Self::ai_forget_tx(tx, connection_id)?;
@@ -1159,6 +1199,62 @@ mod tests {
         assert_eq!(ws.meta_foreign_keys_to("other", "orders").unwrap(), None, "nothing known: can't tell");
     }
 
+    /// An index run skips a schema whose fingerprint it kept. When the
+    /// columns it read leave the cache, the fingerprint goes with them, so
+    /// the next run reads the schema again; when nothing is lost it stays.
+    #[test]
+    fn losing_indexed_columns_forgets_the_index_fingerprint() {
+        let k = |name: &str| crate::KnObject {
+            schema: "sales".into(),
+            name: name.into(),
+            kind: "table".into(),
+            comment: None,
+            row_estimate: None,
+            columns: cols(&["id"]),
+            foreign_keys: vec![],
+        };
+        let indexed = || {
+            let ws = Workspace::open_in_memory().unwrap();
+            ws.meta_put_schemas("c", None, &[sch("sales", None), sch("hr", None)]).unwrap();
+            ws.kn_replace_schema("c", "sales", &[k("orders"), k("items")]).unwrap();
+            ws.kn_set_fingerprint("c", "sales", Some("fp")).unwrap();
+            ws.kn_set_fingerprint("c", "hr", Some("fp")).unwrap();
+            ws
+        };
+        let kept = |ws: &Workspace| ws.kn_fingerprints("c").unwrap().contains_key("sales");
+        let both = [o("sales", "orders", ObjectKind::Table), o("sales", "items", ObjectKind::Table)];
+
+        // Nothing lost: the same listing, a describe, another schema's listing.
+        let ws = indexed();
+        ws.meta_put_schema("c", "sales", &both).unwrap();
+        ws.meta_put_columns("c", "sales", "orders", &cols(&["id", "total"])).unwrap();
+        ws.meta_put_schema("c", "hr", &[]).unwrap();
+        ws.meta_put_schemas("c", None, &[sch("sales", None), sch("hr", None)]).unwrap();
+        assert!(kept(&ws), "an unchanged schema is still skipped");
+        assert!(ws.kn_fingerprints("c").unwrap().contains_key("hr"));
+
+        // A listing without a table that had columns.
+        ws.meta_put_schema("c", "sales", &both[..1]).unwrap();
+        assert!(!kept(&ws), "a listing dropped items' columns");
+        assert!(ws.kn_fingerprints("c").unwrap().contains_key("hr"), "other schemas keep theirs");
+
+        // An empty listing, an incremental refresh, a schema list without it, a cleared cache.
+        let ws = indexed();
+        ws.meta_put_schema("c", "sales", &[]).unwrap();
+        assert!(!kept(&ws), "an empty listing");
+        let ws = indexed();
+        ws.meta_put_schema("c", "sales", &both).unwrap();
+        ws.meta_apply_changes("c", "sales", &[], &["table:items".into()], &Default::default(), None).unwrap();
+        assert!(!kept(&ws), "a refresh that removes a table");
+        let ws = indexed();
+        ws.meta_put_schemas("c", None, &[sch("hr", None)]).unwrap();
+        assert!(!kept(&ws), "the schema left the schema list");
+        assert!(ws.kn_fingerprints("c").unwrap().contains_key("hr"));
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        assert!(ws.kn_fingerprints("c").unwrap().is_empty(), "the cache was cleared");
+    }
+
     #[test]
     fn columns_of_schemas_never_listed_go_stale_after_a_day() {
         let ws = Workspace::open_in_memory().unwrap();
@@ -1219,6 +1315,20 @@ mod tests {
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "session settings don't change the server");
         assert_eq!(ws.kn_count("c").unwrap(), 1, "the index stays for the same server");
         assert!(!ws.ai_scope("c").unwrap().is_empty(), "and what the AI may use");
+        // How it reaches the server or runs there: the same server.
+        for (k, v) in [("warehouse", "WH2"), ("http_path", "/sql/1.0/warehouses/b"), ("tls", "true"), ("trust_cert", "true"), ("passcode", "123456")] {
+            cfg.options.insert(k.into(), v.into());
+            assert!(!ws.meta_check_identity("c", &cfg).unwrap(), "{k} keeps the cache");
+        }
+        assert_eq!(ws.kn_count("c").unwrap(), 1);
+        assert!(!ws.ai_scope("c").unwrap().is_empty());
+        // An option that may point elsewhere (a role sees other tables; one
+        // DataBrain doesn't know counts too): cleared.
+        for k in ["role", "some_new_option"] {
+            let mut other = cfg.clone();
+            other.options.insert(k.into(), "x".into());
+            assert_ne!(identity(&other), identity(&cfg), "{k} is part of what the connection points at");
+        }
         cfg.host = Some("db2".into());
         assert!(ws.meta_check_identity("c", &cfg).unwrap(), "cleared");
         // What the AI may use was chosen for the old server's schemas: a
