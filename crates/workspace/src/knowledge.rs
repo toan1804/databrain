@@ -446,9 +446,9 @@ const STOPWORDS: &[&str] = &[
 impl Workspace {
     /// The objects of one schema as an index run read them in full: their
     /// facts go to the explorer cache, the one store the AI reads
-    /// (`ai_objects`); its search rows follow from there. Tables the read
-    /// doesn't have are gone from the server. An empty list only takes the
-    /// schema out of the index.
+    /// (`ai_objects`); its search rows follow from there. A table the read
+    /// doesn't have is gone from the server, as with a filled explorer
+    /// listing. An empty list changes nothing.
     pub fn kn_replace_schema(&self, connection_id: &str, schema: &str, objects: &[KnObject]) -> Result<IndexDelta> {
         self.kn_replace_schema_read(connection_id, schema, objects, false, true)
     }
@@ -575,13 +575,10 @@ impl Workspace {
         let now = now_ms();
         let mut changed = 0;
         let schemas: HashSet<&str> = objects.iter().map(|o| o.schema.as_str()).collect();
-        let mut before = std::collections::HashMap::new();
-        for sc in &schemas {
-            before.extend(Self::known_tx(&tx, connection_id, Some(sc))?);
-        }
         for o in objects {
-            let old = before.get(&(o.schema.clone(), o.name.clone()));
-            changed += usize::from(Self::changes(old, o, false));
+            // Only this table's facts (not its whole schema's).
+            let old = Self::facts_tx(&tx, connection_id, Some(&o.schema), Some(&o.name))?.into_iter().next();
+            changed += usize::from(Self::changes(old.as_ref(), o, false));
             Self::meta_put_known_tx(&tx, connection_id, o, now, false)?;
         }
         // Indexing a table lets the AI use it.
@@ -620,12 +617,11 @@ impl Workspace {
 
     /// Remove indexed schemas that no longer exist / are excluded.
     pub fn kn_retain_schemas(&self, connection_id: &str, schemas: &[String]) -> Result<usize> {
-        // The schemas earlier runs indexed: the last run's list, those with
-        // a fingerprint, and those allowed as a whole (an index run adds
-        // that rule; `*` and `catalog.*` rules aren't schemas).
+        // The schemas earlier runs indexed: the last run's list and those
+        // with a fingerprint, both as the server listed them (a scope rule
+        // may be written in another case, and must not be taken for one).
         let mut current: Vec<String> = self.kn_state(connection_id)?.map(|s| s.schemas).unwrap_or_default();
         current.extend(self.kn_fingerprints(connection_id)?.into_keys());
-        current.extend(self.ai_scope(connection_id)?.into_iter().filter(|r| r.allow && r.table.is_empty() && !r.schema.contains('*')).map(|r| r.schema));
         current.sort();
         current.dedup();
         let gone: Vec<String> = current.into_iter().filter(|s| !schemas.contains(s)).collect();
@@ -1001,6 +997,7 @@ mod tests {
         assert!(ws.ai_catalog("c1").get("public.customers").unwrap().is_some());
         assert!(ws.ai_catalog("c1").get("nope").unwrap().is_none());
 
+        ws.kn_set_state(&KnState { connection_id: "c1".into(), indexed_at: 1, objects: 2, schemas: vec!["public".into()], error: None }).unwrap();
         assert_eq!(ws.kn_retain_schemas("c1", &[]).unwrap(), 2, "out of the index: out of the AI's scope");
         assert_eq!(ws.ai_catalog("c1").count().unwrap(), 0);
     }

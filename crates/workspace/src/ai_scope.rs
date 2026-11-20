@@ -185,10 +185,13 @@ impl Workspace {
     pub fn ai_remove_schemas(&self, connection_id: &str, schemas: &[String]) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
+        // Where the database ignores the case of names, so does the match
+        // (a rule `SALES` is the listed `sales`'s).
+        let ic = Self::ignore_case_tx(&tx, connection_id);
         tx.execute(
             "DELETE FROM ai_scope WHERE connection_id = ?1 AND table_name = '' AND allow = 1 \
-               AND schema_rule IN (SELECT value FROM json_each(?2))",
-            params![connection_id, serde_json::to_string(schemas)?],
+               AND (schema_rule IN (SELECT value FROM json_each(?2)) OR (?3 AND lower(schema_rule) IN (SELECT lower(value) FROM json_each(?2))))",
+            params![connection_id, serde_json::to_string(schemas)?, ic],
         )?;
         Self::ai_refresh_tx(&tx, connection_id, None)?;
         tx.commit()?;
@@ -793,7 +796,9 @@ mod tests {
         // A re-read without `items`: gone from the server, and from the AI.
         ws.kn_replace_schema("c", "sales", &[k("sales", "orders")]).unwrap();
         assert!(ai.get("sales.items").unwrap().is_none());
-        // Out of the index scope: out of the AI's.
+        // Out of the index scope: out of the AI's (as a run records it).
+        ws.kn_set_state(&crate::KnState { connection_id: "c".into(), indexed_at: 1, objects: 3, schemas: vec!["sales".into(), "hr".into()], error: None })
+            .unwrap();
         ws.kn_retain_schemas("c", &["hr".into()]).unwrap();
         assert_eq!(ai.objects().unwrap().iter().map(|o| o.full_name()).collect::<Vec<_>>(), vec!["hr.teams"]);
     }
@@ -989,6 +994,8 @@ mod review_tests {
         // A table allowed on its own elsewhere, then the schema leaves the index scope:
         // only its schema-level rule goes.
         ws.kn_upsert_objects("c", &[k("hr", "teams")]).unwrap();
+        ws.kn_set_state(&crate::KnState { connection_id: "c".into(), indexed_at: 1, objects: 3, schemas: vec!["sales".into(), "hr".into()], error: None })
+            .unwrap();
         ws.kn_retain_schemas("c", &["hr".into()]).unwrap();
         assert!(ws.ai_scope("c").unwrap().contains(&ScopeRule { schema: "sales".into(), table: "salaries".into(), allow: false }));
         assert!(ws.ai_scope("c").unwrap().contains(&ScopeRule { schema: "hr".into(), table: "teams".into(), allow: true }));

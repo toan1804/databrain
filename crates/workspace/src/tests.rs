@@ -236,6 +236,51 @@ fn note_writes_are_all_or_nothing() {
     assert_eq!(ws.kn_notes("d").unwrap().len(), 1, "a delete that can't drop the search row keeps the note");
 }
 
+/// On a database that ignores the case of names (SQL Server), a scope
+/// chosen as `SALES` covers the listed `sales`: the end of an index run
+/// doesn't take the rule for a schema that went away.
+#[test]
+fn an_index_run_keeps_a_scope_rule_written_in_another_case() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let mut p = profile("SQL Server");
+    p.config.kind = ConnectorKind::Mssql;
+    let id = ws.save_connection(p).unwrap().id;
+    ws.ai_set_schema_rules(&id, &["SALES".into()]).unwrap();
+    let col = databrain_connector_core::ColumnInfo {
+        name: "id".into(),
+        data_type: "int".into(),
+        nullable: true,
+        is_primary_key: false,
+        default: None,
+        comment: None,
+    };
+    let t = KnObject {
+        schema: "sales".into(),
+        name: "orders".into(),
+        kind: "table".into(),
+        comment: None,
+        row_estimate: None,
+        columns: vec![col],
+        foreign_keys: vec![],
+    };
+    // A first run, then a second that reads the same schema.
+    for _ in 0..2 {
+        ws.kn_replace_schema(&id, "sales", std::slice::from_ref(&t)).unwrap();
+        ws.kn_retain_schemas(&id, &["sales".into()]).unwrap();
+        ws.kn_set_state(&KnState { connection_id: id.clone(), indexed_at: 1, objects: 1, schemas: vec!["sales".into()], error: None }).unwrap();
+    }
+    assert!(ws.ai_scope(&id).unwrap().iter().any(|r| r.schema == "SALES" && r.allow));
+    assert_eq!(ws.ai_catalog(&id).count().unwrap(), 1);
+    // Taken out of the index: its rule goes, in any case here.
+    ws.kn_retain_schemas(&id, &[]).unwrap();
+    assert_eq!(ws.ai_catalog(&id).count().unwrap(), 0);
+    // Where case counts (Postgres), `SALES` is another schema's rule: kept.
+    let pg = ws.save_connection(profile("Postgres")).unwrap().id;
+    ws.ai_set_schema_rules(&pg, &["SALES".into(), "sales".into()]).unwrap();
+    ws.ai_remove_schemas(&pg, &["sales".into()]).unwrap();
+    assert_eq!(ws.ai_scope(&pg).unwrap().iter().map(|r| r.schema.as_str()).collect::<Vec<_>>(), vec!["SALES"]);
+}
+
 #[test]
 fn saved_queries_and_folders() {
     let ws = Workspace::open_in_memory().unwrap();

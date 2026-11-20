@@ -82,7 +82,11 @@ impl ToolContext {
                             }
                         }
                     }
-                    Err(e) if knowledge::unreachable_error(&e) => {
+                    // The server couldn't be reached or signed in to (a
+                    // connect timeout is a `connection` error); not a slow
+                    // read of this one table (`timeout`), which says
+                    // nothing of the others.
+                    Err(e) if matches!(e.kind.as_str(), "connection" | "auth" | "reauth_required") => {
                         set_unreachable(&target.id, true);
                         offline = true;
                     }
