@@ -4,7 +4,6 @@
 // history, DDL and notes (see
 // docs/TODO.md "Table explorer" for what each part leaves out).
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { AlertTriangle, BarChart3, Copy, FileCode2, Hash, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Square, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { RESULTS_SCHEMA_ID, tablePath } from "../lib/catalog";
@@ -21,6 +20,7 @@ import { localFrom, RanSql, useExploreRead, type Explore } from "./tableExplore"
 import { ResultsPanel } from "./ResultsPanel";
 import { ConnDot, EnvBadge } from "./ui";
 import { objectRef, selectTop } from "./CatalogSearch";
+import { copyText } from "./CatalogMenus";
 
 type Part = "columns" | "data" | "stats" | "relations" | "usage" | "indexes" | "partitions" | "permissions" | "history" | "ddl" | "notes";
 type Detail = { status: "loading" } | { status: "ready"; detail: ObjectDetail } | { status: "error"; message: string };
@@ -191,16 +191,13 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
 function Description({ text }: { text: string }) {
   return (
     <div className="group flex items-start gap-1">
-      <div className="max-h-[4.5em] min-w-0 flex-1 select-text overflow-y-auto whitespace-pre-wrap break-words text-[11.5px] leading-[1.5em] text-muted" aria-label="Description">
+      {/* Focusable, so the keyboard scrolls it too. */}
+      <div role="note" tabIndex={0} className="max-h-[4.5em] min-w-0 flex-1 select-text overflow-y-auto whitespace-pre-wrap break-words text-[11.5px] leading-[1.5em] text-muted" aria-label="Description">
         {text}
       </div>
       <button
-        className="icon-btn h-5 w-5 shrink-0 opacity-60 group-hover:opacity-100"
-        onClick={() =>
-          void writeText(text)
-            .then(() => useStore.getState().toast("Description copied", "success"))
-            .catch(() => useStore.getState().toast("Couldn't copy the description", "error"))
-        }
+        className="icon-btn h-5 w-5 shrink-0 opacity-60 group-hover:opacity-100 focus-visible:opacity-100"
+        onClick={() => void copyText(text, "the description")}
         title="Copy the description"
         aria-label="Copy the description"
       >
