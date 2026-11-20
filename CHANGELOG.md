@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.5.0 - 2026-11-20
+
 ### Added
 
 - **Jobs from a terminal, and stopping the background runner's runs:** `dbr jobs list`, `dbr jobs run <job>`, `dbr jobs runs <job>` (the last runs and the latest one's steps) and `dbr jobs stop <job>` (also as `databrain-jobs`). Stop now reaches a run in another process: `dbr jobs stop` and the app's Stop on the background runner's run (in the job tab and the activity bar) leave a request the running process reads within about 2 seconds, and the run ends stopped saying where it was stopped from (a run stopped in the app that runs it has no message, as before).
