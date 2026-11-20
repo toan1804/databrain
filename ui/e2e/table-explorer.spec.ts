@@ -233,3 +233,91 @@ test("Relations and Usage: keys both ways, learned joins, job steps and queries 
   await expect(tab.getByText(/orders_archive/)).toHaveCount(0);
   expect(await calls(page, "table_usage")).toContainEqual({ connectionId: "conn-shop", schema: "public", name: "orders" });
 });
+
+test("Indexes: indexes with their use, partitioning, checks and triggers; History says why not on Postgres", async ({ page }) => {
+  await openApp(
+    page,
+    backend({
+      run_query: {
+        status: "started",
+        job_id: "job-t",
+        statements: [{ index: 0, sql: "SELECT …", start: 0, end: 8, classification: { kind: "read", missing_where: false, keyword: "SELECT" } }],
+      },
+      fetch_page: { view_rows: ROWS.length, total_rows: ROWS.length, offset: 0, row_ids: ROWS.map((_, i) => i), rows: ROWS },
+      kn_table_notes: { target: "public.orders", notes: [] },
+      table_layout: {
+        indexes: [
+          { name: "orders_pkey", columns: ["id"], unique: true, primary: true },
+          { name: "orders_status_idx", columns: ["status"], unique: false, primary: false, method: "btree" },
+        ],
+        partition_by: ["created_at"],
+        partition_kind: "range",
+        cluster_by: [],
+        requires_partition_filter: false,
+        notes: [],
+      },
+    }),
+  );
+  // The catalog reads, by what they ask for.
+  await page.evaluate(() => {
+    (window as unknown as { __DB_MOCK__: { handlers: Record<string, unknown> } }).__DB_MOCK__.handlers.explore_query = (a: { sql: string }) =>
+      a.sql.includes("pg_stat_all_indexes")
+        ? { columns: ["name", "scans", "bytes"], rows: [["orders_pkey", "1200", "16384"], ["orders_status_idx", "0", "8192"]], duration_ms: 2 }
+        : a.sql.includes("pg_trigger")
+          ? { columns: ["what", "name", "definition"], rows: [["trigger", "audit_orders", "CREATE TRIGGER audit_orders AFTER UPDATE ON public.orders"]], duration_ms: 3 }
+          : { columns: ["what", "name", "definition"], rows: [["check", "positive_total", "CHECK ((total > (0)::numeric))"]], duration_ms: 3 };
+  });
+  const tree = page.getByRole("treeitem");
+  await tree.filter({ hasText: "Shop" }).first().click();
+  await tree.filter({ hasText: /^orders/ }).dblclick();
+  const tab = page.getByLabel(/^Table .*orders/);
+  await expect(tab).toBeVisible();
+
+  await tab.getByRole("tab", { name: /^Indexes/ }).click();
+  await expect(tab.getByText("orders_status_idx")).toBeVisible();
+  await expect(tab.getByText("primary key")).toBeVisible();
+  await expect(tab.getByText("1,200")).toBeVisible();
+  // A plain index never used: marked (the primary key's scans aren't its job).
+  await expect(tab.getByTitle(/^Never used for a scan/)).toHaveCount(1);
+  await expect(tab.getByText(/Partitioned by range on/)).toBeVisible();
+  await expect(tab.getByText("positive_total")).toBeVisible();
+  await expect(tab.getByText("audit_orders", { exact: true })).toBeVisible();
+  // Catalog reads, as the explorer's (one read each, in the history).
+  const reads = (await calls(page, "explore_query")) as { sql: string }[];
+  expect(reads.some((r) => r.sql.includes("pg_constraint"))).toBe(true);
+  expect(reads.some((r) => r.sql.includes("pg_trigger"))).toBe(true);
+
+  await tab.getByRole("tab", { name: /^History/ }).click();
+  await expect(tab.getByText(/doesn't keep earlier versions of a table's rows/)).toBeVisible();
+});
+
+test("Indexes on MySQL: MariaDB's form of the checks fails, MySQL's runs next, and the triggers are read apart", async ({ page }) => {
+  const my = { ...SHOP, config: { ...SHOP.config, kind: "mysql" } };
+  await openApp(
+    page,
+    backend({
+      list_connections: [my],
+      run_query: { status: "started", job_id: "job-m", statements: [] },
+      kn_table_notes: { target: "public.orders", notes: [] },
+      table_layout: { indexes: [], partition_by: [], cluster_by: [], requires_partition_filter: false, notes: [] },
+    }),
+  );
+  await page.evaluate(() => {
+    (window as unknown as { __DB_MOCK__: { handlers: Record<string, unknown> } }).__DB_MOCK__.handlers.explore_query = (a: { sql: string }) =>
+      a.sql.includes("cc.TABLE_NAME")
+        ? { __error: { kind: "query", message: "Unknown column 'cc.TABLE_NAME' in 'on clause'" } }
+        : a.sql.includes("TRIGGERS")
+          ? { columns: ["what", "name", "definition"], rows: [], duration_ms: 1 }
+          : { columns: ["what", "name", "definition"], rows: [["check", "qty_positive", "(`qty` > 0)"]], duration_ms: 1 };
+  });
+  const tree = page.getByRole("treeitem");
+  await tree.filter({ hasText: "Shop" }).first().click();
+  await tree.filter({ hasText: /^orders/ }).dblclick();
+  const tab = page.getByLabel(/^Table .*orders/);
+  await expect(tab).toBeVisible();
+  await tab.getByRole("tab", { name: /^Indexes/ }).click();
+  await expect(tab.getByText("qty_positive")).toBeVisible();
+  await expect(tab.getByText(/couldn't be read/)).toHaveCount(0);
+  const checks = ((await calls(page, "explore_query")) as { sql: string }[]).filter((r) => r.sql.includes("CHECK_CONSTRAINTS"));
+  expect(checks.map((r) => r.sql.includes("cc.TABLE_NAME"))).toEqual([true, false]);
+});

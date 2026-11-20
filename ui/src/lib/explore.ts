@@ -392,3 +392,215 @@ export function readProfile(rows: ExploreRows, count: number): { total: number |
   };
 }
 
+
+// ------------------------------------------------------------------ step 4: constraints, index use, history
+
+/** Why a database has no checks or triggers here, or `null` when it has them. */
+function noConstraints(kind: ConnectorKind, local?: "results" | "files"): string | null {
+  if (kind === "mongodb") return "MongoDB has no constraints or triggers on a collection (its validator is in the collection's options)";
+  if (kind === "neo4j") return "Neo4j constraints are on labels, not read here yet";
+  if (local) return "A result or a file read by DuckDB has no constraints";
+  if (kind === "snowflake" || kind === "bigquery") return `${traitsOf(kind).name} has no check constraints or triggers (its keys are informational, listed in Columns)`;
+  if (kind === "clickhouse") return "ClickHouse checks are in the table's DDL (the DDL part), and it has no triggers";
+  return null;
+}
+
+/**
+ * The table's check constraints (unique keys and the primary key are among
+ * its indexes), as alternatives tried in order until one runs (MariaDB's
+ * form, then MySQL's; Oracle 12.2+, then older): rows of `what` (`check`,
+ * `exclusion`), `name`, `definition`. Databricks answers with its table
+ * properties (`key`, `value`): read with {@link readConstraints}. Read
+ * apart from the triggers, so one failing doesn't lose the other.
+ */
+export function checksSql(kind: ConnectorKind, schema: string, table: string, local?: "results" | "files"): Built[] {
+  const why = noConstraints(kind, local);
+  if (why) return [{ unavailable: why }];
+  const s = (v: string) => sqlString(kind, v);
+  const [db, sch] = split(kind, schema);
+  switch (kind) {
+    case "postgres":
+      return [
+        {
+          sql: `SELECT CASE con.contype WHEN 'c' THEN 'check' ELSE 'exclusion' END AS what, con.conname AS name, pg_get_constraintdef(con.oid) AS definition
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace ns ON ns.oid = c.relnamespace
+WHERE ns.nspname = ${s(schema)} AND c.relname = ${s(table)} AND con.contype IN ('c', 'x')
+ORDER BY 2`,
+        },
+      ];
+    case "mysql": {
+      // MariaDB names checks per table (CONSTRAINT_1 in several tables):
+      // its CHECK_CONSTRAINTS has TABLE_NAME. MySQL's (8.0.16+) names them
+      // per schema and has no TABLE_NAME: the second form.
+      const body = (extra: string) => `SELECT 'check' AS what, cc.CONSTRAINT_NAME AS name, cc.CHECK_CLAUSE AS definition
+FROM information_schema.CHECK_CONSTRAINTS cc
+JOIN information_schema.TABLE_CONSTRAINTS tc ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME${extra}
+WHERE tc.TABLE_SCHEMA = ${s(schema)} AND tc.TABLE_NAME = ${s(table)} AND tc.CONSTRAINT_TYPE = 'CHECK'`;
+      return [{ sql: body(" AND cc.TABLE_NAME = tc.TABLE_NAME") }, { sql: body("") }];
+    }
+    case "mssql": {
+      const p = db ? `${quoteIdent(kind, db)}.sys.` : "sys.";
+      return [
+        {
+          sql: `SELECT 'check' AS what, cc.name AS name, cc.definition AS definition
+FROM ${p}check_constraints cc
+JOIN ${p}objects o ON o.object_id = cc.parent_object_id
+JOIN ${p}schemas sc ON sc.schema_id = o.schema_id
+WHERE sc.name = N${s(sch)} AND o.name = N${s(table)}`,
+        },
+      ];
+    }
+    case "oracle": {
+      // A NOT NULL column is a check the system names: left out (Columns shows it).
+      const notNull = "NOT (generated = 'GENERATED NAME' AND search_condition_vc LIKE '% IS NOT NULL')";
+      return [
+        { sql: `SELECT 'check' AS what, constraint_name AS name, search_condition_vc AS definition
+FROM all_constraints
+WHERE owner = ${s(schema)} AND table_name = ${s(table)} AND constraint_type = 'C' AND ${notNull}` },
+        // Before 12.2 the condition is only a LONG (not readable here): the user-named checks' names.
+        { sql: `SELECT 'check' AS what, constraint_name AS name, '(its condition is in the DDL)' AS definition
+FROM all_constraints
+WHERE owner = ${s(schema)} AND table_name = ${s(table)} AND constraint_type = 'C' AND generated = 'USER NAME'` },
+      ];
+    }
+    case "duckdb":
+      return [
+        {
+          sql: `SELECT 'check' AS what, '' AS name, constraint_text AS definition
+FROM duckdb_constraints()
+WHERE ${db ? `database_name = ${s(db)} AND ` : ""}schema_name = ${s(sch)} AND table_name = ${s(table)} AND constraint_type = 'CHECK'`,
+        },
+      ];
+    case "sqlite":
+      return [{ unavailable: "SQLite checks are only in the table's DDL (the DDL part)" }];
+    case "databricks":
+      // Delta CHECK constraints are table properties `delta.constraints.<name>`.
+      return [{ sql: `SHOW TBLPROPERTIES ${qualifiedName(kind, schema, table)}` }];
+    default:
+      return [{ unavailable: `${traitsOf(kind).name} constraints aren't read yet` }];
+  }
+}
+
+/** The table's triggers: rows of `what` (`trigger`), `name`, `definition`. */
+export function triggersSql(kind: ConnectorKind, schema: string, table: string, local?: "results" | "files"): Built {
+  const why = noConstraints(kind, local);
+  if (why) return { unavailable: why };
+  const s = (v: string) => sqlString(kind, v);
+  const [db, sch] = split(kind, schema);
+  switch (kind) {
+    case "postgres":
+      return {
+        sql: `SELECT 'trigger' AS what, t.tgname AS name, pg_get_triggerdef(t.oid) AS definition
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace ns ON ns.oid = c.relnamespace
+WHERE ns.nspname = ${s(schema)} AND c.relname = ${s(table)} AND NOT t.tgisinternal
+ORDER BY 2`,
+      };
+    case "mysql":
+      return {
+        sql: `SELECT 'trigger' AS what, TRIGGER_NAME AS name, CONCAT(ACTION_TIMING, ' ', EVENT_MANIPULATION, ' FOR EACH ROW ', ACTION_STATEMENT) AS definition
+FROM information_schema.TRIGGERS
+WHERE EVENT_OBJECT_SCHEMA = ${s(schema)} AND EVENT_OBJECT_TABLE = ${s(table)}`,
+      };
+    case "mssql": {
+      const p = db ? `${quoteIdent(kind, db)}.sys.` : "sys.";
+      return {
+        sql: `SELECT 'trigger' AS what, tr.name AS name, CASE WHEN tr.is_disabled = 1 THEN 'disabled' ELSE 'enabled' END + CASE WHEN tr.is_instead_of_trigger = 1 THEN ', instead of' ELSE '' END AS definition
+FROM ${p}triggers tr
+JOIN ${p}objects o ON o.object_id = tr.parent_id
+JOIN ${p}schemas sc ON sc.schema_id = o.schema_id
+WHERE sc.name = N${s(sch)} AND o.name = N${s(table)}`,
+      };
+    }
+    case "oracle":
+      return { sql: `SELECT 'trigger' AS what, trigger_name AS name, trigger_type || ' ' || triggering_event || ' (' || status || ')' AS definition
+FROM all_triggers
+WHERE table_owner = ${s(schema)} AND table_name = ${s(table)}` };
+    case "sqlite":
+      return { sql: `SELECT 'trigger' AS what, name, sql AS definition
+FROM ${quoteIdent(kind, schema)}.sqlite_master
+WHERE type = 'trigger' AND tbl_name = ${s(table)}` };
+    case "duckdb":
+    case "databricks":
+      return { unavailable: `${traitsOf(kind).name} has no triggers` };
+    default:
+      return { unavailable: `${traitsOf(kind).name} triggers aren't read yet` };
+  }
+}
+
+/** A check, exclusion or trigger of the table. */
+export type Constraint = { what: string; name: string; definition: string };
+
+/** The rows of {@link checksSql} and {@link triggersSql} (Databricks: its `delta.constraints.*` properties). */
+export function readConstraints(kind: ConnectorKind, rows: ExploreRows): Constraint[] {
+  const at = (n: string) => rows.columns.findIndex((c) => c.toLowerCase() === n);
+  if (kind === "databricks") {
+    const [k, v] = [at("key"), at("value")];
+    return rows.rows.flatMap((r) => {
+      const key = r[k] ?? "";
+      return key.startsWith("delta.constraints.") ? [{ what: "check", name: key.slice("delta.constraints.".length), definition: r[v] ?? "" }] : [];
+    });
+  }
+  const [w, n, d] = [at("what"), at("name"), at("definition")];
+  return rows.rows.map((r) => ({ what: r[w] ?? "", name: r[n] ?? "", definition: r[d] ?? "" }));
+}
+
+/** How often each index was used and its size, where the database keeps it (`name`, `scans`, `bytes`). */
+export function indexUseSql(kind: ConnectorKind, schema: string, table: string): Built {
+  if (kind !== "postgres") return { unavailable: `${traitsOf(kind).name}: index use isn't read` };
+  const s = (v: string) => sqlString(kind, v);
+  return {
+    sql: `SELECT s.indexrelname AS name, s.idx_scan AS scans, pg_relation_size(s.indexrelid) AS bytes
+FROM pg_stat_all_indexes s
+WHERE s.schemaname = ${s(schema)} AND s.relname = ${s(table)}`,
+  };
+}
+
+/** Databases that keep earlier versions of a table's rows, and how they are read. */
+export type HistoryKind = "versions" | "as_of" | null;
+
+/** Databricks lists versions (Delta history); Snowflake and BigQuery read the rows as of a time (time travel). */
+export function historyKind(kind: ConnectorKind): HistoryKind {
+  return kind === "databricks" ? "versions" : kind === "snowflake" || kind === "bigquery" ? "as_of" : null;
+}
+
+/** The latest versions of a Delta table (Databricks `DESCRIBE HISTORY`). */
+export function historySql(kind: ConnectorKind, schema: string, table: string, n = 50): Built {
+  if (kind !== "databricks") return { unavailable: "Only Delta tables (Databricks) list their versions" };
+  return { sql: `DESCRIBE HISTORY ${qualifiedName(kind, schema, table)} LIMIT ${n}` };
+}
+
+/** A time typed for "as of": a date, or a date and time (to the second). */
+export const AS_OF_TIME = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$/;
+
+/**
+ * The first rows of the table as they were: at a Delta `version`, or at a
+ * time (`at`, checked against {@link AS_OF_TIME}; the database's time zone).
+ * For a query tab: nothing runs until the user runs it.
+ */
+export function asOfSql(kind: ConnectorKind, schema: string, table: string, at: { version: number } | { time: string }, n = 100): Built {
+  const q = qualifiedName(kind, schema, table);
+  if ("time" in at && !AS_OF_TIME.test(at.time.trim())) return { unavailable: "Write a date, or a date and time (2026-11-20 08:30)" };
+  const time = "time" in at ? at.time.trim().replace("T", " ") : "";
+  switch (kind) {
+    case "databricks":
+      return { sql: "version" in at ? `SELECT *\nFROM ${q} VERSION AS OF ${Math.trunc(at.version)}\nLIMIT ${n}` : `SELECT *\nFROM ${q} TIMESTAMP AS OF '${time}'\nLIMIT ${n}` };
+    case "snowflake":
+      if ("version" in at) return { unavailable: "Snowflake reads a table as of a time, not a version" };
+      return { sql: `SELECT *\nFROM ${q} AT(TIMESTAMP => '${time}'::TIMESTAMP_LTZ)\nLIMIT ${n}` };
+    case "bigquery":
+      if ("version" in at) return { unavailable: "BigQuery reads a table as of a time, not a version" };
+      return { sql: `SELECT *\nFROM ${q} FOR SYSTEM_TIME AS OF TIMESTAMP '${time}'\nLIMIT ${n}` };
+    default:
+      return { unavailable: `${traitsOf(kind).name} doesn't keep earlier versions of a table's rows` };
+  }
+}
+
+/** Rows written, from Delta's operation metrics (`numOutputRows`), as the database printed the map. */
+export const rowsWritten = (metrics: string | null) => {
+  const m = metrics?.match(/numOutputRows\W+(\d+)/);
+  return m ? Number(m[1]) : null;
+};
