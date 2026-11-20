@@ -10,14 +10,14 @@ A desktop SQL client for many databases, with column lineage, scheduled jobs and
 
 | Platform | Installer |
 |---|---|
-| macOS (Apple Silicon) | [DataBrain_0.5.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain_0.5.0_aarch64.dmg) |
-| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.5.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain-no-duckdb_0.5.0_aarch64.dmg) |
-| macOS (Intel) | [DataBrain_0.5.0_x64.dmg](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain_0.5.0_x64.dmg) |
-| Windows | [DataBrain_0.5.0_x64-setup.exe](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain_0.5.0_x64-setup.exe) |
-| Windows (MSI) | [DataBrain_0.5.0_x64_en-US.msi](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain_0.5.0_x64_en-US.msi) |
-| Linux (AppImage) | [DataBrain_0.5.0_amd64.AppImage](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain_0.5.0_amd64.AppImage) |
-| Linux (Debian, Ubuntu) | [DataBrain_0.5.0_amd64.deb](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain_0.5.0_amd64.deb) |
-| Linux (Fedora, RHEL) | [DataBrain-0.5.0-1.x86_64.rpm](https://github.com/toan1804/databrain/releases/download/v0.5.0/DataBrain-0.5.0-1.x86_64.rpm) |
+| macOS (Apple Silicon) | [DataBrain_0.5.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain_0.5.1_aarch64.dmg) |
+| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.5.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain-no-duckdb_0.5.1_aarch64.dmg) |
+| macOS (Intel) | [DataBrain_0.5.1_x64.dmg](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain_0.5.1_x64.dmg) |
+| Windows | [DataBrain_0.5.1_x64-setup.exe](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain_0.5.1_x64-setup.exe) |
+| Windows (MSI) | [DataBrain_0.5.1_x64_en-US.msi](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain_0.5.1_x64_en-US.msi) |
+| Linux (AppImage) | [DataBrain_0.5.1_amd64.AppImage](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain_0.5.1_amd64.AppImage) |
+| Linux (Debian, Ubuntu) | [DataBrain_0.5.1_amd64.deb](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain_0.5.1_amd64.deb) |
+| Linux (Fedora, RHEL) | [DataBrain-0.5.1-1.x86_64.rpm](https://github.com/toan1804/databrain/releases/download/v0.5.1/DataBrain-0.5.1-1.x86_64.rpm) |
 
 All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page, with a `SHA256SUMS` file to check downloads ([how](docs/RELEASING.md#checksums-and-provenance)). The app checks for updates once a day and installs one from its banner (**Update and relaunch**); Linux `.deb` and `.rpm` installs link to the download instead.
 

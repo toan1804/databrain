@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.5.1 - 2026-11-20
+
 ### Added
 
 - **`dbr --help` and `--version`:** `dbr --help` (`-h`, or `dbr` alone) prints its options, examples, exit codes and where it is installed; `dbr jobs --help` the jobs commands; `-v`/`--version` the version (`databrain-jobs --version` too). The README has a "Command line" section.
