@@ -1,9 +1,11 @@
 // Table explorer: one tab per table or view that gathers what DataBrain
-// knows and can read about it: sample rows, columns with their profile,
-// statistics, relations, usage, indexes, history, DDL and notes (see
+// knows and can read about it: columns with their profile, sample rows,
+// statistics, relations, usage, indexes, partitions, permissions,
+// history, DDL and notes (see
 // docs/TODO.md "Table explorer" for what each part leaves out).
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { AlertTriangle, BarChart3, FileCode2, Hash, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Square, Table2 } from "lucide-react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { AlertTriangle, BarChart3, Copy, FileCode2, Hash, Key, Link2, Loader2, NotebookPen, Play, RefreshCw, Shuffle, Square, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { RESULTS_SCHEMA_ID, tablePath } from "../lib/catalog";
 import { traitsOf } from "../lib/sourceTraits";
@@ -14,22 +16,25 @@ import { useStore, type DdlRef } from "../store";
 import { DdlTab } from "./DdlTab";
 import { RelationsPart, UsagePart } from "./TableRelations";
 import { HistoryPart, IndexesPart } from "./TableHistory";
+import { PartitionsPart, PermissionsPart } from "./TableAccess";
 import { localFrom, RanSql, useExploreRead, type Explore } from "./tableExplore";
 import { ResultsPanel } from "./ResultsPanel";
 import { ConnDot, EnvBadge } from "./ui";
 import { objectRef, selectTop } from "./CatalogSearch";
 
-type Part = "data" | "columns" | "stats" | "relations" | "usage" | "indexes" | "history" | "ddl" | "notes";
+type Part = "columns" | "data" | "stats" | "relations" | "usage" | "indexes" | "partitions" | "permissions" | "history" | "ddl" | "notes";
 type Detail = { status: "loading" } | { status: "ready"; detail: ObjectDetail } | { status: "error"; message: string };
 type Notes = { status: "loading" } | { status: "ready"; notes: TableNotes } | { status: "error"; message: string };
 
 export function TableTab({ tabId, reference, visible }: { tabId: string; reference: DdlRef; visible: boolean }) {
   const tab = useStore((s) => s.tabs.find((t) => t.id === tabId));
   const conn = useStore((s) => s.connections.find((c) => c.id === tab?.connection_id));
-  const [part, setPart] = useState<Part>("data");
+  // Columns first: what the table is, read from the catalog. Data reads
+  // rows when it is opened.
+  const [part, setPart] = useState<Part>("columns");
   // Parts opened so far stay mounted (hidden): Data keeps its rows, settings
   // and SQL, the DDL isn't read again.
-  const [opened, setOpened] = useState<ReadonlySet<Part>>(new Set(["data"]));
+  const [opened, setOpened] = useState<ReadonlySet<Part>>(new Set(["columns"]));
   const [detail, setDetail] = useState<Detail>({ status: "loading" });
   const [notes, setNotes] = useState<Notes>({ status: "loading" });
   const [detailSeq, setDetailSeq] = useState(0);
@@ -72,12 +77,14 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
   const noteList = notes.status === "ready" ? notes.notes.notes : [];
   const explore: Explore = { tabId, conn, reference, rowEstimate: object?.row_estimate ?? null, asked: heavyAsked };
   const parts: { key: Part; label: string; count?: number }[] = [
-    { key: "data", label: "Data" },
     { key: "columns", label: "Columns", count: d ? columns.length : undefined },
+    { key: "data", label: "Data" },
     { key: "stats", label: "Statistics" },
     { key: "relations", label: "Relations" },
     { key: "usage", label: "Usage" },
     { key: "indexes", label: "Indexes" },
+    { key: "partitions", label: "Partitions" },
+    { key: "permissions", label: "Permissions" },
     { key: "history", label: "History" },
     { key: "ddl", label: "DDL" },
     { key: "notes", label: "Notes", count: noteList.length || undefined },
@@ -123,7 +130,7 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
             <RefreshCw size={12} className={detail.status === "loading" ? "animate-spin" : ""} />
           </button>
         </div>
-        {object?.comment && <div className="truncate text-[11.5px] text-muted" title={object.comment}>{object.comment}</div>}
+        {object?.comment?.trim() && <Description text={object.comment.trim()} />}
         <div className="flex flex-wrap items-center gap-1">
           <button className="btn-ghost border border-line py-0.5 text-[12px]" onClick={() => selectTop(conn, { schema: reference.schema, name: reference.name, kind: reference.kind })} title="A new query tab with its first 100 rows">
             <Play size={12} /> Query
@@ -169,11 +176,36 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
         {slot("relations", <RelationsPart conn={conn} reference={reference} detail={d} />)}
         {slot("usage", <UsagePart conn={conn} reference={reference} />)}
         {slot("indexes", <IndexesPart explore={explore} />)}
+        {slot("partitions", <PartitionsPart explore={explore} />)}
+        {slot("permissions", <PermissionsPart explore={explore} />)}
         {slot("history", <HistoryPart explore={explore} />)}
         {/* The DDL view as Show DDL opens it, in this tab (read once). */}
         {slot("ddl", <DdlTab tabId={tabId} reference={reference} visible={visible && part === "ddl"} />)}
         {slot("notes", <NotesPart conn={conn} notes={notes} onSaved={() => setNotesSeq((n) => n + 1)} />)}
       </div>
+    </div>
+  );
+}
+
+/** The table's description: up to three lines, the rest scrolls; selectable, with Copy. */
+function Description({ text }: { text: string }) {
+  return (
+    <div className="group flex items-start gap-1">
+      <div className="max-h-[4.5em] min-w-0 flex-1 select-text overflow-y-auto whitespace-pre-wrap break-words text-[11.5px] leading-[1.5em] text-muted" aria-label="Description">
+        {text}
+      </div>
+      <button
+        className="icon-btn h-5 w-5 shrink-0 opacity-60 group-hover:opacity-100"
+        onClick={() =>
+          void writeText(text)
+            .then(() => useStore.getState().toast("Description copied", "success"))
+            .catch(() => useStore.getState().toast("Couldn't copy the description", "error"))
+        }
+        title="Copy the description"
+        aria-label="Copy the description"
+      >
+        <Copy size={11} />
+      </button>
     </div>
   );
 }

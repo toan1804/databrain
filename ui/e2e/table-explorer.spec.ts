@@ -32,7 +32,12 @@ test.describe("table explorer", () => {
     const tab = page.getByLabel(/^Table .*orders/);
     await expect(tab).toBeVisible();
     await expect(page.getByRole("tab", { name: /orders/ }).first()).toBeVisible();
-    // Data: the first 100 rows run at once, on the table tab's own run.
+    // Columns first: no rows are read until Data is opened.
+    await expect(tab.getByRole("tab", { name: /^Columns/ })).toHaveAttribute("aria-selected", "true");
+    await expect(tab.getByRole("cell", { name: "customer_id" })).toBeVisible();
+    expect(await calls(page, "run_query")).toHaveLength(0);
+    // Data: the first 100 rows run when it opens, on the table tab's own run.
+    await tab.getByRole("tab", { name: "Data" }).click();
     await expect.poll(async () => (await calls(page, "run_query")).length).toBe(1);
     const req = (await calls(page, "run_query"))[0].req as { tab_id: string; sql: string; row_limit: number; origin?: string };
     // As the explorer's: one read only, and so in the history.
@@ -132,6 +137,7 @@ test("on BigQuery the sample doesn't run on opening, and Run says what it bills 
   }
   await tree.filter({ hasText: /^orders/ }).dblclick();
   const tab = page.getByLabel(/^Table .*orders/);
+  await tab.getByRole("tab", { name: "Data" }).click();
   await expect(tab.getByText(/Press Run to read sample rows/)).toBeVisible();
   expect(await calls(page, "run_query")).toHaveLength(0);
   await tab.getByRole("button", { name: "Run" }).click();
@@ -155,6 +161,7 @@ test("on a production connection the sample asks once per tab before it reads", 
   await tree.filter({ hasText: "Shop" }).first().click();
   await tree.filter({ hasText: /^orders/ }).dblclick();
   const tab = page.getByLabel(/^Table .*orders/);
+  await tab.getByRole("tab", { name: "Data" }).click();
   await expect(tab.getByText(/production connection, so they aren't read on opening/)).toBeVisible();
   expect(await calls(page, "run_query")).toHaveLength(0);
   await tab.getByRole("button", { name: "Run" }).click();

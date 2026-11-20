@@ -188,7 +188,7 @@ export function sqlString(kind: ConnectorKind, s: string): string {
 }
 
 /** `db.schema` of three-level names (the first dot), else `[null, schema]`. */
-function split(kind: ConnectorKind, schema: string): [string | null, string] {
+export function split(kind: ConnectorKind, schema: string): [string | null, string] {
   const levels = traitsOf(kind).levels;
   const i = schema.indexOf(".");
   if ((levels === "three" || levels === "three_without_database") && i > 0) return [schema.slice(0, i), schema.slice(i + 1)];
