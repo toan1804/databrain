@@ -396,7 +396,8 @@ impl Session for OracleSession {
         {
             l.partition_by = p.iter().filter_map(|r| r[0].clone()).collect();
             l.partition_kind = p.first().and_then(|r| r[1].clone());
-            if let Some(n) = p.first().and_then(|r| r[2].clone()) {
+            // An INTERVAL table's count is the most it may have (1048575), not how many it has.
+            if let Some(n) = p.first().and_then(|r| r[2].clone()).filter(|n| n != "1048575") {
                 l.notes.push(format!("{n} partitions"));
             }
         }
