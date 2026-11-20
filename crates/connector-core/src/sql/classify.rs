@@ -165,7 +165,7 @@ fn classify_sql(sql: &str, kind: ConnectorKind, parse: &Parse) -> Classification
             // it does, so it isn't trusted as one (T-SQL runs `SELECT 1 DENY
             // …` as two statements without a separator, and a list of words
             // that act always misses some).
-            if k == StatementKind::Read && !(kind == ConnectorKind::Databricks && delta_describe(sql)) {
+            if k == StatementKind::Read {
                 k = StatementKind::Unknown;
             }
             // Unparseable session or transaction control: what follows the
@@ -533,20 +533,19 @@ fn check_control(kind: StatementKind, keyword: &str, sql: &str) -> StatementKind
     if !transaction_form || acts { StatementKind::Unknown } else { kind }
 }
 
-/// Unparsed transaction control that is only that: every word after the
-/// first is transaction grammar (`START TRANSACTION WITH CONSISTENT
-/// SNAPSHOT`, `BEGIN DISTRIBUTED TRANSACTION`), except a transaction name as
-/// the last word after `TRAN`/`TRANSACTION` (`begin tran t1`) that isn't a
-/// statement of its own (`begin tran` then `shutdown`).
 /// Databricks' `DESCRIBE HISTORY <table> [LIMIT n]` and `DESCRIBE DETAIL
 /// <table>`, which the parser doesn't read: they read the Delta log only.
 /// Exactly that form: a name of up to three parts, plain or in backticks,
-/// and nothing else (no comment, string or second statement).
-fn delta_describe(sql: &str) -> bool {
-    let s = sql.trim();
+/// and nothing else (no comment, string or second statement). Not a read
+/// for [`classify`]: the history holds users' names and past writes'
+/// conditions with their values, which PII masking can't see in it, so
+/// the AI and MCP are asked; the table explorer reads it
+/// ([`super::Checked::explorer_read`]).
+pub fn delta_describe(sql: &str) -> bool {
+    let s = sql.trim_ascii();
     let mut rest = s;
     let mut word = |want: &str| -> bool {
-        let t = rest.trim_start();
+        let t = rest.trim_ascii_start();
         let n = t.chars().take_while(|c| c.is_ascii_alphabetic()).count();
         let ok = n > 0 && t[..n].eq_ignore_ascii_case(want) && t.len() > n && t[n..].starts_with(|c: char| c.is_ascii_whitespace());
         if ok {
@@ -562,7 +561,7 @@ fn delta_describe(sql: &str) -> bool {
         return false;
     }
     // The name: up to three parts.
-    let mut t = rest.trim_start();
+    let mut t = rest.trim_ascii_start();
     for part in 0..3 {
         if let Some(q) = t.strip_prefix('`') {
             // `` inside backticks is one backtick.
@@ -595,15 +594,20 @@ fn delta_describe(sql: &str) -> bool {
             None => break,
         }
     }
-    let t = t.trim_start();
+    let t = t.trim_ascii_start();
     if t.is_empty() {
         return true;
     }
     // HISTORY takes a LIMIT of digits, and nothing follows it.
-    let Some(n) = t.get(..5).filter(|w| history && w.eq_ignore_ascii_case("LIMIT")).map(|_| t[5..].trim_start()) else { return false };
+    let Some(n) = t.get(..5).filter(|w| history && w.eq_ignore_ascii_case("LIMIT")).map(|_| t[5..].trim_ascii_start()) else { return false };
     t.len() > 5 && t.as_bytes()[5].is_ascii_whitespace() && !n.is_empty() && n.len() <= 9 && n.bytes().all(|c| c.is_ascii_digit())
 }
 
+/// Unparsed transaction control that is only that: every word after the
+/// first is transaction grammar (`START TRANSACTION WITH CONSISTENT
+/// SNAPSHOT`, `BEGIN DISTRIBUTED TRANSACTION`), except a transaction name as
+/// the last word after `TRAN`/`TRANSACTION` (`begin tran t1`) that isn't a
+/// statement of its own (`begin tran` then `shutdown`).
 fn transaction_grammar(sql: &str) -> bool {
     const GRAMMAR: &[&str] = &[
         "TRAN",
@@ -1006,10 +1010,10 @@ mod tests {
     use ConnectorKind::*;
 
     /// The explorer's History and Statistics on Databricks: these forms are
-    /// reads; anything more, or on another database, isn't trusted.
+    /// its reads; anything more isn't.
     #[test]
     fn delta_describe_forms() {
-        let c = |s: &str| classify(s, Databricks).kind;
+        let c = |s: &str| if delta_describe(s) { StatementKind::Read } else { StatementKind::Unknown };
         for read in [
             "DESCRIBE HISTORY `main`.`sales`.`orders` LIMIT 50",
             "describe history sales.orders",
@@ -1029,10 +1033,13 @@ mod tests {
             "DESCRIBE DETAIL t LIMIT 5",
             "DESCRIBE HISTORY t LIMIT 5 6",
             "DESCRIBE HISTORY 't' LIMIT 5",
+            "DESCRIBE HISTORY t\u{a0}LIMIT 5",
+            "DESCRIBE HISTORY t\u{2028}LIMIT 5",
         ] {
             assert!(!c(not_read).is_read(), "{not_read}");
         }
-        assert!(!classify("DESCRIBE HISTORY t LIMIT 50", Postgres).kind.is_read());
+        // For the AI and MCP (and the editor) it isn't a read: asked.
+        assert!(!classify("DESCRIBE HISTORY t LIMIT 50", Databricks).kind.is_read());
     }
 
     #[test]

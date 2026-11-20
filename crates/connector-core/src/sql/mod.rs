@@ -19,7 +19,7 @@ mod splitter;
 mod statement;
 
 pub(crate) use classify::keyword_kind;
-pub use classify::{Classification, StatementKind, classify};
+pub use classify::{Classification, StatementKind, classify, delta_describe};
 pub use mark::MarkType;
 pub use params::{ParamSpan, ParamValue, find_parameters, quote_string, render_param, substitute_known_parameters, substitute_parameters};
 pub use parsed::{ParsedStatement, parse_script};

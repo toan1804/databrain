@@ -73,6 +73,18 @@ impl Checked {
     pub fn statement(&self) -> Statement<'_> {
         Statement { sql: &self.sql }
     }
+
+    /// As the table explorer runs it: Databricks' `DESCRIBE HISTORY` and
+    /// `DESCRIBE DETAIL` of a table ([`super::delta_describe`]), which
+    /// [`classify`] leaves unknown for the AI and MCP, are reads there
+    /// (the user opened the table's History or Statistics).
+    pub fn explorer_read(self, kind: ConnectorKind) -> Self {
+        if kind == ConnectorKind::Databricks && self.classification.kind == StatementKind::Unknown && super::delta_describe(&self.sql) {
+            Self { classification: Classification { kind: StatementKind::Read, ..self.classification }, ..self }
+        } else {
+            self
+        }
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +105,18 @@ mod tests {
         assert_ne!(w.unwrap().kind(), StatementKind::Read);
         assert_eq!(c.bind(pg, &HashMap::new()).unwrap_err(), vec!["id".to_string()]);
         assert_eq!(Statement::internal("select 1").sql(), "select 1");
+    }
+
+    /// The table explorer's Delta reads: a read there, asked elsewhere.
+    #[test]
+    fn delta_describe_is_a_read_for_the_explorer_only() {
+        let db = ConnectorKind::Databricks;
+        let h = Checked::new("DESCRIBE HISTORY `main`.`s`.`t` LIMIT 50", db);
+        assert_eq!(h.kind(), StatementKind::Unknown);
+        assert_eq!(h.explorer_read(db).kind(), StatementKind::Read);
+        assert_ne!(Checked::new("DESCRIBE HISTORY t LIMIT 5 DROP TABLE t", db).explorer_read(db).kind(), StatementKind::Read);
+        assert_eq!(Checked::new("drop table t", db).explorer_read(db).kind(), StatementKind::Ddl);
+        let pg = ConnectorKind::Postgres;
+        assert_ne!(Checked::new("DESCRIBE HISTORY t", pg).explorer_read(pg).kind(), StatementKind::Read);
     }
 }
