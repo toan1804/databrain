@@ -3,4 +3,8 @@ import type { ColumnInfo } from "./ColumnInfo";
 import type { DbObject } from "./DbObject";
 import type { ForeignKey } from "./ForeignKey";
 
-export type ObjectDetail = { object: DbObject, columns: Array<ColumnInfo>, ddl?: string, foreign_keys: Array<ForeignKey>, };
+export type ObjectDetail = { object: DbObject, columns: Array<ColumnInfo>, ddl?: string, 
+/**
+ * Always sent (empty when none): the UI reads it as a list.
+ */
+foreign_keys: Array<ForeignKey>, };

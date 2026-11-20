@@ -5,4 +5,8 @@ import type { ForeignKey } from "./ForeignKey";
 /**
  * Column metadata for a whole schema (bulk introspection for knowledge, ER diagrams).
  */
-export type TableColumns = { table: string, columns: Array<ColumnInfo>, foreign_keys: Array<ForeignKey>, };
+export type TableColumns = { table: string, columns: Array<ColumnInfo>, 
+/**
+ * Always sent (empty when none): the UI reads it as a list.
+ */
+foreign_keys: Array<ForeignKey>, };

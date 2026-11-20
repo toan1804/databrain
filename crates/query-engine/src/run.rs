@@ -97,7 +97,13 @@ impl QueryEngine {
         }
         Self::bind_parameters(&mut plan, profile.config.kind, &req.params)?;
         // The table explorer's sample: one read, whatever its `where` box
-        // held (a `;` in it would start another statement).
+        // held (a `;` in it would start another statement). Its Delta
+        // history and detail are reads there (see `Checked::explorer_read`).
+        if req.origin == Origin::Explorer {
+            for p in &mut plan {
+                p.checked = p.checked.clone().explorer_read(profile.config.kind);
+            }
+        }
         if req.origin == Origin::Explorer && !(plan.len() == 1 && plan[0].classification().kind.is_read()) {
             return Err(EngineError::new("invalid", "The table explorer runs one read only: the condition can't end the statement (`;`) or change data"));
         }
