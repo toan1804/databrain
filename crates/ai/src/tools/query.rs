@@ -21,7 +21,28 @@ fn view_catalog<'a>(
     unversioned: Option<&'a std::cell::RefCell<std::collections::HashSet<String>>>,
 ) -> impl Fn(&[String]) -> Option<databrain_lineage::CatalogTable> + 'a {
     move |parts: &[String]| {
-        let (schema, name) = ws.meta_get(connection_id, &parts.join(".")).ok().flatten()?;
+        let reference = parts.join(".");
+        // A view only kept for the AI (the cache lost it) has no kept
+        // definition. When the name means it, or may mean it (a bare name
+        // that also names a cached table elsewhere), or may mean a cached
+        // view as well as something else, which one the server reads isn't
+        // known here: opaque, so masking fails closed rather than taking
+        // a view for a table and checking its columns by their own names.
+        let kept = ws.kept_view(connection_id, &reference).ok().flatten();
+        let cached = ws.meta_find_named(connection_id, &reference).unwrap_or_default();
+        let cached_view = cached.iter().find(|(s, n)| ws.meta_is_view(connection_id, s, n).unwrap_or(false)).cloned();
+        let ambiguous = cached.len() + usize::from(kept.is_some()) > 1 && (kept.is_some() || cached_view.is_some());
+        if kept.is_some() || ambiguous {
+            let (schema, name, columns) = match (&kept, &cached_view) {
+                (Some((s, n, c)), _) => (s.clone(), n.clone(), c.clone()),
+                (None, Some((s, n))) => (s.clone(), n.clone(), ws.kn_column_names(connection_id, s, n).ok().flatten().unwrap_or_default()),
+                (None, None) => return None,
+            };
+            let full = format!("{schema}.{name}");
+            opaque.borrow_mut().insert(full.to_ascii_lowercase());
+            return Some(databrain_lineage::CatalogTable { name: full, columns, view_sql: None });
+        }
+        let (schema, name) = ws.meta_get(connection_id, &reference).ok().flatten()?;
         if !ws.meta_is_view(connection_id, &schema, &name).unwrap_or(false) {
             return None;
         }

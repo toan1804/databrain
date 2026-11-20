@@ -397,6 +397,31 @@ impl Workspace {
         Ok(rows)
     }
 
+    /// A view the AI still has from before the explorer cache lost it
+    /// (`ai_kept`), by `schema.name` or bare `name` as [`Self::meta_get`]
+    /// reads them: (schema, name, column names). Its definition isn't kept,
+    /// so PII masking can't trace it and treats it as one whose definition
+    /// isn't known.
+    pub fn kept_view(&self, connection_id: &str, reference: &str) -> Result<Option<(String, String, Vec<String>)>> {
+        let (schema, name) = crate::paths::split_reference(reference);
+        let row: Option<(String, String, Option<String>)> = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT schema_name, name, columns_json FROM ai_kept \
+                 WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind IN ('view', 'materialized_view') \
+                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
+                 ORDER BY length(schema_name) LIMIT 1",
+                params![connection_id, name, schema],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(s, n, cols)| {
+            let cols = cols.and_then(|j| serde_json::from_str::<Vec<databrain_connector_core::ColumnInfo>>(&j).ok()).unwrap_or_default();
+            (s, n, cols.into_iter().map(|c| c.name).collect())
+        }))
+    }
+
     /// Kept tables not seen for [`KEPT_DAYS`] go (at start, and `now` for
     /// tests), and the AI's tables follow. How many went.
     pub(crate) fn kept_expire(&self, now: i64) -> Result<usize> {
@@ -485,8 +510,25 @@ impl Workspace {
     }
 
     /// The tables the AI may use on this connection, and only those.
+    /// Kept tables past [`KEPT_DAYS`] go first (checked at most hourly, so
+    /// an app left open doesn't keep them longer).
     pub fn ai_catalog<'a>(&'a self, connection_id: &'a str) -> AiCatalog<'a> {
+        self.kept_expire_due(crate::now_ms());
         AiCatalog { ws: self, connection_id }
+    }
+
+    /// [`Self::kept_expire`] when the last check is an hour old (best effort).
+    pub(crate) fn kept_expire_due(&self, now: i64) {
+        use std::sync::atomic::Ordering;
+        let last = self.kept_checked.load(Ordering::Relaxed);
+        if now - last >= 60 * 60 * 1000
+            && self.kept_checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            && let Err(e) = self.kept_expire(now)
+        {
+            // E.g. the other process (app, MCP) writing: again in 5 minutes.
+            self.kept_checked.store(now - 55 * 60 * 1000, Ordering::Relaxed);
+            tracing::warn!("expiring kept tables failed: {e}");
+        }
     }
 }
 
@@ -552,6 +594,16 @@ impl AiCatalog<'_> {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// The allowed tables kept from before the cache lost them, by
+    /// `schema.name`, with when (ms): see [`Self::missing_since`].
+    pub fn kept(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let c = self.ws.conn.lock();
+        let mut st =
+            c.prepare_cached("SELECT schema_name || '.' || name, missing_since FROM ai_objects WHERE connection_id = ?1 AND missing_since IS NOT NULL")?;
+        let rows = st.query_map([self.connection_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// Every table the AI may use, by schema and name.
@@ -943,6 +995,21 @@ mod kept_tests {
         ws.ai_put_rule("c", &ScopeRule { schema: "sales".into(), table: "orders".into(), allow: false }).unwrap();
         assert_eq!(has(&ws), vec![("sales.items".to_string(), true, true)]);
         assert!(ws.ai_catalog("c").search("orders", 5).unwrap().is_empty());
+    }
+
+    /// An app left open expires kept tables too: the AI's reader checks at
+    /// most hourly.
+    #[test]
+    fn kept_tables_expire_while_the_app_stays_open() {
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        let day = 24 * 60 * 60 * 1000;
+        ws.conn.lock().execute("UPDATE ai_kept SET missing_since = missing_since - ?1", [(KEPT_DAYS + 1) * day]).unwrap();
+        // Checked less than an hour ago: still there.
+        assert_eq!(has(&ws).len(), 2);
+        ws.kept_checked.store(crate::now_ms() - 2 * 60 * 60 * 1000, std::sync::atomic::Ordering::Relaxed);
+        assert!(has(&ws).is_empty(), "gone on the next read");
+        assert_eq!(ws.ai_catalog("c").search("amount", 5).unwrap().len(), 0);
     }
 
     #[test]

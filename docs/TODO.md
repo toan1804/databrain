@@ -23,9 +23,8 @@ The review's privacy gaps and bugs were fixed on 2026-11-15 (a connection's rule
 - **Tool arguments are read from loose JSON.** The job tools now refuse a schedule or an export format they can't read, but the other tools still take each field by hand (`args.get(..)`), with undocumented aliases (`insert`, `upsert`, `mirror`). Typed structs (`deny_unknown_fields`) that also produce the schema sent to the model would remove the class.
 - **Table rules and several schemas on a `search_path`**: an unqualified name that may resolve in more than one schema (Postgres `search_path` of several, a SQL Server schema other than `dbo`), or whose schema the server couldn't say, is refused by rules that depend on its schema. Resolving each name on the server (`to_regclass`, `OBJECT_ID`) would allow the ones that are unambiguous. Checked live on Postgres only, not on SQL Server, Snowflake or Databricks.
 - **PII rules and non-SQL views**: MongoDB views (`viewOn`) and other non-SQL sources aren't traced through their definitions; their columns are masked by name only (a rule on a table masks the same column name in the view).
-- **Notes about dropped or renamed tables stay** (hidden from the model, never removed), and there is no limit on the number of notes or proposals.
-- **A schema that becomes empty keeps its tables in the AI's catalog** until the next full index (not confirmed; `kn_replace_schema_read` with an empty list).
-- **Kept tables (`ai_kept`), left for later:** the Knowledge page lists them without a mark (only `describe_table` says "not seen since"; search hits, `list_tables` and the prompt's retrieved tables don't); they expire only when a workspace is opened (an app left running for weeks keeps them longer); an index run that reads a schema as empty leaves its kept tables until they expire; view definitions (`meta_views`, for PII masking through views) are not kept, so a kept view is masked by column name only.
+- **Notes about dropped or renamed tables stay** (hidden from the model, never removed). Approved notes have no limit; the AI's proposals stop at 100 notes and 100 documented joins waiting per connection (two at once, app and MCP, may pass by one).
+- **Kept views and PII masking:** a view's definition isn't kept with it, so a kept view is masked whole where a PII rule names a table (rather than traced) until it is listed again. **`describe_table` offline:** after a connection error the server isn't asked again for a minute, even if it comes back or the connection is edited meanwhile.
 - **Databricks without Unity Catalog:** the schema and catalog lists fall back to `hive_metastore` only when the statement is answered as failed; which error a workspace without the `system` catalog gives wasn't seen on a live one.
 - **Workspace SQLite on the async runtime**: `knowledge::retrieve` and a schema's index write run on the runtime's threads; a learn pass commits once per sighting.
 - **A stream's events are capped, not what they add up to per field:** a stream may send 128 MB in all (a line or an event 32 MB); within that, an answer's text or one tool call's arguments can take all of it.
@@ -66,7 +65,6 @@ A review of the 54 commits since v0.4.1 (PRs #40–#53). Findings were checked o
 
 - In the AI's DuckDB sandbox, an output on disk is copied into a table of its own that also spills to disk, unchecked by `low_disk`.
 - The `get_array_memory_size` entry (buffers shared between batches counted once per batch) was removed from this file in #45 without a fix.
-- `SessionRole::is_ai()` is never used: nothing checks that AI or MCP SQL runs on an AI-role session key.
 
 ## UI (second review, 2026-11-15)
 

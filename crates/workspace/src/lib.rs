@@ -86,6 +86,9 @@ pub fn new_id() -> String {
 
 pub struct Workspace {
     pub(crate) conn: Mutex<Connection>,
+    /// When kept tables were last checked for expiry (ms): at open, then at
+    /// most hourly as the AI reads its tables ([`Workspace::ai_catalog`]).
+    pub(crate) kept_checked: std::sync::atomic::AtomicI64,
 }
 
 impl Workspace {
@@ -157,7 +160,7 @@ impl Workspace {
             tx.commit()?;
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let ws = Self { conn: Mutex::new(conn) };
+        let ws = Self { conn: Mutex::new(conn), kept_checked: std::sync::atomic::AtomicI64::new(0) };
         // A workspace a development build upgraded to an earlier draft of
         // v22 (it changed before it was released): brought to the final one.
         ws.repair_v22()?;
@@ -172,7 +175,7 @@ impl Workspace {
             tracing::warn!("building the AI's table list failed; retried on the next start: {e}");
         }
         // Kept tables not seen for 60 days go (best effort).
-        let _ = ws.kept_expire(now_ms());
+        ws.kept_expire_due(now_ms());
         Ok(ws)
     }
 }

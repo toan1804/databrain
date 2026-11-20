@@ -5,4 +5,9 @@ export type KnObjectPage = { objects: Array<KnObject>,
 /**
  * Objects matching the filter (all pages).
  */
-total: number, };
+total: number, 
+/**
+ * Tables of this page kept from before the explorer cache lost them,
+ * by `schema.name`: when they were last seen (ms).
+ */
+kept: Record<string, number>, };

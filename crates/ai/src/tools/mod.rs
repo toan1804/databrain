@@ -4,6 +4,7 @@
 mod gate;
 mod jobs;
 mod notes;
+pub use notes::MAX_PENDING_NOTES;
 mod query;
 mod schema;
 mod specs;

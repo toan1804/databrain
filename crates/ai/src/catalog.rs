@@ -70,6 +70,12 @@ impl<'a> AiTables<'a> {
         Ok(self.cat.missing_since(&o.schema, &o.name)?)
     }
 
+    /// The tables [`Self::missing_since`] would answer for, by
+    /// `schema.name`: one query for a list of them.
+    pub fn kept(&self) -> Result<std::collections::HashMap<String, i64>> {
+        Ok(self.cat.kept()?)
+    }
+
     pub fn resolve_path(&self, path: &str) -> Result<Option<(KnObject, Option<String>)>> {
         match self.cat.resolve_path(path)?.filter(|(o, _)| self.readable(&o.full_name())) {
             Some((o, c)) => Ok(Some((self.scrub(o)?, c))),
