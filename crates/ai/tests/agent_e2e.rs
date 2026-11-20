@@ -1148,6 +1148,13 @@ async fn knowledge_index_plan_scope_and_cancel() {
     f.ws.kn_clear(&conn).unwrap();
     let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| {}, &Default::default()).await.unwrap();
     assert_eq!((r.objects, r.skipped), (60, 0));
+    // So does clearing the explorer cache, where the AI's tables live: the
+    // next run reads them again instead of skipping every schema as unchanged.
+    f.ws.meta_clear(&conn).unwrap();
+    assert_eq!(f.ws.ai_catalog(&conn).count().unwrap(), 0);
+    let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| {}, &Default::default()).await.unwrap();
+    assert_eq!((r.objects, r.skipped), (60, 0));
+    assert!(f.ws.ai_catalog(&conn).get("lake.s07.t07").unwrap().unwrap().columns.iter().any(|c| c.name == "email"), "read again, with columns");
 
     // Already cancelled before start.
     let done = tokio_util::sync::CancellationToken::new();
