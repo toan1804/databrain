@@ -935,6 +935,31 @@ mod tests {
         let v = s.object_ddl(&me, "KB_THIN_V", ObjectKind::View).await.unwrap().unwrap();
         assert!(v.starts_with("CREATE OR REPLACE VIEW") && v.contains("where id > 10"), "{driver}: {v}");
         run("drop view kb_thin_v").await.unwrap();
+        // A partitioned table's DDL: its first partition and how many more,
+        // and it runs (an INTERVAL table needs a partition in it). Checks
+        // come without a LONG on 12.2+.
+        let _ = run("drop table kb_part purge").await;
+        run("create table kb_part (id number, d date not null, constraint kb_part_ck check (id > 0)) \
+             partition by range (d) interval (numtoyminterval(1, 'MONTH')) (partition p0 values less than (date '2020-01-01'))")
+        .await
+        .unwrap();
+        run("insert into kb_part values (1, date '2024-05-01')").await.unwrap();
+        run("insert into kb_part values (2, date '2024-07-01')").await.unwrap();
+        let p = s.object_ddl(&me, "KB_PART", ObjectKind::Table).await.unwrap().unwrap();
+        assert!(
+            p.contains("PARTITION BY RANGE (\"D\") INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))") && p.contains("PARTITION \"P0\" VALUES LESS THAN (TO_DATE"),
+            "{driver}: {p}"
+        );
+        assert!(p.contains("lists them all") && !p.contains("1048575") && p.contains("CHECK (id > 0)"), "{driver}: {p}");
+        run("drop table kb_part purge").await.unwrap();
+        let create = p.split(";\n").next().unwrap().to_string();
+        s.execute(databrain_connector_core::Statement::internal(&create), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{driver}: {e:?}\n{create}"));
+        run("drop table kb_part purge").await.unwrap();
         let f0 = s.explorer_fingerprints().await.unwrap().unwrap()[&me].clone();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         run("alter table kb_thin add (extra number)").await.unwrap();
