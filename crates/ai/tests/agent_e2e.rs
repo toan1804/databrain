@@ -1743,9 +1743,16 @@ async fn describe_table_offline_answers_from_the_cache_without_waiting_each_time
     // connection itself is unchanged).
     let db = std::path::PathBuf::from(f.ws.get_connection(&f.conn).unwrap().config.file_path.unwrap());
     let moved = db.with_extension("moved");
-    std::fs::rename(&db, &moved).unwrap();
-    std::fs::create_dir(&db).unwrap();
+    // Closed first: Windows doesn't rename a file that is open, and the
+    // pool may take a moment to let it go.
     f.engine.disconnect(&f.conn);
+    let mut tries = 0;
+    while let Err(e) = std::fs::rename(&db, &moved) {
+        tries += 1;
+        assert!(tries < 50, "{e}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    std::fs::create_dir(&db).unwrap();
     let o = ctx().call("describe_table", &json!({"table": "orders"})).await;
     assert!(o.content.contains("customer_id") && o.content.contains("couldn't be reached") && o.content.contains("Not seen on the server"), "{}", o.content);
     // Back: within the minute the server isn't asked again (the answer is
