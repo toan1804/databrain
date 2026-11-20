@@ -18,7 +18,23 @@ fn note_arg(args: &Value) -> Result<&str> {
     Ok(note)
 }
 
+/// Notes the AI may leave waiting for the user's review on a connection:
+/// past this it is told to have them reviewed first, so a model that keeps
+/// proposing can't bury the user's review list.
+pub const MAX_PENDING_NOTES: usize = 100;
+
 impl ToolContext {
+    /// Refuses a new proposal when [`MAX_PENDING_NOTES`] already wait.
+    fn room_for_proposal(&self) -> Result<()> {
+        let waiting = self.engine.workspace().kn_notes(&self.profile.id)?.iter().filter(|n| n.status == NoteStatus::Proposed).count();
+        if waiting >= MAX_PENDING_NOTES {
+            return Err(AiError::Policy(format!(
+                "{waiting} notes already wait for the user's review on this connection (AI panel → Knowledge → Notes): ask the user to review them before proposing more"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn ai_note_status(&self) -> NoteStatus {
         if self.policy().auto_approve_notes { NoteStatus::Approved } else { NoteStatus::Proposed }
     }
@@ -69,6 +85,9 @@ impl ToolContext {
             return Ok(out(format!("An identical note already exists (id {}).", dup.id), json!({"note": dup})));
         }
         let status = self.ai_note_status();
+        if status == NoteStatus::Proposed {
+            self.room_for_proposal()?;
+        }
         let saved = ws.kn_save_note(KnNote {
             id: String::new(),
             connection_id: self.profile.id.clone(),
@@ -103,6 +122,9 @@ impl ToolContext {
             // else's is kept until the user approves the replacement).
             ws.kn_save_note(KnNote { body: note.to_string(), target, ..old.clone() })?
         } else {
+            if status == NoteStatus::Proposed {
+                self.room_for_proposal()?;
+            }
             ws.kn_save_note(KnNote {
                 id: String::new(),
                 connection_id: self.profile.id.clone(),

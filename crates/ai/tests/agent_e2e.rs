@@ -1207,6 +1207,30 @@ async fn knowledge_note_tools_add_list_update() {
     assert!(o.content.contains("review"), "{}", o.content);
     let o = ctx.call("add_knowledge_note", &json!({"note": "STATUS 2 =  shipped"})).await;
     assert!(o.content.contains("identical note already exists"), "no duplicates: {}", o.content);
+    // At most MAX_PENDING_NOTES wait for review: then the AI is told to
+    // have them reviewed. Approved ones don't count.
+    let pending = |body: String| databrain_workspace::KnNote {
+        id: String::new(),
+        connection_id: f.conn.clone(),
+        target: None,
+        body,
+        author: "ai".into(),
+        status: databrain_workspace::NoteStatus::Proposed,
+        created_at: 0,
+        replaces: None,
+    };
+    let filler: Vec<String> = (1..databrain_ai::tools::MAX_PENDING_NOTES).map(|i| f.ws.kn_save_note(pending(format!("filler {i}"))).unwrap().id).collect();
+    let o = ctx.call("add_knowledge_note", &json!({"note": "one too many"})).await;
+    assert!(o.content.contains("wait for the user's review"), "{}", o.content);
+    f.ws.kn_save_note(databrain_workspace::KnNote { status: databrain_workspace::NoteStatus::Approved, id: filler[0].clone(), ..pending("filler 1".into()) })
+        .unwrap();
+    let o = ctx.call("add_knowledge_note", &json!({"note": "room again"})).await;
+    assert!(o.content.contains("review") && !o.content.contains("wait for the user's review"), "{}", o.content);
+    for id in &filler {
+        f.ws.kn_delete_note(id).unwrap();
+    }
+    let extra = f.ws.kn_notes(&f.conn).unwrap().into_iter().find(|n| n.body == "room again").unwrap();
+    f.ws.kn_delete_note(&extra.id).unwrap();
     // A user note the AI later corrects.
     let user =
         f.ws.kn_save_note(databrain_workspace::KnNote {
