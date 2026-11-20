@@ -21,7 +21,16 @@ fn view_catalog<'a>(
     unversioned: Option<&'a std::cell::RefCell<std::collections::HashSet<String>>>,
 ) -> impl Fn(&[String]) -> Option<databrain_lineage::CatalogTable> + 'a {
     move |parts: &[String]| {
-        let (schema, name) = ws.meta_get(connection_id, &parts.join(".")).ok().flatten()?;
+        let reference = parts.join(".");
+        let Some((schema, name)) = ws.meta_get(connection_id, &reference).ok().flatten() else {
+            // A view only kept for the AI (the cache lost it): its
+            // definition isn't kept, so it is opaque. Failing to know it is
+            // a view would mask its columns by their own names only.
+            let (schema, name, columns) = ws.kept_view(connection_id, &reference).ok().flatten()?;
+            let full = format!("{schema}.{name}");
+            opaque.borrow_mut().insert(full.to_ascii_lowercase());
+            return Some(databrain_lineage::CatalogTable { name: full, columns, view_sql: None });
+        };
         if !ws.meta_is_view(connection_id, &schema, &name).unwrap_or(false) {
             return None;
         }

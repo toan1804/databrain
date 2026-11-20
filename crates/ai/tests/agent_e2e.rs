@@ -891,6 +891,16 @@ async fn pii_rules_follow_tables_through_views() {
     // A plain table read stays as before: the rule masks the column itself, not others.
     let o = ctx.call("run_query", &json!({"sql": "select id, country from orders order by id"})).await;
     assert!(o.content.contains("Vietnam") && !o.content.contains("***"), "{}", o.content);
+    // The cache is cleared: the view is only kept for the AI, without its
+    // definition. Masked whole (where it came from isn't known), not by
+    // its columns' own names.
+    f.ws.meta_clear(&conn.id).unwrap();
+    assert!(f.ws.kept_view(&conn.id, "v_people").unwrap().is_some());
+    let o = ctx.call("run_query", &json!({"sql": "select id, reach from v_people order by id"})).await;
+    assert!(!o.content.contains("@x.io"), "kept view: {}", o.content);
+    // A kept table is masked by its rules as before.
+    let o = ctx.call("run_query", &json!({"sql": "select id, country from orders order by id"})).await;
+    assert!(o.content.contains("Vietnam") && !o.content.contains("***"), "{}", o.content);
 }
 
 /// Table access rules: run_query, sample_rows, outputs the user made from a

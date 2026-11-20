@@ -397,6 +397,31 @@ impl Workspace {
         Ok(rows)
     }
 
+    /// A view the AI still has from before the explorer cache lost it
+    /// (`ai_kept`), by `schema.name` or bare `name` as [`Self::meta_get`]
+    /// reads them: (schema, name, column names). Its definition isn't kept,
+    /// so PII masking can't trace it and treats it as one whose definition
+    /// isn't known.
+    pub fn kept_view(&self, connection_id: &str, reference: &str) -> Result<Option<(String, String, Vec<String>)>> {
+        let (schema, name) = crate::paths::split_reference(reference);
+        let row: Option<(String, String, Option<String>)> = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT schema_name, name, columns_json FROM ai_kept \
+                 WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind IN ('view', 'materialized_view') \
+                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
+                 ORDER BY length(schema_name) LIMIT 1",
+                params![connection_id, name, schema],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(s, n, cols)| {
+            let cols = cols.and_then(|j| serde_json::from_str::<Vec<databrain_connector_core::ColumnInfo>>(&j).ok()).unwrap_or_default();
+            (s, n, cols.into_iter().map(|c| c.name).collect())
+        }))
+    }
+
     /// Kept tables not seen for [`KEPT_DAYS`] go (at start, and `now` for
     /// tests), and the AI's tables follow. How many went.
     pub(crate) fn kept_expire(&self, now: i64) -> Result<usize> {
