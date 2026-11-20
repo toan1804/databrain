@@ -541,7 +541,8 @@ pub struct ObjectDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub ddl: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always sent (empty when none): the UI reads it as a list.
+    #[serde(default)]
     pub foreign_keys: Vec<ForeignKey>,
 }
 
@@ -719,7 +720,8 @@ pub struct SchemaMetadata {
 pub struct TableColumns {
     pub table: String,
     pub columns: Vec<ColumnInfo>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always sent (empty when none): the UI reads it as a list.
+    #[serde(default)]
     pub foreign_keys: Vec<ForeignKey>,
 }
 

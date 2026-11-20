@@ -4,6 +4,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- **Table explorer: Columns and Relations on a table without foreign keys:** they failed with "undefined is not an object (evaluating 't.foreign_keys.find')" (any database): a table with no foreign keys was sent without the list.
+- **Table explorer: History on Databricks:** it failed with "The table explorer runs one read only": `DESCRIBE HISTORY` (and `DESCRIBE DETAIL`), which the SQL parser doesn't read, were taken for a statement that may write. Exactly those forms are reads now; anything more still asks.
+
 ## 0.5.0 - 2026-11-20
 
 ### Added
