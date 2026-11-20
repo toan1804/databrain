@@ -9,7 +9,8 @@ import { useStore } from "../../store";
 import { Modal } from "../ui";
 
 /** Whether a connection can change its password here. */
-export const canChangePassword = (conn: ConnectionView) => traitsOf(conn.config.kind).change_password && conn.config.auth.method === "password";
+/** Not on a read-only connection: it changes the server. */
+export const canChangePassword = (conn: ConnectionView) => traitsOf(conn.config.kind).change_password && conn.config.auth.method === "password" && !conn.config.read_only;
 
 export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; onClose: () => void }) {
   const [current, setCurrent] = useState("");
@@ -37,11 +38,11 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
   return (
     <Modal
       title={`Change the password of ${user}`}
-      onClose={onClose}
+      onClose={() => !busy && onClose()}
       width={420}
       footer={
         <>
-          <button className="btn-ghost" onClick={onClose}>
+          <button className="btn-ghost" onClick={onClose} disabled={busy}>
             Cancel
           </button>
           <button className="btn-primary" disabled={!ready} onClick={() => void submit()}>
@@ -59,7 +60,7 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
       >
         <p className="text-muted">
           Changes it on {traitsOf(conn.config.kind).name} for every program that signs in as {user}
-          {conn.has_secret ? `, and saves the new one for "${conn.name}"` : ""}. Other connections with this user keep the old one until you change them.
+          {conn.has_secret ? `, and saves the new one for "${conn.name}"` : ""}. The current password is checked by signing in with it first. Running queries and open transactions go on; other connections with this user keep the old password until you change them.
         </p>
         <label className="block space-y-1">
           <span className="text-muted">Current password</span>
@@ -71,9 +72,13 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
         </label>
         <label className="block space-y-1">
           <span className="text-muted">New password again</span>
-          <input type="password" className="field" autoComplete="new-password" value={again} onChange={(e) => setAgain(e.target.value)} aria-invalid={mismatch} />
+          <input type="password" className="field" autoComplete="new-password" value={again} onChange={(e) => setAgain(e.target.value)} aria-invalid={mismatch} aria-describedby={mismatch ? "pw-mismatch" : undefined} />
         </label>
-        {mismatch && <p className="text-danger">The new passwords differ.</p>}
+        {mismatch && (
+          <p id="pw-mismatch" className="text-danger">
+            The new passwords differ.
+          </p>
+        )}
         {problem && (
           <p className="text-danger" role="alert">
             {problem}

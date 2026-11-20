@@ -30,7 +30,13 @@ pub fn dir(data_dir: &Path) -> std::path::PathBuf {
 /// stderr (never stdout: the MCP server speaks its protocol there). Panics
 /// are logged too. Calling it again does nothing.
 pub fn init(name: &str, data_dir: Option<&Path>, stderr: bool) {
-    let filter = || EnvFilter::try_from_env("DATABRAIN_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    // tokio-postgres logs each statement at debug: kept at info, whatever
+    // DATABRAIN_LOG asks (a password change sends a password hash).
+    let filter = || {
+        EnvFilter::try_from_env("DATABRAIN_LOG")
+            .unwrap_or_else(|_| EnvFilter::new("info"))
+            .add_directive("tokio_postgres=info".parse().expect("a valid directive"))
+    };
     let file = data_dir.and_then(|d| {
         std::fs::create_dir_all(dir(d)).ok()?;
         let appender = tracing_appender::rolling::Builder::new()

@@ -25,6 +25,9 @@ describe("change password", () => {
     expect(canChangePassword(conn("oracle"))).toBe(true);
     expect(canChangePassword(conn("snowflake"))).toBe(false);
     expect(canChangePassword(conn("postgres", "cloud_cli"))).toBe(false);
+    const ro = conn("postgres");
+    ro.config.read_only = true;
+    expect(canChangePassword(ro)).toBe(false);
   });
 
   it("needs the new password twice, sends both and closes; a refusal stays shown", async () => {

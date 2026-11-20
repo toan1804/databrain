@@ -173,10 +173,11 @@ impl Session for OracleSession {
 
     /// `ALTER USER … IDENTIFIED BY "new" REPLACE "current"` for the user
     /// signed in (`REPLACE` is what a profile's verify function needs). A
-    /// password is a quoted identifier there: it can't hold `"`.
+    /// password is a quoted identifier there: it can't hold `"` or a
+    /// control character.
     async fn change_password(&self, current: &str, new: &str) -> Result<()> {
-        if new.contains('"') || current.contains('"') {
-            return Err(ConnectorError::config("An Oracle password can't contain a double quote (\")"));
+        if [new, current].iter().any(|p| p.contains('"') || p.chars().any(char::is_control)) {
+            return Err(ConnectorError::config("An Oracle password can't contain a double quote (\") or a control character"));
         }
         let rows = self.query_named("select user from dual", vec![]).await?;
         let user =
@@ -1210,7 +1211,13 @@ mod tests {
         drop(s);
         assert!(connect("New'pw_2").await.is_ok(), "the new password signs in");
         assert!(connect("Old_pw_1").await.is_err(), "the old one no longer does");
-        admin.run_internal("drop user kb_pw").await.unwrap();
+        // Its sessions may take a moment to end (ORA-01940).
+        let mut tries = 0;
+        while let Err(e) = admin.run_internal("drop user kb_pw").await {
+            tries += 1;
+            assert!(tries < 20, "{e:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
 
     /// Live: DATABRAIN_ORACLE_HOST, _USER, _PASSWORD, _SERVICE (e.g. gvenzl/oracle-free).

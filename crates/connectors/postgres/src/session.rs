@@ -106,23 +106,36 @@ impl Session for PgSession {
         ConnectorKind::Postgres
     }
 
-    /// `ALTER USER … PASSWORD` with the password hashed here, as psql's
-    /// `\password` does (the server's log and statistics never see it):
-    /// SCRAM-SHA-256 from PostgreSQL 10, MD5 before and on Redshift (an
-    /// older server would take a SCRAM verifier for the password itself).
+    /// `ALTER USER … PASSWORD` for the role that signed in
+    /// (`session_user`), the password hashed here as psql's `\password`
+    /// does (the server's log and statistics never see it): as the
+    /// server's `password_encryption` says, SCRAM-SHA-256 from PostgreSQL
+    /// 10 unless it is `md5`; MD5 before 10 (an older server would take a
+    /// SCRAM verifier for the password itself) and on Redshift. Hashed
+    /// here, so the server's `passwordcheck` rules don't see it.
     async fn change_password(&self, _current: &str, new: &str) -> Result<()> {
         let redshift = self.redshift || self.detected_redshift;
         let row = self
             .client()
-            .query_one(if redshift { "select current_user::text, 0" } else { "select current_user::text, current_setting('server_version_num')::int" }, &[])
+            .query_one(
+                if redshift {
+                    "select session_user::text, 0, 'md5'"
+                } else {
+                    "select session_user::text, current_setting('server_version_num')::int, current_setting('password_encryption')"
+                },
+                &[],
+            )
             .await
             .map_err(|e| map_err(&e))?;
-        let (user, version): (String, i32) = (row.get(0), row.get(1));
-        let hashed = if version >= 100_000 {
+        let (user, version, encryption): (String, i32, String) = (row.get(0), row.get(1), row.get(2));
+        let hashed = if version >= 100_000 && !encryption.eq_ignore_ascii_case("md5") {
             postgres_protocol::password::scram_sha_256(new.as_bytes())
         } else {
             postgres_protocol::password::md5(new.as_bytes(), &user)
         };
+        // A prepared statement takes no parameters here (utility command),
+        // and simple queries are logged by tokio-postgres at debug: the
+        // logging leaves `tokio_postgres` at info (crates/app logging).
         let sql = format!("ALTER USER {} PASSWORD {}", quote(&user), databrain_connector_core::quote_literal_pg(&hashed));
         self.client().batch_execute(&sql).await.map_err(|e| map_err(&e))
     }

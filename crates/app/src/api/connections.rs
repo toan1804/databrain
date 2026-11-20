@@ -208,9 +208,11 @@ pub fn reconnect(state: &AppState, id: &str) -> usize {
 }
 
 /// Change the connection's password on the server, then the one saved for
-/// it (when one is saved): the next sign-in uses it. With a saved password,
-/// `current` must be it (PostgreSQL and older MySQL don't check it
-/// themselves). Neither password is logged or kept anywhere else.
+/// it (when one is saved): the next sign-in uses it. `current` must sign
+/// in (checked first: PostgreSQL and older MySQL don't check it themselves)
+/// and, with a saved password, be it. Idle sessions sign in again with the
+/// new one; running queries, jobs and open transactions go on. Neither
+/// password is logged or kept anywhere else.
 pub async fn change_password(state: &AppState, id: &str, current: String, new: String) -> Result<()> {
     if new.is_empty() {
         return Err(invalid("Type the new password"));
@@ -226,14 +228,23 @@ pub async fn change_password(state: &AppState, id: &str, current: String, new: S
             return Err(invalid("The current password isn't the one saved for this connection"));
         }
     }
+    // Said before the sign-in below (the engine refuses these too).
+    let traits = profile.config.kind.traits();
+    if !traits.change_password {
+        return Err(EngineError::new("unsupported", format!("{} passwords can't be changed from DataBrain", traits.name)));
+    }
+    if profile.config.read_only {
+        return Err(EngineError::new("read_only", format!("\"{}\" is read-only: change its password with a connection that isn't", profile.name)));
+    }
+    if let Err(e) = state.engine.test_connection(&profile.config, Some(current.clone()), Some(id), None, None).await {
+        return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}", e.message)));
+    }
     state.engine.change_password(id, &current, &new).await?;
-    // Its sessions sign in with the new one from here on (they would on
-    // their next reconnect anyway).
-    state.engine.disconnect(id);
+    // Saved before anything signs in again, so nothing caches the old one.
+    let saved_ok = if profile.has_secret { state.secrets.set(&saved, &SecretString::from(new)) } else { Ok(()) };
     state.engine.forget_credentials(id);
-    if profile.has_secret
-        && let Err(e) = state.secrets.set(&saved, &SecretString::from(new))
-    {
+    state.engine.reconnect(id);
+    if let Err(e) = saved_ok {
         return Err(EngineError::new(
             "partial",
             format!("The password was changed on the server, but the new one couldn't be saved ({e}): type it in the connection's settings."),
