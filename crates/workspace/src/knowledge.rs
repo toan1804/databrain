@@ -448,7 +448,9 @@ impl Workspace {
     /// facts go to the explorer cache, the one store the AI reads
     /// (`ai_objects`); its search rows follow from there. A table the read
     /// doesn't have is gone from the server, as with a filled explorer
-    /// listing. An empty list changes nothing.
+    /// listing. A read that found no table answers for none of them (the
+    /// user may see nothing there): as with an empty explorer listing, the
+    /// tables leave the cache and the AI keeps what it may use of them.
     pub fn kn_replace_schema(&self, connection_id: &str, schema: &str, objects: &[KnObject]) -> Result<IndexDelta> {
         self.kn_replace_schema_read(connection_id, schema, objects, false, true)
     }
@@ -464,6 +466,18 @@ impl Workspace {
         let before = Self::known_tx(&tx, connection_id, Some(schema))?;
         let now = now_ms();
         let mut delta = IndexDelta::default();
+        if objects.is_empty() && complete && !before.is_empty() {
+            Self::keep_tx(&tx, connection_id, Some(schema))?;
+            for (_, name) in before.keys() {
+                tx.execute(
+                    "DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 \
+                       AND kind IN ('table', 'view', 'materialized_view', 'foreign_table')",
+                    params![connection_id, schema, name],
+                )?;
+                tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1 AND schema_name = ?2 AND table_name = ?3", params![connection_id, schema, name])?;
+                delta.removed += 1;
+            }
+        }
         if !objects.is_empty() && complete {
             let keep: HashSet<&str> = objects.iter().map(|o| o.name.as_str()).collect();
             for name in before.keys().map(|(_, n)| n).filter(|n| !keep.contains(n.as_str())) {
@@ -1000,6 +1014,34 @@ mod tests {
         ws.kn_set_state(&KnState { connection_id: "c1".into(), indexed_at: 1, objects: 2, schemas: vec!["public".into()], error: None }).unwrap();
         assert_eq!(ws.kn_retain_schemas("c1", &[]).unwrap(), 2, "out of the index: out of the AI's scope");
         assert_eq!(ws.ai_catalog("c1").count().unwrap(), 0);
+    }
+
+    /// An index read that finds a schema empty (no error) is no answer
+    /// about each table: they leave the cache, the AI keeps them (marked)
+    /// until a read finds tables again or they expire.
+    #[test]
+    fn an_empty_index_read_keeps_the_tables_for_the_ai() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let objs = [obj("s", "a", &["id"], None), obj("s", "b", &["id"], None)];
+        ws.kn_replace_schema("c1", "s", &objs).unwrap();
+        let d = ws.kn_replace_schema("c1", "s", &[]).unwrap();
+        assert_eq!(d.removed, 2);
+        assert!(ws.meta_table("c1", "s", "a").unwrap().is_none() && ws.meta_get("c1", "s.a").unwrap().is_none(), "not in the explorer");
+        let ai = ws.ai_catalog("c1");
+        assert_eq!(ai.count().unwrap(), 2);
+        assert!(ai.missing_since("s", "a").unwrap().is_some());
+        assert_eq!(ai.get("s.b").unwrap().unwrap().columns.len(), 1, "with its columns");
+        // With an error: nothing changes (it was already kept here).
+        ws.kn_replace_schema_read("c1", "s", &[], false, false).unwrap();
+        assert_eq!(ai.count().unwrap(), 2);
+        // Found again: the cache's, unmarked.
+        ws.kn_replace_schema("c1", "s", &objs[..1]).unwrap();
+        assert_eq!(ai.count().unwrap(), 1, "b: a read with tables answers for it");
+        assert!(ai.missing_since("s", "a").unwrap().is_none());
+        // A schema the AI may not use keeps nothing.
+        ws.ai_put_rule("c1", &crate::ScopeRule { schema: "s".into(), table: String::new(), allow: false }).unwrap();
+        ws.kn_replace_schema("c1", "s", &[]).unwrap();
+        assert_eq!(ws.conn.lock().query_row("SELECT count(*) FROM ai_kept", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
     /// A read that failed partway (some tables, an error) adds what it has
