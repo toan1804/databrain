@@ -509,7 +509,7 @@ impl AiCatalog<'_> {
         Ok(c.query_row(
             &format!(
                 "SELECT {} FROM ai_objects WHERE connection_id = ?1 AND lower(name) = lower(?2) \
-                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
                  ORDER BY length(schema_name) LIMIT 1",
                 Workspace::AI_COLUMNS
             ),
@@ -1028,6 +1028,32 @@ mod review_tests {
         // Excluded again: the reference goes with it.
         ws.ai_put_rule("c", &rule("hr", "payroll", false)).unwrap();
         assert!(found("payroll").is_empty(), "{:?}", found("payroll"));
+    }
+
+    /// A schema written without its catalog matches the end of a schema
+    /// id exactly: `_` and `%` in it are characters, not wildcards.
+    #[test]
+    fn a_schema_without_its_catalog_matches_only_itself() {
+        let o = |s: &str, n: &str| DbObject { schema: s.into(), name: n.into(), kind: ObjectKind::Table, comment: None, row_estimate: None };
+        let ws = Workspace::open_in_memory().unwrap();
+        ws.ai_set_scope("c", &[ScopeRule { schema: "*".into(), table: String::new(), allow: true }]).unwrap();
+        ws.meta_put_schema("c", "lake.myxschema", &[o("lake.myxschema", "t")]).unwrap();
+        ws.meta_put_schema("c", "lake.a5b", &[o("lake.a5b", "t")]).unwrap();
+        ws.meta_put_schema("c", "lake.my_schema", &[o("lake.my_schema", "u")]).unwrap();
+        let ai = ws.ai_catalog("c");
+        let got = |r: &str| ai.get(r).unwrap().map(|o| o.full_name());
+        let meta = |r: &str| ws.meta_get("c", r).unwrap().map(|(s, n)| format!("{s}.{n}"));
+        let named = |r: &str| ws.meta_find_named("c", r).unwrap().into_iter().map(|(s, n)| format!("{s}.{n}")).collect::<Vec<_>>();
+        for r in ["my_schema.t", "a%b.t", "a_b.t", "chema.t"] {
+            assert_eq!(got(r), None, "{r}");
+            assert_eq!(meta(r), None, "{r}");
+            assert!(named(r).is_empty(), "{r}");
+        }
+        assert_eq!(got("myxschema.t").as_deref(), Some("lake.myxschema.t"));
+        assert_eq!(got("MY_SCHEMA.u").as_deref(), Some("lake.my_schema.u"), "case still ignored");
+        assert_eq!(meta("my_schema.u").as_deref(), Some("lake.my_schema.u"));
+        assert_eq!(named("a5b.t"), vec!["lake.a5b.t"]);
+        assert_eq!(got("lake.my_schema.u").as_deref(), Some("lake.my_schema.u"), "the whole id");
     }
 
     #[test]

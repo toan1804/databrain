@@ -798,7 +798,7 @@ impl Workspace {
         Ok(c.query_row(
             "SELECT schema_name, name, kind, comment, row_estimate, columns_json, fks_json FROM kn_objects \
              WHERE connection_id = ?1 AND lower(name) = lower(?2) \
-               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
              ORDER BY length(schema_name) LIMIT 1",
             params![connection_id, name, schema],
             Self::kn_object_row,

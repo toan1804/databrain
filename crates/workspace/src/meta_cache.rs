@@ -787,7 +787,7 @@ impl Workspace {
             .query_row(
                 "SELECT schema_name, name FROM meta_objects \
                  WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other') \
-                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
                  ORDER BY length(schema_name) LIMIT 1",
                 params![connection_id, name, schema],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -805,7 +805,7 @@ impl Workspace {
         let mut st = c.prepare_cached(
             "SELECT DISTINCT schema_name, name FROM meta_objects \
              WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other') \
-               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
              ORDER BY length(schema_name), schema_name",
         )?;
         let rows = st.query_map(params![connection_id, name, schema], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
