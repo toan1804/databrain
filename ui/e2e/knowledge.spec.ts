@@ -41,7 +41,14 @@ test("Knowledge: index, notes and learned joins each have a tab; joins are one l
           { id: "n2", connection_id: "conn-shop", target: null, body: "GMV = sum(amount) of paid orders", author: "ai", status: "proposed", created_at: 0 },
         ],
       },
-      kn_objects: { objects: [], total: 0 },
+      kn_objects: {
+        objects: [
+          { schema: "sales", name: "orders", kind: "table", comment: null, row_estimate: null, columns: [], foreign_keys: [] },
+          { schema: "sales", name: "refunds", kind: "table", comment: null, row_estimate: null, columns: [], foreign_keys: [] },
+        ],
+        total: 2,
+        kept: { "sales.refunds": Date.UTC(2026, 10, 2) },
+      },
       kn_learned: {
         supported: true,
         enabled: true,
@@ -57,6 +64,10 @@ test("Knowledge: index, notes and learned joins each have a tab; joins are one l
 
   const tabs = page.getByRole("tablist", { name: "Knowledge" });
   await expect(tabs.getByRole("tab", { name: /Index\s*120/ })).toBeVisible();
+  // A table kept after the explorer cache lost it says since when; the other doesn't.
+  await tabs.getByRole("tab", { name: /Index/ }).click();
+  await expect(page.getByText(/not seen since/)).toHaveCount(1);
+  await expect(page.getByText("sales.refunds").locator("..").getByText(/not seen since/)).toBeVisible();
   // One approved note, one proposed by the AI to review.
   await expect(tabs.getByRole("tab", { name: /Notes\s*1\s*1/ })).toBeVisible();
   await tabs.getByRole("tab", { name: new RegExp(`Learned\\s*${JOINS.length}`) }).click();
@@ -101,7 +112,7 @@ test("Knowledge: index, notes and learned joins each have a tab; joins are one l
 });
 
 test("Knowledge remembers the last tab", async ({ page }) => {
-  await openApp(page, backend({ kn_get: { state: null, notes: [] }, kn_objects: { objects: [], total: 0 }, kn_learned: { supported: true, enabled: false, state: null, joins: [], tables: [] } }));
+  await openApp(page, backend({ kn_get: { state: null, notes: [] }, kn_objects: { objects: [], total: 0, kept: {} }, kn_learned: { supported: true, enabled: false, state: null, joins: [], tables: [] } }));
   await page.getByRole("button", { name: "AI assistant" }).first().click();
   await page.getByRole("tab", { name: /Knowledge/ }).click();
   await page.getByRole("tablist", { name: "Knowledge" }).getByRole("tab", { name: /Learned/ }).click();
@@ -124,7 +135,7 @@ test("joins recorded from a document: to review, approved or discarded, and mark
     page,
     backend({
       kn_get: { state: null, notes: [] },
-      kn_objects: { objects: [], total: 0 },
+      kn_objects: { objects: [], total: 0, kept: {} },
       kn_learned: { supported: true, enabled: true, state: null, joins: [JOINS[0], proposed, approved], tables: [] },
       kn_join_evidence: [],
     }),
@@ -161,7 +172,7 @@ test("joins recorded from a document: to review, approved or discarded, and mark
 
 test("Knowledge starts fresh for each connection: the last one's excluded tables can't be allowed under this one", async ({ page }) => {
   const DWH = { ...SHOP, id: "conn-dwh", name: "Shop DWH" };
-  await openApp(page, backend({ list_connections: [SHOP, DWH], kn_get: { state: null, notes: [] }, kn_objects: { objects: [], total: 0 } }));
+  await openApp(page, backend({ list_connections: [SHOP, DWH], kn_get: { state: null, notes: [] }, kn_objects: { objects: [], total: 0, kept: {} } }));
   // Shop answers at once; Shop DWH's rules come when the test says.
   await page.evaluate(() => {
     const w = window as unknown as { __DB_MOCK__: { handlers: Record<string, unknown> }; __dwhRules?: (r: unknown) => void };

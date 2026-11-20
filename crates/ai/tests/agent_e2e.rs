@@ -353,6 +353,11 @@ async fn denied_approval_and_blocked_writes() {
     f.ws.meta_clear(&f.conn).unwrap();
     let kept = f.ws.ai_catalog(&f.conn).get("orders").unwrap().unwrap();
     assert!(f.ws.ai_catalog(&f.conn).missing_since(&kept.schema, &kept.name).unwrap().is_some());
+    // Said wherever the AI is shown it: the table list and retrieval.
+    let o = auto.call("list_tables", &json!({})).await;
+    assert!(o.content.contains("main.orders (not seen on the server since"), "{}", o.content);
+    let r = databrain_ai::knowledge::retrieve(&f.ws, &f.conn, "orders by country", 8, 12_000).unwrap();
+    assert!(r.text.contains("Not seen on the server since"), "{}", r.text);
     assert!(databrain_ai::knowledge::kept_note(0).starts_with("Not seen on the server since 19"));
     let o = auto.call("describe_table", &json!({"table": "orders"})).await;
     assert!(o.content.contains("customer_id") && !o.content.contains("Not seen on the server"), "{}", o.content);

@@ -49,7 +49,7 @@ function KnowledgeFor({ connId, setConnId }: { connId: string | null; setConnId:
   // The AI scope's rules: excluded tables are listed to allow them again.
   const [rules, setRules] = useState<ScopeRule[]>([]);
   const [filter, setFilter] = useState("");
-  const [objects, setObjects] = useState<{ list: KnObject[]; total: number } | null>(null);
+  const [objects, setObjects] = useState<{ list: KnObject[]; total: number; kept: Record<string, number> } | null>(null);
   const [note, setNote] = useState({ target: "", body: "" });
   const [targetState, setTargetState] = useState<TargetState>({ status: "empty" });
   const targetOk = targetState.status === "empty" || targetState.status === "ok";
@@ -154,7 +154,7 @@ function KnowledgeFor({ connId, setConnId }: { connId: string | null; setConnId:
       () =>
         void api
           .knObjects(connId, filter, 0, OBJECT_PAGE)
-          .then((p) => !stale && setObjects({ list: p.objects, total: p.total }))
+          .then((p) => !stale && setObjects({ list: p.objects, total: p.total, kept: p.kept ?? {} }))
           .catch(() => {}),
       filter ? 150 : 0,
     );
@@ -167,7 +167,7 @@ function KnowledgeFor({ connId, setConnId }: { connId: string | null; setConnId:
     if (!connId || !objects) return;
     void api
       .knObjects(connId, filter, objects.list.length, OBJECT_PAGE)
-      .then((p) => setObjects((o) => (o ? { list: [...o.list, ...p.objects], total: p.total } : o)))
+      .then((p) => setObjects((o) => (o ? { list: [...o.list, ...p.objects], total: p.total, kept: { ...o.kept, ...(p.kept ?? {}) } } : o)))
       .catch((e) => toast(toError(e).message, "error"));
   };
 
@@ -450,6 +450,14 @@ function KnowledgeFor({ connId, setConnId }: { connId: string | null; setConnId:
                 <span className="ml-1.5 text-[10.5px] text-muted">
                   {o.kind} · {o.columns.length > 0 ? `${o.columns.length} cols` : "columns not read yet"}
                 </span>
+                {objects.kept[`${o.schema}.${o.name}`] !== undefined && (
+                  <span
+                    className="ml-1.5 text-[10.5px] text-warning"
+                    title="The explorer cache lost this table without the server saying it is gone. The AI keeps what it knew until it is read again, at most 60 days."
+                  >
+                    not seen since {new Date(objects.kept[`${o.schema}.${o.name}`]).toLocaleDateString()}
+                  </span>
+                )}
                 <button
                   className="icon-btn float-right hidden h-5 w-5 group-hover:flex"
                   title="Exclude: the AI won't see this table"

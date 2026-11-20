@@ -629,13 +629,19 @@ pub struct KnObjectPage {
     pub objects: Vec<KnObject>,
     /// Objects matching the filter (all pages).
     pub total: usize,
+    /// Tables of this page kept from before the explorer cache lost them,
+    /// by `schema.name`: when they were last seen (ms).
+    #[ts(type = "Record<string, number>")]
+    pub kept: std::collections::BTreeMap<String, i64>,
 }
 
 /// The tables the AI may use (Knowledge → Index), a page at a time.
 pub fn knowledge_objects(state: &AppState, connection_id: &str, filter: &str, offset: usize, limit: usize) -> Result<KnObjectPage> {
     let tables = databrain_ai::catalog::AiTables::new(&state.workspace, connection_id).map_err(ai_err)?;
     let (objects, total) = tables.page(filter, offset, limit.clamp(1, 1000)).map_err(ai_err)?;
-    Ok(KnObjectPage { objects, total })
+    let all_kept = tables.kept().map_err(ai_err)?;
+    let kept = objects.iter().filter_map(|o| all_kept.get(&o.full_name()).map(|t| (o.full_name(), *t))).collect();
+    Ok(KnObjectPage { objects, total, kept })
 }
 
 /// What indexing would cover (schemas, catalogs, table counts) so the UI

@@ -230,12 +230,18 @@ impl ToolContext {
     pub(super) fn list_tables(&self, args: &Value) -> Result<ToolOutput> {
         let schema = args.get("schema").and_then(|s| s.as_str());
         let target = self.schema_target(args)?;
-        let names: Vec<String> = AiTables::with_profile(self.engine.workspace(), &target)
+        let tables = AiTables::with_profile(self.engine.workspace(), &target);
+        let kept = tables.kept()?;
+        let names: Vec<String> = tables
             .objects()?
             .into_iter()
             .filter(|o| schema.is_none_or(|s| o.schema.eq_ignore_ascii_case(s)))
             .map(|o| o.full_name())
             .take(500)
+            .map(|n| match kept.get(&n) {
+                Some(since) => format!("{n} (not seen on the server since {}; may be gone)", databrain_workspace::day_text(*since)),
+                None => n,
+            })
             .collect();
         self.audit("list_tables", args, "allowed", Some(&format!("{} tables", names.len())));
         Ok(out(if names.is_empty() { "No tables are available to the AI on this connection.".into() } else { names.join("\n") }, json!({"count": names.len()})))

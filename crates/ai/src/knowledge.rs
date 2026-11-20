@@ -595,6 +595,7 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
     let mut text = String::new();
     let mut tables = Vec::new();
     let mut learned_joins = 0;
+    let kept = t.kept()?;
     for o in &chosen {
         let full = o.full_name();
         let table_notes: Vec<String> = notes_all
@@ -606,6 +607,10 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
             })
             .collect();
         let mut block = render_object(o, &policy, &table_notes);
+        if let Some(since) = kept.get(&full) {
+            block.push('\n');
+            block.push_str(&kept_note(*since));
+        }
         let lines = join_lines(&full, &learned);
         for l in &lines {
             block.push('\n');
