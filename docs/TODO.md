@@ -223,3 +223,7 @@ The escapes found by the red-team review are fixed (see CHANGELOG, Security). Le
 - **Not followed:** the assistant's rows reached through `USE results`, a view made earlier, or a table name built from a `:param`; tables the assistant's steps wrote on other databases.
 - **Name check not repeated after approval:** a tab or notebook taking the name meanwhile is refused later (the job step keeps it).
 - **Missing tests:** a load with explicit `select … from results.x` SQL of the assistant's rows; a chain of steps following them.
+
+## Change password (2026-11-20)
+
+Done for PostgreSQL, Redshift, MySQL/MariaDB, SQL Server and Oracle with a password sign-in. Left: an expired password (Oracle ORA-28001, SQL Server 18488, PostgreSQL `VALID UNTIL` passed) can't sign in to change it: the connect step should offer the change (Oracle and SQL Server change it at sign-in); Snowflake and ClickHouse (a user usually lacks the privilege on itself); other connections saved with the same user and server aren't offered the new password.

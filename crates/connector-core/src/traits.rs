@@ -391,6 +391,9 @@ pub struct SourceTraits {
     /// Transactions DataBrain opens (loads, grid edits, manual commit).
     pub transactions: Option<TxDialect>,
     pub load: Option<LoadTraits>,
+    /// The signed-in user can change its own password from DataBrain
+    /// ([`crate::Session::change_password`]).
+    pub change_password: bool,
 }
 
 const KB: usize = 1024;
@@ -487,6 +490,7 @@ pub const STANDARD: SourceTraits = SourceTraits {
     syntax: STANDARD_SYNTAX,
     transactions: None,
     load: Some(STANDARD_LOAD),
+    change_password: false,
 };
 
 pub const SQLITE: SourceTraits = SourceTraits {
@@ -536,6 +540,7 @@ pub const POSTGRES: SourceTraits = SourceTraits {
         ..STANDARD_LOAD
     }),
     transactions: Some(STANDARD_TX),
+    change_password: true,
     ..STANDARD
 };
 
@@ -572,6 +577,7 @@ pub const MYSQL: SourceTraits = SourceTraits {
         ..STANDARD_LOAD
     }),
     transactions: Some(TxDialect { begin: "START TRANSACTION", ddl_commits: DdlCommits::Ddl, ..STANDARD_TX }),
+    change_password: true,
     ..STANDARD
 };
 
@@ -622,6 +628,7 @@ pub const MSSQL: SourceTraits = SourceTraits {
         savepoint: Some(("SAVE TRANSACTION {}", "ROLLBACK TRANSACTION {}")),
         release_savepoint: None,
     }),
+    change_password: true,
     ..STANDARD
 };
 
@@ -665,6 +672,7 @@ pub const ORACLE: SourceTraits = SourceTraits {
         merge: MergeStyle::MergeNoAs,
         ..STANDARD_LOAD
     }),
+    change_password: true,
     ..STANDARD
 };
 

@@ -181,6 +181,20 @@ pub trait Session: Send + Sync {
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail>;
 
+    /// Change the signed-in user's (the server's name for it) password to `new`
+    /// (`current`: for servers that check it, e.g. SQL Server's
+    /// `OLD_PASSWORD`, Oracle's `REPLACE`). Statements DataBrain writes,
+    /// never in the query history; neither password is logged. Only where
+    /// [`crate::SourceTraits::change_password`] says so.
+    async fn change_password(&self, _current: &str, _new: &str) -> Result<()> {
+        Err(ConnectorError::unsupported(format!("{} passwords can't be changed from DataBrain", self.kind().traits().name)))
+    }
+
+    /// Run statements DataBrain writes and drop what they return.
+    async fn run_internal(&self, sql: &str) -> Result<()> {
+        self.execute(Statement::internal(sql), ExecOptions::default()).await?.collect().await.map(|_| ())
+    }
+
     /// Full DDL of an object (explorer "Show DDL"). `None` when the engine
     /// can't produce it. The default uses [`Session::describe`] for tables
     /// and views; engines override it for complete table DDL (constraints,

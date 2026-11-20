@@ -110,6 +110,32 @@ impl Session for MysqlSession {
         }
     }
 
+    /// `ALTER USER CURRENT_USER() IDENTIFIED BY … REPLACE …` (MySQL
+    /// 8.0.13+ checks the current password with it); without `REPLACE`
+    /// where the server doesn't know it (MariaDB, older MySQL: a syntax
+    /// error, nothing changed). The literals are written for the session's
+    /// `sql_mode` (with NO_BACKSLASH_ESCAPES a backslash is itself). A
+    /// syntax error's message quotes the statement: not shown.
+    async fn change_password(&self, current: &str, new: &str) -> Result<()> {
+        let mut c = self.conn.lock().await;
+        let mode: Option<String> = c.query_first("select @@session.sql_mode").await.map_err(map_err)?;
+        let plain = mode.unwrap_or_default().to_ascii_uppercase().contains("NO_BACKSLASH_ESCAPES");
+        let q = |s: &str| if plain { databrain_connector_core::quote_literal(s) } else { databrain_connector_core::sql::quote_string(s, ConnectorKind::Mysql) };
+        let syntax = |e: &ConnectorError| e.code.as_deref().is_some_and(|c| c.starts_with("1064 "));
+        let hidden = |e: ConnectorError| {
+            if syntax(&e) {
+                ConnectorError::query("This server doesn't take ALTER USER … IDENTIFIED BY (MySQL 5.7.6 or MariaDB 10.2 and later do)")
+                    .with_code(e.code.unwrap_or_default())
+            } else {
+                e
+            }
+        };
+        match c.query_drop(format!("ALTER USER CURRENT_USER() IDENTIFIED BY {} REPLACE {}", q(new), q(current))).await.map_err(map_err) {
+            Err(e) if syntax(&e) => c.query_drop(format!("ALTER USER CURRENT_USER() IDENTIFIED BY {}", q(new))).await.map_err(map_err).map_err(hidden),
+            r => r.map_err(hidden),
+        }
+    }
+
     async fn ping(&self) -> Result<()> {
         self.conn.lock().await.ping().await.map_err(map_err)
     }

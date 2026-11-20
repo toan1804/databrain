@@ -2,6 +2,7 @@
   "bigquery": {
     "always_qualify_catalog": true,
     "catalog_noun": "project",
+    "change_password": false,
     "cloud": true,
     "cost_preview": true,
     "dialect_name": "BigQuery GoogleSQL",
@@ -86,6 +87,7 @@
   "clickhouse": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": false,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "ClickHouse SQL",
@@ -168,6 +170,7 @@
   "databricks": {
     "always_qualify_catalog": false,
     "catalog_noun": "catalog",
+    "change_password": false,
     "cloud": true,
     "cost_preview": true,
     "dialect_name": "Databricks SQL (Spark SQL)",
@@ -250,6 +253,7 @@
   "duckdb": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": false,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "DuckDB SQL (read local files with read_csv/read_parquet/read_json/delta_scan/iceberg_scan)",
@@ -339,6 +343,7 @@
   "mongodb": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": false,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "MongoDB query (mongosh-style db.<collection>.find/aggregate/countDocuments/distinct/insertOne/updateMany/deleteMany…, or a JSON database command; `use <db>` on the first line picks the database)",
@@ -386,6 +391,7 @@
   "mssql": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": true,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "Microsoft SQL Server (T-SQL)",
@@ -484,6 +490,7 @@
   "mysql": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": true,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "MySQL/MariaDB",
@@ -581,6 +588,7 @@
   "neo4j": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": false,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "Neo4j Cypher (MATCH (n:Label) … RETURN …; labels and relationship types are the tables)",
@@ -628,6 +636,7 @@
   "oracle": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": true,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "Oracle SQL / PL/SQL",
@@ -719,6 +728,7 @@
   "postgres": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": true,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "PostgreSQL",
@@ -814,6 +824,7 @@
   "snowflake": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": false,
     "cloud": true,
     "cost_preview": true,
     "dialect_name": "Snowflake SQL",
@@ -906,6 +917,7 @@
   "sqlite": {
     "always_qualify_catalog": false,
     "catalog_noun": "database",
+    "change_password": false,
     "cloud": false,
     "cost_preview": false,
     "dialect_name": "SQLite",

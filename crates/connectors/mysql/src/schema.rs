@@ -122,6 +122,46 @@ mod tests {
     use databrain_connector_core::ExecOptions;
     use std::sync::Arc;
 
+    /// Live: the signed-in user changes its own password (`REPLACE` the
+    /// current one on MySQL 8): the new one signs in, the old one no longer.
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_change_password() {
+        let Ok(host) = std::env::var("DATABRAIN_MYSQL_HOST") else {
+            panic!("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let connect = |user: String, pw: String| {
+            let host = host.clone();
+            async move {
+                let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.clone() });
+                cfg.host = Some(host);
+                cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
+                MysqlConnector.connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, Some(secrecy::SecretString::from(pw))))).await
+            }
+        };
+        let admin =
+            connect(std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into()), std::env::var("DATABRAIN_MYSQL_PASSWORD").unwrap_or_default())
+                .await
+                .unwrap();
+        let _ = admin.run_internal("drop user if exists 'kb_pw'@'%'").await;
+        admin.run_internal("create user 'kb_pw'@'%' identified by 'Old_pw_1'").await.unwrap();
+        let s = connect("kb_pw".into(), "Old_pw_1".into()).await.unwrap();
+        // A wrong current password is refused where the server checks it (MySQL 8.0.13+ with REPLACE).
+        assert!(s.change_password("wrong", "New'pw\\2").await.is_err());
+        s.change_password("Old_pw_1", "New'pw\\2").await.unwrap();
+        drop(s);
+        assert!(connect("kb_pw".into(), "New'pw\\2".into()).await.is_ok(), "the new password signs in");
+        assert!(connect("kb_pw".into(), "Old_pw_1".into()).await.is_err(), "the old one no longer does");
+        // With NO_BACKSLASH_ESCAPES a backslash is itself: the same password is set.
+        let s = connect("kb_pw".into(), "New'pw\\2".into()).await.unwrap();
+        s.run_internal("set session sql_mode = concat(@@session.sql_mode, ',NO_BACKSLASH_ESCAPES')").await.unwrap();
+        s.change_password("New'pw\\2", "Third\\3").await.unwrap();
+        drop(s);
+        assert!(connect("kb_pw".into(), "Third\\3".into()).await.is_ok(), "set as typed under NO_BACKSLASH_ESCAPES");
+        admin.run_internal("drop user 'kb_pw'@'%'").await.unwrap();
+    }
+
     /// Live: bulk metadata (one batch query set) and schema fingerprints.
     /// DATABRAIN_MYSQL_HOST (+ _PORT, _USER, _PASSWORD).
     #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]

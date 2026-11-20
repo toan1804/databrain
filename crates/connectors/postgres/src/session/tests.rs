@@ -478,3 +478,31 @@ fn the_row_limit_cursor_is_off_on_redshift() {
     assert!(!cursor_for_limit(false, false), "outside a transaction: not needed");
     assert!(!cursor_for_limit(true, true), "Redshift: refused");
 }
+
+/// Live: the signed-in user changes its own password (hashed here, as
+/// psql's \password): the new one signs in, the old one no longer does.
+#[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
+#[tokio::test]
+async fn live_change_password() {
+    let Some(admin) = live_session().await else {
+        panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
+    };
+    let as_user = |pw: &'static str| async move {
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "kb_pw".into() });
+        cfg.host = std::env::var("DATABRAIN_PG_HOST").ok();
+        cfg.port = std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok());
+        cfg.database = Some(std::env::var("DATABRAIN_PG_DB").unwrap_or_else(|_| "postgres".into()));
+        PostgresConnector
+            .connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "kb_pw".into() }, Some(secrecy::SecretString::from(pw)))))
+            .await
+    };
+    let _ = admin.run_internal("drop role if exists kb_pw").await;
+    admin.run_internal("create role kb_pw login password 'Old_pw_1'").await.unwrap();
+    let s = as_user("Old_pw_1").await.unwrap();
+    s.change_password("Old_pw_1", "New'pw\\2").await.unwrap();
+    drop(s);
+    assert!(as_user("New'pw\\2").await.is_ok(), "the new password signs in");
+    assert!(as_user("Old_pw_1").await.is_err(), "the old one no longer does");
+    admin.run_internal("drop role kb_pw").await.unwrap();
+}

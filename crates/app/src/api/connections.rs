@@ -207,6 +207,59 @@ pub fn reconnect(state: &AppState, id: &str) -> usize {
     state.engine.reconnect(id)
 }
 
+/// Change the connection's password on the server, then the one saved for
+/// it (when one is saved): the next sign-in uses it. `current` must sign
+/// in (checked first: PostgreSQL and older MySQL don't check it themselves)
+/// and, with a saved password, be it. Idle sessions sign in again with the
+/// new one; running queries, jobs and open transactions go on. Neither
+/// password is logged or kept anywhere else.
+pub async fn change_password(state: &AppState, id: &str, current: String, new: String) -> Result<()> {
+    if new.is_empty() {
+        return Err(invalid("Type the new password"));
+    }
+    if new == current {
+        return Err(invalid("The new password is the current one"));
+    }
+    let profile = state.workspace.get_connection(id)?;
+    let saved = SecretRef::for_connection(id);
+    if profile.has_secret {
+        let stored = state.secrets.get(&saved)?;
+        if stored.as_ref().map(secrecy::ExposeSecret::expose_secret) != Some(current.as_str()) {
+            return Err(invalid("The current password isn't the one saved for this connection"));
+        }
+    }
+    // Said before the sign-in below (the engine refuses these too).
+    let traits = profile.config.kind.traits();
+    if !traits.change_password {
+        return Err(EngineError::new("unsupported", format!("{} passwords can't be changed from DataBrain", traits.name)));
+    }
+    if !matches!(profile.config.auth, databrain_auth::AuthMethod::Password { .. }) {
+        return Err(invalid("Only a connection that signs in with a password can change it here"));
+    }
+    if profile.config.read_only {
+        return Err(EngineError::new("read_only", format!("\"{}\" is read-only: change its password with a connection that isn't", profile.name)));
+    }
+    // A refused sign-in is the wrong password; anything else (unreachable,
+    // a timeout, an SSH host key to trust) keeps its own error.
+    match state.engine.test_connection(&profile.config, Some(current.clone()), Some(id), None, None).await {
+        Err(e) if e.kind == "auth" => return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}", e.message))),
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
+    state.engine.change_password(id, &current, &new).await?;
+    // Saved before anything signs in again, so nothing caches the old one.
+    let saved_ok = if profile.has_secret { state.secrets.set(&saved, &SecretString::from(new)) } else { Ok(()) };
+    state.engine.forget_credentials(id);
+    state.engine.reconnect(id);
+    if let Err(e) = saved_ok {
+        return Err(EngineError::new(
+            "partial",
+            format!("The password was changed on the server, but the new one couldn't be saved ({e}): type it in the connection's settings."),
+        ));
+    }
+    Ok(())
+}
+
 /// The user checked an SSH server's key fingerprint and trusts it.
 pub fn trust_ssh_host_key(state: &AppState, host: &str, port: u16, fingerprint: &str) -> Result<usize> {
     state.engine.trust_ssh_host_key(host, port, fingerprint)
