@@ -521,10 +521,11 @@ impl Workspace {
     pub(crate) fn kept_expire_due(&self, now: i64) {
         use std::sync::atomic::Ordering;
         let last = self.kept_checked.load(Ordering::Relaxed);
-        if now - last >= 60 * 60 * 1000 && self.kept_checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            if let Err(e) = self.kept_expire(now) {
-                tracing::warn!("expiring kept tables failed: {e}");
-            }
+        if now - last >= 60 * 60 * 1000
+            && self.kept_checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            && let Err(e) = self.kept_expire(now)
+        {
+            tracing::warn!("expiring kept tables failed: {e}");
         }
     }
 }

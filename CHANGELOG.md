@@ -15,6 +15,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- **PII masking of a kept view:** a view kept for the AI after the cached metadata was lost was taken for a table, so a rule on a table's column didn't mask that column under the view's name. It is now masked whole when a rule names a table, as a view whose definition isn't known.
+- **Kept tables are marked everywhere:** the tables put in the AI's prompt, `list_tables` and the Knowledge page say since when a kept table wasn't seen, and they expire after 60 days while the app stays open too.
+- **An index run that finds a schema empty** keeps the AI's tables (marked) instead of leaving them as current.
+- **The AI's notes waiting for review stop at 100 per connection;** past that it asks you to review them first.
 - **The AI doesn't wait on an unreachable server for every table:** offline, `describe_table` tried the server for each table it had to read again (one not described yet, one changed, a kept one) and waited for the connect timeout each time. After one failure it answers from the cache for a minute and says the server couldn't be reached.
 - **A schema named without its catalog matches only itself:** `_` and `%` in it were wildcards, so `my_schema.orders` could resolve to `lake.myxschema.orders` (the AI's lookups, grid edits, lineage, note targets).
 - **Notes are saved whole:** a note and its search row are written in one transaction, a notes import applies all its choices or none, and replacing a note no longer drops another connection's note from search.
