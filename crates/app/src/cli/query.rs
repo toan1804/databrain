@@ -16,7 +16,7 @@
 //! confirmation apply (asked here, `--yes` without a terminal); the table
 //! access rules and PII masking are the AI's and don't. Every run goes to
 //! the query history (Terminal). Exit codes: 0 done, 1 a statement failed,
-//! 2 bad arguments, 130 stopped (Ctrl-C).
+//! 2 bad arguments or a question answered no, 130 stopped (Ctrl-C).
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -42,13 +42,15 @@ usage: dbr [-c <connection>] -i [options] <sql | file.sql | data file>…
        dbr jobs list | run <job> | runs <job> | stop <job>
 
 options:
-  -c, --conn <name>    a saved connection (its name, any case, or a part of it
-                       when only one matches); default: the local DuckDB
+  -c, --conn <name>    a saved connection: its name (any case), a part of it
+                       when only one matches, or its id; default: the local
+                       DuckDB
   -i, --inline         print the rows here (needed for now: opening them in
                        the app comes later)
   -e, --execute <sql>  this text is SQL (when it could be read as a file name)
   --csv, --json, --tsv every row in that format (CSV by default when piped)
-  --limit <n>          rows a table shows: 100 by default, at most 1,000
+  --limit <n>          at most n rows: a table shows 100 by default and at
+                       most 1,000; CSV, JSON and TSV every row unless given
   -p, --param <n=v>    a value for :n in the SQL (repeatable)
   -y, --yes            run on a production connection without asking
   -h, --help           this help
@@ -56,7 +58,7 @@ options:
 
 It runs as the app's editor does: a read-only connection refuses writes,
 and what the app would confirm on a production connection is asked here
-([y/N]). Each run is in the app's query history as \"Terminal\".
+([y/N]; refused without a terminal unless --yes). Each run is in the app's query history as \"Terminal\".
 
 examples:
   dbr -c \"Sales PG\" -i \"select * from orders limit 10\"
@@ -66,11 +68,12 @@ examples:
                                                Delta/Iceberg folders)
   dbr jobs run \"Daily load\"
 
-exit codes: 0 done, 1 a statement failed, 2 bad arguments or a question
-answered no, 130 stopped (Ctrl-C).
+exit codes: 0 done, 1 a statement failed, 2 bad arguments (an unknown
+connection too) or a question answered no, 130 stopped (Ctrl-C).
 
-dbr is next to the app (DataBrain.app/Contents/MacOS/dbr on macOS, the
-install folder on Windows and Linux); link it into your PATH.";
+where it is: macOS DataBrain.app/Contents/MacOS/dbr (link it into your
+PATH); Windows the install folder (add it to PATH); Linux /usr/bin/dbr
+from the .deb or .rpm.";
 
 /// Most rows a table in the terminal shows.
 pub const TABLE_MAX: usize = 1_000;

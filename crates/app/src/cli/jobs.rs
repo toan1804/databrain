@@ -129,10 +129,13 @@ const JOBS_HELP: &str = "usage: dbr jobs <command>   (also databrain-jobs <comma
 
 commands:
   list                      the jobs, with their next and last run
-  run <job>                 run a job now; exit code 1 when it fails
+  run <job>                 run a job now; exit code 1 when it (or a job run
+                            after it) fails, 2 when it can't start
       [--set <parameter set>] [--param name=value]...
   runs <job> [--limit N]    its last runs (5 by default) and the latest one's steps
-  stop <job> [--no-wait]    stop its run wherever it runs, and wait for it to end
+  stop <job> [--no-wait]    stop its run wherever it runs and wait (up to a
+                            minute) for it to end; exit code 1 when it isn't
+                            running or hasn't ended
   tick [--force]            run the jobs that are due (what the OS timer starts)
 
 <job> is its name (any case) or id.";

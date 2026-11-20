@@ -67,7 +67,7 @@ dbr jobs list                                            # jobs: list, run, runs
 dbr --help                                               # every option; dbr --version
 ```
 
-`-c` takes the connection's name (any case); without it, `dbr` uses the local DuckDB. A read-only connection refuses writes and a production one asks `[y/N]` (or `--yes`), as the app's editor does, and every run is in the query history as "Terminal". `dbr` is installed next to the app (`DataBrain.app/Contents/MacOS/dbr` on macOS, the install folder on Windows and Linux): link it into your PATH, e.g. `ln -s /Applications/DataBrain.app/Contents/MacOS/dbr /usr/local/bin/dbr`. Exit codes: 0 done, 1 a statement failed, 2 bad arguments or a question answered no, 130 stopped. More in [docs/FEATURES.md](docs/FEATURES.md) (`dbr` (terminal)).
+`-c` takes the connection's name (any case, or a part of it when only one matches); without it, `dbr` uses the local DuckDB. `--limit n` caps the rows (a table shows 100 by default). It runs as the app's editor does: a read-only connection refuses writes, what the app would confirm on a production connection is asked as `[y/N]` (refused without a terminal unless `--yes`), and every run is in the query history as "Terminal". Where it is: `DataBrain.app/Contents/MacOS/dbr` on macOS (link it into your PATH, e.g. `ln -s /Applications/DataBrain.app/Contents/MacOS/dbr /usr/local/bin/dbr`), the install folder on Windows (add it to PATH), `/usr/bin/dbr` from the Linux `.deb` or `.rpm`. Exit codes: 0 done, 1 a statement failed, 2 bad arguments or a question answered no, 130 stopped. More in [docs/FEATURES.md](docs/FEATURES.md) (`dbr` (terminal)).
 
 ## Build from source
 

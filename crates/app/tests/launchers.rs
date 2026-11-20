@@ -22,7 +22,9 @@ fn databrain_jobs_runs_the_jobs_mode() {
 
     let usage = jobs().output().unwrap();
     assert_eq!(usage.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&usage.stderr).contains("usage: databrain-jobs"));
+    assert!(String::from_utf8_lossy(&usage.stderr).contains("usage: dbr jobs <command>"));
+    let help = jobs().arg("--help").output().unwrap();
+    assert!(help.status.success() && String::from_utf8_lossy(&help.stdout).contains("stop <job>"));
 
     // The program itself takes the same command.
     let direct = Command::new(env!("CARGO_BIN_EXE_databrain")).args(["jobs", "list"]).env("DATABRAIN_DATA_DIR", dir.path()).output().unwrap();
