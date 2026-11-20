@@ -63,9 +63,6 @@ pub const PART_SQL_10G: &str = "select partitioning_type, subpartitioning_type, 
 pub const PART_KEYS_SQL: &str = "select 'P', column_name, column_position from all_part_key_columns where owner = :o and name = :n and object_type = 'TABLE' \
      union all select 'S', column_name, column_position from all_subpart_key_columns where owner = :o and name = :n and object_type = 'TABLE' \
      order by 1, 3";
-/// Partitions: name, bound (LONG), position.
-pub const PARTITIONS_SQL: &str = "select partition_name, high_value from all_tab_partitions \
-     where table_owner = :o and table_name = :n order by partition_position";
 pub const VIEW_SQL: &str = "select v.text, (select c.comments from all_tab_comments c where c.owner = v.owner and c.table_name = v.view_name) \
      from all_views v where v.owner = :o and v.view_name = :n";
 pub const VIEW_COLUMNS_SQL: &str = "select column_name from all_tab_columns where owner = :o and table_name = :n order by column_id";
@@ -127,7 +124,6 @@ pub struct TableParts {
     pub col_comments: Rows,
     pub part: Rows,
     pub part_keys: Rows,
-    pub partitions: Rows,
 }
 
 struct Constraint<'a> {
@@ -222,34 +218,24 @@ fn partition_clause(p: &TableParts) -> Option<String> {
     let r = p.part.first()?;
     let kind = get(r, 0)?;
     let keys = |k: &str| col_list(p.part_keys.iter().filter(|r| get(r, 0) == Some(k)).filter_map(|r| get(r, 1)));
-    let mut s = format!("PARTITION BY {kind} {}", keys("P"));
+    let count = get(r, 3).filter(|n| *n != "0");
+    // The partitions themselves aren't listed: their bounds are LONG
+    // values, read one row at a time, and a table may have thousands
+    // (DBeaver lists them apart too). The Partitions part shows them.
+    let mut s = match (kind, count) {
+        ("HASH", _) => String::new(),
+        (_, Some(n)) => format!("-- {n} partition{}: listed in the table's Partitions part\n", if n == "1" { "" } else { "s" }),
+        _ => "-- the partitions are listed in the table's Partitions part\n".into(),
+    };
+    s.push_str(&format!("PARTITION BY {kind} {}", keys("P")));
     if let Some(i) = get(r, 2).map(str::trim).filter(|i| !i.is_empty()) {
         s.push_str(&format!(" INTERVAL ({i})"));
     }
     if let Some(sub) = get(r, 1).filter(|s| *s != "NONE") {
         s.push_str(&format!("\nSUBPARTITION BY {sub} {}", keys("S")));
     }
-    if kind == "HASH" && p.partitions.iter().all(|r| get(r, 0).is_some_and(|n| n.starts_with("SYS_P"))) {
-        if let Some(n) = get(r, 3) {
-            s.push_str(&format!("\nPARTITIONS {n}"));
-        }
-        return Some(s);
-    }
-    let parts: Vec<String> = p
-        .partitions
-        .iter()
-        .filter_map(|r| {
-            let name = qi(get(r, 0)?);
-            let hv = get(r, 1).map(str::trim).unwrap_or("");
-            Some(match kind {
-                "RANGE" => format!("    PARTITION {name} VALUES LESS THAN ({hv})"),
-                "LIST" => format!("    PARTITION {name} VALUES ({hv})"),
-                _ => format!("    PARTITION {name}"),
-            })
-        })
-        .collect();
-    if !parts.is_empty() {
-        s.push_str(&format!("\n(\n{}\n)", parts.join(",\n")));
+    if let ("HASH", Some(n)) = (kind, count) {
+        s.push_str(&format!("\nPARTITIONS {n}"));
     }
     Some(s)
 }
@@ -516,7 +502,6 @@ mod tests {
             col_comments: vec![row(&[Some("NAME"), Some("it's the name")])],
             part: vec![row(&[Some("RANGE"), Some("NONE"), n, Some("2")])],
             part_keys: vec![row(&[Some("P"), Some("ID"), Some("1")])],
-            partitions: vec![row(&[Some("P1"), Some("100")]), row(&[Some("PMAX"), Some("MAXVALUE")])],
         };
         let d = table_ddl("APP", "ORDERS", &p).unwrap();
         let want = r#"CREATE TABLE "APP"."ORDERS" (
@@ -528,11 +513,8 @@ mod tests {
     CONSTRAINT "FK_C" FOREIGN KEY ("CUST_ID") REFERENCES "CUSTOMERS" ("ID") ON DELETE CASCADE,
     CONSTRAINT "CK_AMT" CHECK (amount >= 0)
 )
-PARTITION BY RANGE ("ID")
-(
-    PARTITION "P1" VALUES LESS THAN (100),
-    PARTITION "PMAX" VALUES LESS THAN (MAXVALUE)
-);
+-- 2 partitions: listed in the table's Partitions part
+PARTITION BY RANGE ("ID");
 
 CREATE INDEX "APP"."IX_NAME" ON "APP"."ORDERS" (UPPER("NAME"), "AMOUNT");
 CREATE UNIQUE INDEX "APP"."UX_CUST" ON "APP"."ORDERS" ("CUST_ID");
@@ -557,16 +539,7 @@ COMMENT ON COLUMN "APP"."ORDERS"."NAME" IS 'it''s the name';"#;
             table_ddl(
                 "APP",
                 "NONE",
-                &TableParts {
-                    columns: vec![],
-                    table: vec![],
-                    constraints: vec![],
-                    indexes: vec![],
-                    col_comments: vec![],
-                    part: vec![],
-                    part_keys: vec![],
-                    partitions: vec![]
-                }
+                &TableParts { columns: vec![], table: vec![], constraints: vec![], indexes: vec![], col_comments: vec![], part: vec![], part_keys: vec![] }
             )
             .is_none()
         );

@@ -248,18 +248,10 @@ impl OracleSession {
                     col_comments: self.dict_opt(ddl::COL_COMMENTS_SQL, None, owner, name).await,
                     part: self.dict_opt(ddl::PART_SQL, Some(ddl::PART_SQL_10G), owner, name).await,
                     part_keys: vec![],
-                    partitions: vec![],
                 };
                 let partitioned = !parts.part.is_empty();
-                let parts = if partitioned {
-                    ddl::TableParts {
-                        part_keys: self.dict_opt(ddl::PART_KEYS_SQL, None, owner, name).await,
-                        partitions: self.dict_opt(ddl::PARTITIONS_SQL, None, owner, name).await,
-                        ..parts
-                    }
-                } else {
-                    parts
-                };
+                let parts =
+                    if partitioned { ddl::TableParts { part_keys: self.dict_opt(ddl::PART_KEYS_SQL, None, owner, name).await, ..parts } } else { parts };
                 ddl::table_ddl(owner, name, &parts)
             }
         })

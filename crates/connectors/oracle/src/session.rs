@@ -23,7 +23,6 @@ use databrain_connector_core::Result;
 use databrain_connector_core::SchemaInfo;
 use databrain_connector_core::Session;
 use databrain_connector_core::TableColumns;
-use databrain_connector_core::quote_ident;
 use oracle::Connection;
 use oracle::sql_type::ToSql;
 use std::sync::Arc;
@@ -446,15 +445,9 @@ impl Session for OracleSession {
         let kind = g(0).as_deref().map(kind_of).unwrap_or(ObjectKind::Table);
         let object = DbObject { schema: schema.to_string(), name: name.to_string(), kind, comment: g(1), row_estimate: g(2).and_then(|n| n.parse().ok()) };
         let columns: Vec<ColumnInfo> = self.columns(schema, Some(name)).await?.into_iter().map(|(_, c)| c).collect();
-        let ddl = self.dictionary_ddl(schema, name, kind).await.ok().flatten().or_else(|| {
-            (kind == ObjectKind::Table).then(|| {
-                let cols: Vec<String> = columns
-                    .iter()
-                    .map(|c| format!("    {} {}{}", quote_ident(ConnectorKind::Oracle, &c.name), c.data_type, if c.nullable { "" } else { " NOT NULL" }))
-                    .collect();
-                format!("CREATE TABLE {}.{} (\n{}\n);", quote_ident(ConnectorKind::Oracle, schema), quote_ident(ConnectorKind::Oracle, name), cols.join(",\n"))
-            })
-        });
+        // No DDL here: Show DDL reads it (`object_ddl`), and building it
+        // takes several dictionary reads the columns don't need.
+        let ddl = None;
         let foreign_keys = self.foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();
         Ok(ObjectDetail { object, columns, ddl, foreign_keys })
     }
@@ -930,7 +923,7 @@ mod tests {
         let t = m[0].columns.iter().find(|t| t.table == "KB_THIN").unwrap();
         assert!(t.columns[0].is_primary_key && t.columns[1].data_type == "VARCHAR2(40)");
         let d = s.describe(&me, "KB_THIN").await.unwrap();
-        assert!(d.ddl.unwrap_or_default().contains("CREATE TABLE"));
+        assert!(d.ddl.is_none() && d.columns.len() >= 2);
         // Show DDL from the dictionary: constraints, indexes, comments; views.
         run("create index kb_thin_name on kb_thin (upper(name), note desc)").await.unwrap();
         run("create or replace view kb_thin_v as select id, name from kb_thin where id > 10").await.unwrap();
