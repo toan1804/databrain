@@ -145,7 +145,7 @@ export function ObjectMenu({
     <Popover x={at.x} y={at.y} onClose={onClose} className="w-72">
       {isRelation && (
         <>
-          <MenuItem icon={<Table2 size={13} />} label="Open table" hint="data, columns, DDL, notes" onClick={run(() => openTable(conn, obj))} />
+          <MenuItem icon={<Table2 size={13} />} label="Open table" hint="columns, data, DDL, partitions, permissions…" onClick={run(() => openTable(conn, obj))} />
           <MenuSeparator />
         </>
       )}

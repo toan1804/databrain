@@ -11,11 +11,13 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Changed
 
 - **Oracle: a table's Columns and DDL open faster.** Columns no longer builds the table's DDL first. The DDL of a partitioned table keeps its partitioning (keys, interval, subpartitioning, the count of a HASH table) and its first partition, which the statement needs, and says how many more there are: each partition's bound is a LONG value read a row at a time, which made tables with many partitions slow. The table explorer's Partitions part lists them. On 12.2 and later, check conditions are read without a LONG too. An INTERVAL table no longer shows "1048575 partitions" (Oracle's limit, not its count) in Indexes.
+- **Table explorer opens on Columns**, then Data: the sample rows are read when Data is opened. A table's description shows up to three lines (the rest scrolls), can be selected and copied, and isn't shown when there is none.
 
 ### Fixed
 
 - **Table explorer: Columns and Relations on a table without foreign keys:** they failed with "undefined is not an object (evaluating 't.foreign_keys.find')" (any database): a table with no foreign keys was sent without the list.
 - **Table explorer: History on Databricks:** it failed with "The table explorer runs one read only": `DESCRIBE HISTORY` (and `DESCRIBE DETAIL`), which the SQL parser doesn't read, were taken for a statement that may write. Exactly those forms are reads for the table explorer; the AI and MCP are still asked before running them (the history holds users' names and past writes' values, which PII masking can't see), and anything more still asks.
+- **Table explorer: Partitions and Permissions.** Partitions lists each partition with its bound, row estimate and size (the first 1,000) on PostgreSQL, MySQL, SQL Server, Oracle, ClickHouse, Databricks and BigQuery (on demand there: BigQuery bills the read). Permissions lists who may do what on the table, with column grants, and on SQL Server denies, on MySQL schema and global grants: PostgreSQL, MySQL, SQL Server, Oracle, ClickHouse, Snowflake and Databricks. Each says why where the database has none.
 
 ## 0.5.0 - 2026-11-20
 

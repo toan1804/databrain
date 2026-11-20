@@ -33,6 +33,8 @@ const rows = (columns: string[], ...r: (string | null)[][]): ExploreRows => ({ c
 function answer(key: string): Promise<ExploreRows> {
   if (key.endsWith("#profile")) return Promise.resolve(rows(["total", "n0", "d0", "lo0", "hi0", "n1", "d1"], ["3", "3", "3", "1", "3", "2", "2"]));
   if (key.endsWith("#top:status")) return Promise.resolve(rows(["value", "n"], ["paid", "2"], [null, "1"]));
+  if (key.endsWith("#partitions")) return Promise.resolve(rows(["name", "bound", "row_count", "bytes"], ["orders_2026", "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')", "1200", "2048"]));
+  if (key.endsWith("#permissions")) return Promise.resolve(rows(["grantee", "privilege", "grantable", "grantor", "scope"], ["analyst", "SELECT", "no", "owner", "table"]));
   if (key.endsWith("#stats")) return Promise.resolve(rows(["row_estimate", "total_bytes", "last_analyzed"], ["3", "16384", null]));
   return new Promise(() => {});
 }
@@ -91,5 +93,37 @@ describe("table explorer: profile, top values, statistics", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Stop counting/ }));
     expect(confirm).not.toHaveBeenCalled();
     await waitFor(() => expect(closed).toContain("t1#count"));
+  });
+
+  it("opens on Columns without reading rows, with the description in full", async () => {
+    const run = vi.spyOn(useStore.getState(), "runSql");
+    vi.mocked(api.describeObject).mockResolvedValue({ ...detail, object: { ...detail.object, comment: "line one\nline two\nline three\nline four" } });
+    open("none");
+    expect((await screen.findByRole("tab", { name: /^Columns/ })).getAttribute("aria-selected")).toBe("true");
+    expect(await screen.findByText("status")).toBeTruthy();
+    // Every line is there (three show, the rest scroll), not cut to one.
+    expect(screen.getByLabelText("Description").textContent).toBe("line one\nline two\nline three\nline four");
+    expect(screen.getByRole("button", { name: "Copy the description" })).toBeTruthy();
+    expect(run).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("tab").map((t) => t.textContent?.replace(/\d+$/, ""))).toEqual(["Columns", "Data", "Statistics", "Relations", "Usage", "Indexes", "Partitions", "Permissions", "History", "DDL", "Notes"]);
+  });
+
+  it("shows no description when the table has none", async () => {
+    vi.mocked(api.describeObject).mockResolvedValue({ ...detail, object: { ...detail.object, comment: "  " } });
+    open("none");
+    expect(await screen.findByText("status")).toBeTruthy();
+    expect(screen.queryByLabelText("Description")).toBeNull();
+  });
+
+  it("reads the partitions and permissions when their parts open", async () => {
+    open("none");
+    fireEvent.click(await screen.findByRole("tab", { name: "Partitions" }));
+    expect(await screen.findByText("orders_2026")).toBeTruthy();
+    expect(screen.getByText("1,200")).toBeTruthy();
+    expect(screen.getByText("1 partition")).toBeTruthy();
+    fireEvent.click(screen.getByRole("tab", { name: "Permissions" }));
+    expect(await screen.findByText("analyst")).toBeTruthy();
+    expect(screen.getByText("Can grant")).toBeTruthy();
+    expect(confirm).not.toHaveBeenCalled();
   });
 });
