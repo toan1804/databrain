@@ -125,10 +125,23 @@ pub fn tick_report(ws: &Workspace, runs: &[JobRun]) -> TickReport {
     r
 }
 
+const JOBS_HELP: &str = "usage: dbr jobs <command>   (also databrain-jobs <command>)
+
+commands:
+  list                      the jobs, with their next and last run
+  run <job>                 run a job now; exit code 1 when it (or a job run
+                            after it) fails, 2 when it can't start
+      [--set <parameter set>] [--param name=value]...
+  runs <job> [--limit N]    its last runs (5 by default) and the latest one's steps
+  stop <job> [--no-wait]    stop its run wherever it runs and wait (up to a
+                            minute) for it to end; exit code 1 when it isn't
+                            running or hasn't ended
+  tick [--force]            run the jobs that are due (what the OS timer starts)
+
+<job> is its name (any case) or id.";
+
 fn usage() -> ExitCode {
-    eprintln!(
-        "usage: databrain-jobs tick [--force] | run <job> [--set <parameter set>] [--param name=value]... | list | runs <job> [--limit N] | stop <job> [--no-wait]\n       (also dbr jobs …; <job> is its name, any case, or id)"
-    );
+    eprintln!("{JOBS_HELP}");
     ExitCode::from(2)
 }
 
@@ -257,6 +270,17 @@ pub fn main(args: Vec<String>) -> ExitCode {
 
 async fn run(args: Vec<String>) -> ExitCode {
     let Some(cmd) = args.first().map(String::as_str) else { return usage() };
+    match cmd {
+        "-h" | "--help" | "help" => {
+            println!("{JOBS_HELP}");
+            return ExitCode::SUCCESS;
+        }
+        "-v" | "-V" | "--version" => {
+            println!("databrain-jobs {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     let dir = background::data_dir();
     crate::logging::init("databrain-jobs", Some(&dir), false);
     let state = match background::headless_state(&dir) {
