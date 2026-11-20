@@ -898,6 +898,23 @@ mod tests {
         assert_eq!((f(10).as_str(), types[10].as_str()), ("42", "Int64"));
         assert_eq!(types[9], "Float64");
 
+        // XMLTYPE table columns (stored as CLOB or binary XML): go-ora fails
+        // on them ("invalid size for GetInt64"); the helper reads them as text.
+        let _ = run("drop table kb_xml purge").await;
+        run("create table kb_xml (id number, x sys.xmltype, y xmltype) xmltype column x store as clob xmltype column y store as binary xml").await.unwrap();
+        run("insert into kb_xml values (1, xmltype('<a>1</a>'), xmltype('<b>2</b>'))").await.unwrap();
+        run("insert into kb_xml values (2, null, null)").await.unwrap();
+        let x = run("select id, x, y from kb_xml order by id").await.unwrap();
+        let xb = &x.batches[0];
+        let xf = |c: usize, r: usize| {
+            databrain_connector_core::arrow::util::display::ArrayFormatter::try_new(xb.column(c).as_ref(), &Default::default()).unwrap().value(r).to_string()
+        };
+        assert_eq!((xf(1, 0).trim(), xf(2, 0).trim()), ("<a>1</a>", "<b>2</b>"), "{driver}");
+        assert!(xb.column(1).is_null(1) && xb.column(2).is_null(1), "{driver}");
+        // And the connection still works.
+        assert_eq!(run("select count(*) from kb_xml").await.unwrap().num_rows(), 1);
+        run("drop table kb_xml purge").await.unwrap();
+
         // Errors carry the ORA code and position.
         let e = run("select * from no_such_table_xyz").await.unwrap_err();
         assert_eq!(e.code.as_deref(), Some("ORA-00942"), "{e:?}");

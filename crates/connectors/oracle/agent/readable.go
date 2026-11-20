@@ -1,7 +1,8 @@
 // Columns go-ora can't decode (Oracle object types: SDO_GEOMETRY, XMLTYPE,
 // user-defined objects and collections, REFs, native JSON / VECTOR): go-ora
-// stops with "TTC error: received code … during response reading" and the
-// connection's protocol stream is out of step. The query is then run again,
+// stops with "TTC error: received code … during response reading" (or, for
+// an XMLTYPE table column, "invalid size for GetInt64") and the
+// connection's protocol stream may be out of step. The query is then run again,
 // on a new connection, with those columns converted to text on the server.
 package main
 
@@ -18,7 +19,16 @@ func undecodable(err error) bool {
 		return false
 	}
 	m := err.Error()
-	return strings.Contains(m, "TTC error") || strings.Contains(m, "unable to decode oracle type")
+	// "invalid size for GetInt64: 32": go-ora decoding the value of an
+	// XMLTYPE table column (one made in the query reads fine). It, the
+	// buffer under-run and the unexpected packet all mean go-ora lost its
+	// place in the server's reply (the connection is reopened).
+	for _, s := range []string{"TTC error", "unable to decode oracle type", "invalid size for Get", "buffer under-run", "abnormal packet type"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // unreadableType: a column type go-ora describes but may not decode.
