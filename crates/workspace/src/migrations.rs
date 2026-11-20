@@ -495,6 +495,41 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE ai_usage ADD COLUMN credits REAL NOT NULL DEFAULT 0;
     "#,
+    // v25: what the AI knew of its tables when the explorer cache lost
+    // them without the server saying each one is gone (a schema missing
+    // from a schema list, a listing that came back empty, a cleared
+    // cache): kept for the AI, marked with when, until the table is seen
+    // again, a filled listing leaves it out, or 60 days pass.
+    r#"
+    CREATE TABLE ai_kept (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        kind          TEXT NOT NULL,
+        comment       TEXT,
+        row_estimate  INTEGER,
+        columns_json  TEXT,
+        fks_json      TEXT,
+        described_at  INTEGER,
+        missing_since INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, schema_name, name)
+    );
+    DROP VIEW IF EXISTS ai_objects;
+    CREATE VIEW ai_objects AS
+        SELECT o.connection_id, o.schema_name, o.name, o.kind, o.comment, o.row_estimate,
+               c.columns_json, c.fks_json, c.seen_at AS described_at, c.stale, NULL AS missing_since
+        FROM ai_tables a
+        JOIN meta_objects o ON o.connection_id = a.connection_id AND o.schema_name = a.schema_name AND o.name = a.name
+            AND o.kind IN ('table', 'view', 'materialized_view', 'foreign_table')
+        LEFT JOIN meta_columns c ON c.connection_id = a.connection_id AND c.schema_name = a.schema_name AND c.table_name = a.name
+        UNION ALL
+        SELECT k.connection_id, k.schema_name, k.name, k.kind, k.comment, k.row_estimate,
+               k.columns_json, k.fks_json, k.described_at, 1, k.missing_since
+        FROM ai_tables a
+        JOIN ai_kept k ON k.connection_id = a.connection_id AND k.schema_name = a.schema_name AND k.name = a.name
+        WHERE NOT EXISTS (SELECT 1 FROM meta_objects o WHERE o.connection_id = k.connection_id AND o.schema_name = k.schema_name
+            AND o.name = k.name AND o.kind IN ('table', 'view', 'materialized_view', 'foreign_table'));
+    "#,
 ];
 
 impl Workspace {

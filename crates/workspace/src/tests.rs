@@ -158,13 +158,13 @@ fn schema_version_guard_and_backup() {
     {
         let c = Connection::open(&path).unwrap();
         c.pragma_update(None, "user_version", 19i64).unwrap();
-        // Undo v24, v23, v22 and v21.
-        c.execute_batch("ALTER TABLE ai_usage DROP COLUMN credits; DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
+        // Undo v25 (its view goes with v20's below), v24, v23, v22 and v21.
+        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits; DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
         // Undo v20, as an older version left it: schema `s`
         // indexed in full (index scope `*`), `hr.teams` indexed on its own,
         // and `hr.salaries` only seen in the explorer.
         let cols = r#"[{"name":"id","data_type":"int","nullable":false,"is_primary_key":true}]"#;
-        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_scope; DROP TABLE ai_tables; DELETE FROM maintenance WHERE name = 'ai_tables_v20';").unwrap();
+        c.execute_batch("DROP TABLE ai_scope; DROP TABLE ai_tables; DELETE FROM maintenance WHERE name = 'ai_tables_v20';").unwrap();
         for (s, n) in [("s", "orders"), ("hr", "teams")] {
             c.execute(
                 "INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
@@ -541,7 +541,7 @@ fn an_earlier_draft_of_v22_is_repaired() {
         // At v22, which then held v23's tables too: v23 runs over them.
         // Later migrations are taken back too, so they can run again.
         c.pragma_update(None, "user_version", 22i64).unwrap();
-        c.execute_batch("ALTER TABLE ai_usage DROP COLUMN credits;").unwrap();
+        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits;").unwrap();
         c.execute_batch(
             "DROP TABLE job_after_pending; \
              CREATE TABLE job_after_pending (job_id TEXT PRIMARY KEY, after TEXT NOT NULL, added_at INTEGER NOT NULL); \

@@ -72,6 +72,14 @@ impl ToolContext {
             return Ok(out(knowledge::render_object(&o, &target.ai_policy, &[]), json!({"table": full})));
         }
         let mut text = knowledge::render_object(&o, &target.ai_policy, &notes);
+        // Kept from before the cache lost it (and not read now): say so.
+        if let Some(since) = tables.missing_since(&o)? {
+            text.push_str(&format!(
+                "
+{}",
+                knowledge::kept_note(since)
+            ));
+        }
         // Tables that reference this one.
         let refs: Vec<String> = tables
             .objects()?

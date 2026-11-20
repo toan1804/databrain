@@ -146,6 +146,16 @@ pub async fn index_connection(
     index_connection_with(engine, connection_id, scope, false, progress, cancel).await
 }
 
+/// Told with a table the AI knows only from before the explorer cache lost
+/// it (`since`, ms): its definition may be out of date, or it may be gone.
+pub fn kept_note(since: i64) -> String {
+    let day = databrain_workspace::day_text(since);
+    format!(
+        "Not seen on the server since {day}: this is what DataBrain kept of it (the server wasn't read, or no longer lists it). \
+         It may have changed or been dropped; say so when you use it."
+    )
+}
+
 /// [`index_connection`]; `full` re-reads every schema even when its
 /// fingerprint says nothing changed.
 pub async fn index_connection_with(

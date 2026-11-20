@@ -144,7 +144,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
         title: `Clear cached metadata of "${conn.name}"?`,
         reasons: [
           "Forgets the schemas, tables, columns and keys DataBrain keeps for this connection, and reads them again from the server.",
-          "Until a schema is read again, the AI can't use its tables (what it may use stays chosen). Notes and AI knowledge choices are kept.",
+          "The AI keeps what it knew of the tables it may use until they are read again (at most 60 days). Notes and AI knowledge choices are kept.",
         ],
         confirmLabel: "Clear and reload",
         onCancel: () => resolve(false),

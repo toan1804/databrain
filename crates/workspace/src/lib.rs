@@ -75,6 +75,11 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// The local date of a time in ms, `2026-11-20`.
+pub fn day_text(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()).unwrap_or_default()
+}
+
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -166,6 +171,8 @@ impl Workspace {
         if let Err(e) = ws.build_ai_tables() {
             tracing::warn!("building the AI's table list failed; retried on the next start: {e}");
         }
+        // Kept tables not seen for 60 days go (best effort).
+        let _ = ws.kept_expire(now_ms());
         Ok(ws)
     }
 }

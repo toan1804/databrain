@@ -512,6 +512,8 @@ impl Workspace {
         // An existing rule (the user excluded the schema) is kept.
         if !objects.is_empty() {
             Self::put_rule_if_absent(&tx, connection_id, &crate::ScopeRule { schema: schema.to_string(), table: String::new(), allow: true })?;
+            // A read that found tables answers for the schema's kept ones.
+            Self::kept_answered_tx(&tx, connection_id, schema)?;
         }
         Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
@@ -843,6 +845,7 @@ impl Workspace {
 
     pub(crate) fn kn_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
         tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
+        Self::kept_forget_tx(tx, connection_id)?;
         // Search rows go with `ai_tables` (kept in step); the scope stays.
         Self::ai_forget_tx(tx, connection_id)?;
         tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;

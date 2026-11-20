@@ -157,6 +157,13 @@ impl Workspace {
             .optional()?
             .flatten();
         let old_versions = Self::versions_tx(&tx, connection_id, schema)?;
+        // A listing with tables answers for every table of the schema; one
+        // without any may be a server that shows this user nothing: what
+        // the AI may use is kept (see `keep_tx`).
+        let answered = objects.iter().any(|o| o.kind.is_relation());
+        if !answered {
+            Self::keep_tx(&tx, connection_id, Some(schema))?;
+        }
         tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2", params![connection_id, schema])?;
         Self::meta_insert(&tx, connection_id, objects, versions)?;
         let names: HashSet<&str> = objects.iter().map(|o| o.name.as_str()).collect();
@@ -175,6 +182,9 @@ impl Workspace {
         };
         Self::columns_changed(&tx, connection_id, schema, &changed, &names)?;
         Self::mark_listed(&tx, connection_id, schema, fingerprint)?;
+        if answered {
+            Self::kept_answered_tx(&tx, connection_id, schema)?;
+        }
         Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
         Ok(())
@@ -194,6 +204,12 @@ impl Workspace {
     ) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
+        // As a listing: versions that name tables answer for the schema;
+        // none left is kept for the AI.
+        let answered = versions.keys().any(|k| k.split_once(':').is_some_and(|(kind, _)| parse_kind(kind).is_relation()));
+        if !answered {
+            Self::keep_tx(&tx, connection_id, Some(schema))?;
+        }
         {
             let mut del = tx.prepare_cached("DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND kind = ?3 AND name = ?4")?;
             for k in removed.iter().chain(upserts.iter().map(|o| version_key(o.kind, &o.name)).collect::<Vec<_>>().iter()) {
@@ -220,6 +236,9 @@ impl Workspace {
         let changed: Vec<&str> = upserts.iter().map(|o| o.name.as_str()).collect();
         Self::columns_changed(&tx, connection_id, schema, &changed, &names.iter().map(String::as_str).collect())?;
         Self::mark_listed(&tx, connection_id, schema, fingerprint)?;
+        if answered {
+            Self::kept_answered_tx(&tx, connection_id, schema)?;
+        }
         Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
         Ok(())
@@ -362,10 +381,13 @@ impl Workspace {
     }
 
     fn drop_schema_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, schema: &str) -> Result<()> {
+        // The list it is missing from says nothing of its tables: what the
+        // AI may use of them is kept (see `keep_tx`).
+        Self::keep_tx(tx, connection_id, Some(schema))?;
         for t in ["meta_objects", "meta_columns", "meta_schemas"] {
             tx.execute(&format!("DELETE FROM {t} WHERE connection_id = ?1 AND schema_name = ?2"), params![connection_id, schema])?;
         }
-        // Nothing left there for the AI either, and nothing an index run read.
+        // Nothing an index run read is left there.
         Self::index_unread_tx(tx, connection_id, Some(schema))?;
         Self::ai_refresh_tx(tx, connection_id, Some(schema))?;
         Ok(())
@@ -547,7 +569,7 @@ impl Workspace {
             // Cached before identities were recorded: assume it is the same server.
             None => false,
             Some(_) => {
-                Self::meta_clear_tx(&tx, connection_id)?;
+                Self::meta_clear_tx(&tx, connection_id, false)?;
                 Self::kn_clear_tx(&tx, connection_id)?;
                 tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1", [connection_id])?;
                 // The schemas chosen for indexing too: the next "Index for
@@ -610,6 +632,7 @@ impl Workspace {
             params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), now_ms(), fks],
         )?;
         // The AI's search row of the table, when it may use it.
+        Self::kept_described_tx(&tx, connection_id, schema, table)?;
         Self::ai_refresh_table_tx(&tx, connection_id, schema, table)?;
         tx.commit()?;
         Ok(())
@@ -632,6 +655,7 @@ impl Workspace {
                  fks_json = coalesce(excluded.fks_json, meta_columns.fks_json), stale = 0",
                 params![connection_id, schema, t.table, serde_json::to_string(&t.columns).unwrap_or_else(|_| "[]".into()), now, fks],
             )?;
+            Self::kept_described_tx(&tx, connection_id, schema, &t.table)?;
             Self::ai_refresh_table_tx(&tx, connection_id, schema, &t.table)?;
         }
         tx.commit()?;
@@ -922,12 +946,20 @@ impl Workspace {
         // the AI's tables pointing at a cache that was gone).
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
-        Self::meta_clear_tx(&tx, connection_id)?;
+        Self::meta_clear_tx(&tx, connection_id, true)?;
         tx.commit()?;
         Ok(())
     }
 
-    pub(crate) fn meta_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
+    /// `keep`: the user cleared the cache of a server that is still the
+    /// same, so what the AI may use is kept until it is read again (see
+    /// `keep_tx`). Not when the connection points elsewhere.
+    pub(crate) fn meta_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, keep: bool) -> Result<()> {
+        if keep {
+            Self::keep_tx(tx, connection_id, None)?;
+        } else {
+            Self::kept_forget_tx(tx, connection_id)?;
+        }
         tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_views WHERE connection_id = ?1", [connection_id])?;
@@ -935,8 +967,9 @@ impl Workspace {
         tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
         Self::index_unread_tx(tx, connection_id, None)?;
         tx.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
-        // The tables the AI could use are gone with them (its scope stays).
-        Self::ai_forget_tx(tx, connection_id)?;
+        // The tables the AI could use are gone with them, but those kept
+        // (its scope stays).
+        Self::ai_refresh_tx(tx, connection_id, None)?;
         Ok(())
     }
 }

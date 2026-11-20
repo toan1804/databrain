@@ -348,6 +348,15 @@ async fn denied_approval_and_blocked_writes() {
     assert!(o.content.contains("customer_id") && !o.content.contains("Referenced by"));
     let o = auto.call("describe_table", &json!({"table": "customers"})).await;
     assert!(o.content.contains("Referenced by: main.orders"), "{}", o.content);
+    // The explorer cache is cleared: the AI still has the table (kept), and
+    // a describe that reaches the server makes it the cache's again.
+    f.ws.meta_clear(&f.conn).unwrap();
+    let kept = f.ws.ai_catalog(&f.conn).get("orders").unwrap().unwrap();
+    assert!(f.ws.ai_catalog(&f.conn).missing_since(&kept.schema, &kept.name).unwrap().is_some());
+    assert!(databrain_ai::knowledge::kept_note(0).starts_with("Not seen on the server since 19"));
+    let o = auto.call("describe_table", &json!({"table": "orders"})).await;
+    assert!(o.content.contains("customer_id") && !o.content.contains("Not seen on the server"), "{}", o.content);
+    assert!(f.ws.ai_catalog(&f.conn).missing_since(&kept.schema, &kept.name).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1151,10 +1160,11 @@ async fn knowledge_index_plan_scope_and_cancel() {
     // So does clearing the explorer cache, where the AI's tables live: the
     // next run reads them again instead of skipping every schema as unchanged.
     f.ws.meta_clear(&conn).unwrap();
-    assert_eq!(f.ws.ai_catalog(&conn).count().unwrap(), 0);
+    assert_eq!(f.ws.ai_catalog(&conn).count().unwrap(), 60, "kept for the AI meanwhile");
     let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| {}, &Default::default()).await.unwrap();
     assert_eq!((r.objects, r.skipped), (60, 0));
     assert!(f.ws.ai_catalog(&conn).get("lake.s07.t07").unwrap().unwrap().columns.iter().any(|c| c.name == "email"), "read again, with columns");
+    assert!(f.ws.ai_catalog(&conn).missing_since("lake.s07", "t07").unwrap().is_none(), "and the cache's again");
 
     // Already cancelled before start.
     let done = tokio_util::sync::CancellationToken::new();
