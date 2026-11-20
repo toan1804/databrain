@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use databrain_connector_core::ColumnInfo;
 use databrain_connector_core::ConnectorError;
 use databrain_connector_core::ConnectorKind;
+use databrain_connector_core::quote_ident;
 use databrain_connector_core::DbObject;
 use databrain_connector_core::ExecOptions;
 use databrain_connector_core::ObjectDetail;
