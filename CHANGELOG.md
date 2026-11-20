@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **`dbr --help` and `--version`:** `dbr --help` (`-h`, or `dbr` alone) prints its options, examples, exit codes and where it is installed; `dbr jobs --help` the jobs commands; `-v`/`--version` the version (`databrain-jobs --version` too). The README has a "Command line" section.
+
 ### Fixed
 
 - **Table explorer: Columns and Relations on a table without foreign keys:** they failed with "undefined is not an object (evaluating 't.foreign_keys.find')" (any database): a table with no foreign keys was sent without the list.

@@ -32,13 +32,45 @@ use crate::api::AppState;
 use crate::background;
 
 const USAGE: &str = "usage: dbr [-c <connection>] -i [--csv|--json|--tsv] [--limit N] [-p name=value]… [--yes] <sql | file.sql | data file>…
-  -c, --conn <name>    a saved connection (name, any case); default: the local DuckDB
-  -i, --inline         print the rows here (opening them in the app comes later)
+       dbr jobs list | run <job> | runs <job> | stop <job>   (dbr jobs --help)
+       dbr --help | --version";
+
+/// `dbr --help`: what it does, its options, examples and exit codes.
+const HELP: &str = "dbr: run SQL from a terminal on a DataBrain connection and print the rows.
+
+usage: dbr [-c <connection>] -i [options] <sql | file.sql | data file>…
+       dbr jobs list | run <job> | runs <job> | stop <job>
+
+options:
+  -c, --conn <name>    a saved connection (its name, any case, or a part of it
+                       when only one matches); default: the local DuckDB
+  -i, --inline         print the rows here (needed for now: opening them in
+                       the app comes later)
   -e, --execute <sql>  this text is SQL (when it could be read as a file name)
   --csv, --json, --tsv every row in that format (CSV by default when piped)
-  --limit <n>          rows to show: a table shows 100 by default, at most 1,000
-  -p, --param <n=v>    a value for :n (repeatable)
-  -y, --yes            run on a production connection without asking";
+  --limit <n>          rows a table shows: 100 by default, at most 1,000
+  -p, --param <n=v>    a value for :n in the SQL (repeatable)
+  -y, --yes            run on a production connection without asking
+  -h, --help           this help
+  -v, --version        the version
+
+It runs as the app's editor does: a read-only connection refuses writes,
+and what the app would confirm on a production connection is asked here
+([y/N]). Each run is in the app's query history as \"Terminal\".
+
+examples:
+  dbr -c \"Sales PG\" -i \"select * from orders limit 10\"
+  dbr -c sales -i report.sql -p day=2026-11-20
+  dbr -c sales -i --csv \"select * from orders\" > orders.csv
+  dbr -i data.parquet orders.xlsx events/      (CSV, Parquet, JSON, Excel,
+                                               Delta/Iceberg folders)
+  dbr jobs run \"Daily load\"
+
+exit codes: 0 done, 1 a statement failed, 2 bad arguments or a question
+answered no, 130 stopped (Ctrl-C).
+
+dbr is next to the app (DataBrain.app/Contents/MacOS/dbr on macOS, the
+install folder on Windows and Linux); link it into your PATH.";
 
 /// Most rows a table in the terminal shows.
 pub const TABLE_MAX: usize = 1_000;
@@ -68,6 +100,7 @@ pub struct Opts {
     pub params: HashMap<String, ParamValue>,
     pub yes: bool,
     pub help: bool,
+    pub version: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +118,7 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => o.help = true,
+            "-v" | "-V" | "--version" => o.version = true,
             "-i" | "--inline" => o.inline = true,
             "-y" | "--yes" => o.yes = true,
             "-c" | "--conn" => o.conn = Some(value(&mut it, a)?),
@@ -107,7 +141,7 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
             s => o.sources.push(Source::Sql(s.to_string())),
         }
     }
-    if !o.help && o.sources.is_empty() {
+    if !o.help && !o.version && o.sources.is_empty() {
         return Err("nothing to run: give SQL, a .sql file or a data file".into());
     }
     Ok(o)
@@ -312,6 +346,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
     if args.first().map(String::as_str) == Some("jobs") {
         return crate::cli::jobs::main(args[1..].to_vec());
     }
+    // Nothing to run: what dbr does, rather than an error.
+    if args.is_empty() {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
     // A folder is a data source (Delta, Iceberg, Parquet files), whatever its name.
     let opts = match parse(&args, |p| p.is_file() || p.is_dir()) {
         Ok(o) => o,
@@ -321,7 +360,11 @@ pub fn main(args: Vec<String>) -> ExitCode {
         }
     };
     if opts.help {
-        println!("{USAGE}");
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
+    if opts.version {
+        println!("dbr {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
     if !opts.inline {
@@ -744,6 +787,9 @@ mod tests {
         // SQL that starts with a `--` comment is SQL, not an option.
         assert_eq!(parse(&args(&["-i", "--x\nselect\n1"]), files).unwrap().sources, [Source::Sql("--x\nselect\n1".into())]);
         assert!(parse(&args(&["--help"]), files).unwrap().help);
+        assert!(parse(&args(&["-h"]), files).unwrap().help);
+        assert!(parse(&args(&["--version"]), files).unwrap().version);
+        assert!(parse(&args(&["-v"]), files).unwrap().version);
     }
 
     #[test]

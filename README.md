@@ -54,6 +54,21 @@ The screenshots are made from the UI with sample data (`cd ui && npm run screens
 
 See [docs/FEATURES.md](docs/FEATURES.md) for the full reference.
 
+## Command line
+
+`dbr` runs SQL from a terminal on a saved connection, with its credentials and safety rules, and prints the rows:
+
+```sh
+dbr -c "Sales PG" -i "select * from orders limit 10"     # a table as wide as the terminal
+dbr -c sales -i report.sql -p day=2026-11-20             # a .sql file, :day filled in
+dbr -c sales -i --csv "select * from orders" > out.csv   # every row (also --json, --tsv)
+dbr -i data.parquet orders.xlsx events/                  # local files, read with DuckDB
+dbr jobs list                                            # jobs: list, run, runs, stop
+dbr --help                                               # every option; dbr --version
+```
+
+`-c` takes the connection's name (any case); without it, `dbr` uses the local DuckDB. A read-only connection refuses writes and a production one asks `[y/N]` (or `--yes`), as the app's editor does, and every run is in the query history as "Terminal". `dbr` is installed next to the app (`DataBrain.app/Contents/MacOS/dbr` on macOS, the install folder on Windows and Linux): link it into your PATH, e.g. `ln -s /Applications/DataBrain.app/Contents/MacOS/dbr /usr/local/bin/dbr`. Exit codes: 0 done, 1 a statement failed, 2 bad arguments or a question answered no, 130 stopped. More in [docs/FEATURES.md](docs/FEATURES.md) (`dbr` (terminal)).
+
 ## Build from source
 
 Requirements:
