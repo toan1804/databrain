@@ -2072,6 +2072,7 @@ dependencies = [
  "futures",
  "native-tls",
  "postgres-native-tls",
+ "postgres-protocol",
  "secrecy",
  "tokio",
  "tokio-postgres",

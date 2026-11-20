@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Eye,
   FileCode2,
+  KeyRound,
   LogIn,
   Eraser,
   NotebookPen,
@@ -27,6 +28,7 @@ import { ConnDot, EnvBadge, MenuItem, MenuSeparator, Popover } from "../ui";
 import { kbd } from "../../lib/platform";
 import { CatalogNode, SchemaNode } from "./CatalogNodes";
 import { Row, useTreeOpen } from "./primitives";
+import { canChangePassword, ChangePasswordDialog } from "../connection/ChangePasswordDialog";
 
 /** Connections whose explorer was opened this session (cache shown, then checked). */
 const explorerOpened = new Set<string>();
@@ -45,6 +47,7 @@ export function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [changingPassword, setChangingPassword] = useState(false);
 
   const loaded = !!(catalogList ?? schemas);
   const load = useCallback(
@@ -194,6 +197,7 @@ export function ConnectionNode({ conn }: { conn: ConnectionView }) {
                 .then((cleared) => cleared && setExpanded(true));
             }}
           />
+          {canChangePassword(conn) && <MenuItem icon={<KeyRound size={13} />} label="Change password…" onClick={() => { setMenu(null); setChangingPassword(true); }} />}
           {conn.connected && (
             <MenuItem icon={<Unplug size={13} />} label="Disconnect" onClick={() => { setMenu(null); setExpanded(false); void disconnect(conn.id); }} />
           )}
@@ -203,6 +207,7 @@ export function ConnectionNode({ conn }: { conn: ConnectionView }) {
           <MenuItem icon={<Trash2 size={13} />} label="Delete connection…" hint={kbd("⌘⌫")} danger onClick={() => { setMenu(null); void useStore.getState().deleteConnection(conn.id); }} />
         </Popover>
       )}
+      {changingPassword && <ChangePasswordDialog conn={conn} onClose={() => setChangingPassword(false)} />}
       {expanded && status?.offline && (
         <Row
           depth={1}

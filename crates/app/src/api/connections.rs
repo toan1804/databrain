@@ -207,6 +207,41 @@ pub fn reconnect(state: &AppState, id: &str) -> usize {
     state.engine.reconnect(id)
 }
 
+/// Change the connection's password on the server, then the one saved for
+/// it (when one is saved): the next sign-in uses it. With a saved password,
+/// `current` must be it (PostgreSQL and older MySQL don't check it
+/// themselves). Neither password is logged or kept anywhere else.
+pub async fn change_password(state: &AppState, id: &str, current: String, new: String) -> Result<()> {
+    if new.is_empty() {
+        return Err(invalid("Type the new password"));
+    }
+    if new == current {
+        return Err(invalid("The new password is the current one"));
+    }
+    let profile = state.workspace.get_connection(id)?;
+    let saved = SecretRef::for_connection(id);
+    if profile.has_secret {
+        let stored = state.secrets.get(&saved)?;
+        if stored.as_ref().map(secrecy::ExposeSecret::expose_secret) != Some(current.as_str()) {
+            return Err(invalid("The current password isn't the one saved for this connection"));
+        }
+    }
+    state.engine.change_password(id, &current, &new).await?;
+    // Its sessions sign in with the new one from here on (they would on
+    // their next reconnect anyway).
+    state.engine.disconnect(id);
+    state.engine.forget_credentials(id);
+    if profile.has_secret
+        && let Err(e) = state.secrets.set(&saved, &SecretString::from(new))
+    {
+        return Err(EngineError::new(
+            "partial",
+            format!("The password was changed on the server, but the new one couldn't be saved ({e}): type it in the connection's settings."),
+        ));
+    }
+    Ok(())
+}
+
 /// The user checked an SSH server's key fingerprint and trusts it.
 pub fn trust_ssh_host_key(state: &AppState, host: &str, port: u16, fingerprint: &str) -> Result<usize> {
     state.engine.trust_ssh_host_key(host, port, fingerprint)

@@ -106,6 +106,27 @@ impl Session for PgSession {
         ConnectorKind::Postgres
     }
 
+    /// `ALTER USER … PASSWORD` with the password hashed here, as psql's
+    /// `\password` does (the server's log and statistics never see it):
+    /// SCRAM-SHA-256 from PostgreSQL 10, MD5 before and on Redshift (an
+    /// older server would take a SCRAM verifier for the password itself).
+    async fn change_password(&self, _current: &str, new: &str) -> Result<()> {
+        let redshift = self.redshift || self.detected_redshift;
+        let row = self
+            .client()
+            .query_one(if redshift { "select current_user::text, 0" } else { "select current_user::text, current_setting('server_version_num')::int" }, &[])
+            .await
+            .map_err(|e| map_err(&e))?;
+        let (user, version): (String, i32) = (row.get(0), row.get(1));
+        let hashed = if version >= 100_000 {
+            postgres_protocol::password::scram_sha_256(new.as_bytes())
+        } else {
+            postgres_protocol::password::md5(new.as_bytes(), &user)
+        };
+        let sql = format!("ALTER USER {} PASSWORD {}", quote(&user), databrain_connector_core::quote_literal_pg(&hashed));
+        self.client().batch_execute(&sql).await.map_err(|e| map_err(&e))
+    }
+
     async fn server_version(&self) -> Result<String> {
         let row = self.client().query_one("select version()", &[]).await.map_err(|e| map_err(&e))?;
         Ok(row.get(0))

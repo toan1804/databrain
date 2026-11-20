@@ -110,6 +110,21 @@ impl Session for MysqlSession {
         }
     }
 
+    /// `ALTER USER CURRENT_USER() IDENTIFIED BY … REPLACE …` (MySQL
+    /// 8.0.13+ checks the current password with it); without `REPLACE`
+    /// where the server doesn't know it (MariaDB, older MySQL: a syntax
+    /// error, nothing changed).
+    async fn change_password(&self, current: &str, new: &str) -> Result<()> {
+        let q = |s: &str| databrain_connector_core::sql::quote_string(s, ConnectorKind::Mysql);
+        let sql = format!("ALTER USER CURRENT_USER() IDENTIFIED BY {} REPLACE {}", q(new), q(current));
+        match self.run_internal(&sql).await {
+            Err(e) if e.code.as_deref().is_some_and(|c| c.starts_with("1064 ")) => {
+                self.run_internal(&format!("ALTER USER CURRENT_USER() IDENTIFIED BY {}", q(new))).await
+            }
+            r => r,
+        }
+    }
+
     async fn ping(&self) -> Result<()> {
         self.conn.lock().await.ping().await.map_err(map_err)
     }

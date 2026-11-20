@@ -171,6 +171,20 @@ impl Session for OracleSession {
         .await
     }
 
+    /// `ALTER USER … IDENTIFIED BY "new" REPLACE "current"` for the user
+    /// signed in (`REPLACE` is what a profile's verify function needs). A
+    /// password is a quoted identifier there: it can't hold `"`.
+    async fn change_password(&self, current: &str, new: &str) -> Result<()> {
+        if new.contains('"') || current.contains('"') {
+            return Err(ConnectorError::config("An Oracle password can't contain a double quote (\")"));
+        }
+        let rows = self.query_named("select user from dual", vec![]).await?;
+        let user =
+            rows.first().and_then(|r| r.first().cloned().flatten()).ok_or_else(|| ConnectorError::query("the server didn't say which user is signed in"))?;
+        let sql = format!("ALTER USER {} IDENTIFIED BY \"{new}\" REPLACE \"{current}\"", quote_ident(ConnectorKind::Oracle, &user));
+        self.run_internal(&sql).await
+    }
+
     async fn ping(&self) -> Result<()> {
         if let Backend::Thin(a) = &self.backend {
             return a.call(serde_json::json!({"op": "ping"})).await.map(|_| ());
@@ -1163,6 +1177,40 @@ mod tests {
         s.execute(Statement::internal("commit"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(run("select count(*) from kb_arr").await.unwrap()[0][0].as_deref(), Some("3"), "the failed call's first row isn't kept");
         run("drop table kb_arr purge").await.unwrap();
+    }
+
+    /// Live: a user changes its own password (`REPLACE` the current one):
+    /// the new one signs in, the old one no longer does. Needs a user that
+    /// may create users (DATABRAIN_ORACLE_USER, e.g. system).
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_change_password() {
+        let driver = std::env::var("DATABRAIN_ORACLE_DRIVER").unwrap_or_else(|_| "thin".into());
+        let Some(admin) = live_session(&driver, false).await else {
+            panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
+        };
+        let connect = |pw: &'static str| {
+            let driver = driver.clone();
+            async move {
+                use databrain_auth::InlineCredentialSource;
+                let mut cfg = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: "kb_pw".into() });
+                cfg.host = std::env::var("DATABRAIN_ORACLE_HOST").ok();
+                cfg.port = std::env::var("DATABRAIN_ORACLE_PORT").ok().and_then(|p| p.parse().ok());
+                cfg.options.insert("service_name".into(), std::env::var("DATABRAIN_ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".into()));
+                cfg.options.insert("driver".into(), driver);
+                open(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "kb_pw".into() }, Some(secrecy::SecretString::from(pw))))).await
+            }
+        };
+        let _ = admin.run_internal("drop user kb_pw").await;
+        admin.run_internal("create user kb_pw identified by \"Old_pw_1\"").await.unwrap();
+        admin.run_internal("grant create session to kb_pw").await.unwrap();
+        let s = connect("Old_pw_1").await.unwrap();
+        assert!(s.change_password("Old_pw_1", "a\"b").await.is_err(), "a double quote is refused");
+        s.change_password("Old_pw_1", "New'pw_2").await.unwrap();
+        drop(s);
+        assert!(connect("New'pw_2").await.is_ok(), "the new password signs in");
+        assert!(connect("Old_pw_1").await.is_err(), "the old one no longer does");
+        admin.run_internal("drop user kb_pw").await.unwrap();
     }
 
     /// Live: DATABRAIN_ORACLE_HOST, _USER, _PASSWORD, _SERVICE (e.g. gvenzl/oracle-free).

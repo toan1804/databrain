@@ -205,6 +205,8 @@ export const api = {
   disconnect: (id: string) => call<void>("disconnect", { id }),
   /** Sign in again on the next call (metadata session and idle tabs), so rights granted since the login apply. */
   reconnect: (id: string) => call<number>("reconnect", { id }),
+  /** Change the connection's password on the server, then the saved one. */
+  changePassword: (id: string, current: string, next: string) => call<null>("change_password", { id, current, new: next }),
   /** Pin a checked SSH host key on the saved connections through `host:port` that have none. */
   trustSshHostKey: (host: string, port: number, fingerprint: string) => call<number>("trust_ssh_host_key", { host, port, fingerprint }),
 

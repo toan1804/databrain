@@ -45,6 +45,27 @@ impl QueryEngine {
         Ok(self.credentials(&profile)?.status())
     }
 
+    /// Change the password of the connection's user on the server
+    /// ([`Session::change_password`]), on a session of its own that is
+    /// closed after. The caller saves the new password; the connection's
+    /// other sessions stay signed in until they reconnect.
+    pub async fn change_password(&self, connection_id: &str, current: &str, new: &str) -> Result<()> {
+        let profile = self.workspace.get_connection(connection_id)?;
+        let traits = profile.config.kind.traits();
+        if !traits.change_password {
+            return Err(EngineError::new("unsupported", format!("{} passwords can't be changed from DataBrain", traits.name)));
+        }
+        if !matches!(profile.config.auth, databrain_auth::AuthMethod::Password { .. }) {
+            return Err(EngineError::new("invalid", "Only a connection that signs in with a password can change it here"));
+        }
+        let tab = "__change_password";
+        let s = self.session(connection_id, tab).await?;
+        let r = s.change_password(current, new).await;
+        drop(s);
+        self.drop_session(connection_id, tab);
+        Ok(r?)
+    }
+
     /// Forget cached credentials after a connection is edited.
     pub fn forget_credentials(&self, connection_id: &str) {
         self.creds.lock().remove(connection_id);

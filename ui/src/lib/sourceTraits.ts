@@ -45,6 +45,8 @@ export interface SourceTraits {
     /** Update and Merge by key are possible (not on ClickHouse). */
     keyed: boolean;
   } | null;
+  /** The signed-in user can change its password from DataBrain. */
+  change_password: boolean;
 }
 
 const FALLBACK: SourceTraits = {
@@ -69,6 +71,7 @@ const FALLBACK: SourceTraits = {
   ssl_setting: false,
   formatter: "sql",
   load: null,
+  change_password: false,
 };
 
 let table: Record<string, SourceTraits> = builtIn as unknown as Record<string, SourceTraits>;

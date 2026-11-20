@@ -2097,3 +2097,51 @@ async fn a_conversation_left_during_a_turn_lets_late_outputs_go() {
     crate::ai_api::leave_session(&st, "t");
     assert!(st.ai.left.lock().is_empty());
 }
+
+/// Change password: the current password must be the saved one (PostgreSQL
+/// doesn't check it), a new one is required, and a database that can't is
+/// refused, all before anything reaches a server.
+#[tokio::test]
+async fn change_password_checks_before_the_server() {
+    use secrecy::ExposeSecret;
+    let (st, _, _dir) = state();
+    let save = |kind: ConnectorKind, secret: Option<&str>| {
+        let mut cfg = ConnectionConfig::new(kind, databrain_auth::AuthMethod::Password { user: "me".into() });
+        cfg.host = Some("127.0.0.1".into());
+        cfg.port = Some(1);
+        if kind == ConnectorKind::Snowflake {
+            cfg.options.insert("account".into(), "acme".into());
+        }
+        save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: format!("{kind:?}"),
+                    config: cfg,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: false,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: secret.map(str::to_string),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+    };
+    let pg = save(ConnectorKind::Postgres, Some("hunter2"));
+    let e = change_password(&st, &pg.id, "guess".into(), "new".into()).await.unwrap_err();
+    assert!(e.message.contains("isn't the one saved"), "{e:?}");
+    assert!(change_password(&st, &pg.id, "hunter2".into(), "".into()).await.unwrap_err().message.contains("new password"));
+    assert!(change_password(&st, &pg.id, "hunter2".into(), "hunter2".into()).await.unwrap_err().message.contains("is the current one"));
+    // The right current password reaches the server (none listens here): the saved one stays.
+    assert!(change_password(&st, &pg.id, "hunter2".into(), "new".into()).await.is_err());
+    assert_eq!(st.secrets.get(&SecretRef::for_connection(&pg.id)).unwrap().unwrap().expose_secret(), "hunter2");
+    let sf = save(ConnectorKind::Snowflake, Some("pw"));
+    assert_eq!(change_password(&st, &sf.id, "pw".into(), "new".into()).await.unwrap_err().kind, "unsupported");
+}

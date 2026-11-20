@@ -230,6 +230,26 @@ impl Session for MssqlSession {
         self.state.tx_state()
     }
 
+    /// `ALTER LOGIN … WITH PASSWORD = … OLD_PASSWORD = …` for the login
+    /// signed in (SQL Server authentication; a login may change its own
+    /// password when it gives the current one).
+    async fn change_password(&self, current: &str, new: &str) -> Result<()> {
+        let rows = self.rows("select suser_sname()", vec![]).await?;
+        let login = rows
+            .first()
+            .and_then(|r| r.get::<&str, _>(0))
+            .map(str::to_string)
+            .ok_or_else(|| ConnectorError::query("the server didn't say which login is signed in"))?;
+        let lit = |s: &str| format!("N{}", databrain_connector_core::quote_literal(s));
+        let sql = format!(
+            "ALTER LOGIN {} WITH PASSWORD = {} OLD_PASSWORD = {}",
+            databrain_connector_core::quote_ident(ConnectorKind::Mssql, &login),
+            lit(new),
+            lit(current)
+        );
+        self.run_internal(&sql).await
+    }
+
     async fn ping(&self) -> Result<()> {
         self.rows("select 1", vec![]).await.map(|_| ())
     }
@@ -669,6 +689,43 @@ mod tests {
     use databrain_connector_core::ConnectionConfig;
     use databrain_connector_core::Connector;
     use std::time::Duration;
+
+    /// Live: a SQL Server login changes its own password (with its current
+    /// one): the new one signs in, the old one no longer does.
+    #[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_change_password() {
+        let Ok(host) = std::env::var("DATABRAIN_MSSQL_HOST") else {
+            panic!("live test: DATABRAIN_MSSQL_HOST not set (run with --ignored)");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let connect = |user: String, pw: String| {
+            let host = host.clone();
+            async move {
+                let mut cfg = ConnectionConfig::new(ConnectorKind::Mssql, AuthMethod::Password { user: user.clone() });
+                cfg.host = Some(host);
+                cfg.port = std::env::var("DATABRAIN_MSSQL_PORT").ok().and_then(|p| p.parse().ok());
+                if std::env::var("DATABRAIN_MSSQL_SSL").as_deref() == Ok("disable") {
+                    cfg.ssl_mode = databrain_connector_core::SslMode::Disable;
+                }
+                cfg.options.insert("trust_cert".into(), "true".into());
+                MssqlConnector.connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, Some(secrecy::SecretString::from(pw))))).await
+            }
+        };
+        let admin =
+            connect(std::env::var("DATABRAIN_MSSQL_USER").unwrap_or_else(|_| "sa".into()), std::env::var("DATABRAIN_MSSQL_PASSWORD").unwrap_or_default())
+                .await
+                .unwrap();
+        let _ = admin.run_internal("IF SUSER_ID('kb_pw') IS NOT NULL DROP LOGIN kb_pw").await;
+        admin.run_internal("CREATE LOGIN kb_pw WITH PASSWORD = 'Old_pw_1x!', CHECK_POLICY = OFF").await.unwrap();
+        let s = connect("kb_pw".into(), "Old_pw_1x!".into()).await.unwrap();
+        assert!(s.change_password("wrong", "New'pw_2x!").await.is_err(), "the current password is checked");
+        s.change_password("Old_pw_1x!", "New'pw_2x!").await.unwrap();
+        drop(s);
+        assert!(connect("kb_pw".into(), "New'pw_2x!".into()).await.is_ok(), "the new password signs in");
+        assert!(connect("kb_pw".into(), "Old_pw_1x!".into()).await.is_err(), "the old one no longer does");
+        admin.run_internal("DROP LOGIN kb_pw").await.unwrap();
+    }
 
     /// Live: DATABRAIN_MSSQL_HOST, _USER, _PASSWORD (e.g. the mcr.microsoft.com/mssql/server image).
     #[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
