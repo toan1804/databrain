@@ -30,8 +30,9 @@ pub fn dir(data_dir: &Path) -> std::path::PathBuf {
 /// stderr (never stdout: the MCP server speaks its protocol there). Panics
 /// are logged too. Calling it again does nothing.
 pub fn init(name: &str, data_dir: Option<&Path>, stderr: bool) {
-    // tokio-postgres logs each statement at debug: kept at info, whatever
-    // DATABRAIN_LOG asks (a password change sends a password hash).
+    // tokio-postgres logs each statement at debug: kept at info (a password
+    // change sends a password hash) unless DATABRAIN_LOG names one of its
+    // modules itself (`tokio_postgres::simple_query=debug`).
     let filter = || {
         EnvFilter::try_from_env("DATABRAIN_LOG")
             .unwrap_or_else(|_| EnvFilter::new("info"))

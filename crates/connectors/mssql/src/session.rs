@@ -729,11 +729,16 @@ mod tests {
         assert!(connect("kb_pw".into(), "New'pw_2x!".into()).await.is_ok(), "the new password signs in");
         assert!(connect("kb_pw".into(), "Old_pw_1x!".into()).await.is_err(), "the old one no longer does");
         // The login's sessions may not have ended yet (15434): end them first.
-        admin
-            .run_internal("DECLARE @k nvarchar(max) = N''; SELECT @k += N'KILL ' + CAST(session_id AS nvarchar(10)) + N'; ' FROM sys.dm_exec_sessions WHERE login_name = N'kb_pw'; EXEC (@k)")
-            .await
-            .unwrap();
-        admin.run_internal("DROP LOGIN kb_pw").await.unwrap();
+        // (a session that ends meanwhile fails its KILL: tried again).
+        let mut tries = 0;
+        while let Err(e) = admin.run_internal("DROP LOGIN kb_pw").await {
+            tries += 1;
+            assert!(tries < 20, "{e:?}");
+            let _ = admin
+                .run_internal("DECLARE @k nvarchar(max) = N''; SELECT @k += N'KILL ' + CAST(session_id AS nvarchar(10)) + N'; ' FROM sys.dm_exec_sessions WHERE login_name = N'kb_pw'; EXEC (@k)")
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
 
     /// Live: DATABRAIN_MSSQL_HOST, _USER, _PASSWORD (e.g. the mcr.microsoft.com/mssql/server image).

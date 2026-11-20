@@ -233,11 +233,18 @@ pub async fn change_password(state: &AppState, id: &str, current: String, new: S
     if !traits.change_password {
         return Err(EngineError::new("unsupported", format!("{} passwords can't be changed from DataBrain", traits.name)));
     }
+    if !matches!(profile.config.auth, databrain_auth::AuthMethod::Password { .. }) {
+        return Err(invalid("Only a connection that signs in with a password can change it here"));
+    }
     if profile.config.read_only {
         return Err(EngineError::new("read_only", format!("\"{}\" is read-only: change its password with a connection that isn't", profile.name)));
     }
-    if let Err(e) = state.engine.test_connection(&profile.config, Some(current.clone()), Some(id), None, None).await {
-        return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}", e.message)));
+    // A refused sign-in is the wrong password; anything else (unreachable,
+    // a timeout, an SSH host key to trust) keeps its own error.
+    match state.engine.test_connection(&profile.config, Some(current.clone()), Some(id), None, None).await {
+        Err(e) if e.kind == "auth" => return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}", e.message))),
+        Err(e) => return Err(e),
+        Ok(_) => {}
     }
     state.engine.change_password(id, &current, &new).await?;
     // Saved before anything signs in again, so nothing caches the old one.

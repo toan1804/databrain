@@ -2139,9 +2139,10 @@ async fn change_password_checks_before_the_server() {
     assert!(e.message.contains("isn't the one saved"), "{e:?}");
     assert!(change_password(&st, &pg.id, "hunter2".into(), "".into()).await.unwrap_err().message.contains("new password"));
     assert!(change_password(&st, &pg.id, "hunter2".into(), "hunter2".into()).await.unwrap_err().message.contains("is the current one"));
-    // The right current password must sign in (none listens here): refused, the saved one stays.
+    // The current password must sign in first: no server listens here, so
+    // that error (not "wrong password") comes back and the saved one stays.
     let e = change_password(&st, &pg.id, "hunter2".into(), "new".into()).await.unwrap_err();
-    assert!(e.message.contains("doesn't sign in"), "{e:?}");
+    assert!(e.kind != "auth" && !e.message.contains("doesn't sign in"), "{e:?}");
     assert_eq!(st.secrets.get(&SecretRef::for_connection(&pg.id)).unwrap().unwrap().expose_secret(), "hunter2");
     // A read-only connection is refused before anything signs in.
     let mut ro = st.workspace.get_connection(&pg.id).unwrap();
@@ -2153,6 +2154,7 @@ async fn change_password_checks_before_the_server() {
     cli.config.read_only = false;
     cli.config.auth = databrain_auth::AuthMethod::CloudCli { profile: None };
     st.workspace.save_connection(cli).unwrap();
+    assert!(change_password(&st, &pg.id, "hunter2".into(), "new".into()).await.unwrap_err().message.contains("signs in with a password"));
     assert!(st.engine.change_password(&pg.id, "a", "b").await.unwrap_err().message.contains("password"));
     let sf = save(ConnectorKind::Snowflake, Some("pw"));
     assert_eq!(change_password(&st, &sf.id, "pw".into(), "new".into()).await.unwrap_err().kind, "unsupported");
