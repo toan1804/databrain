@@ -63,6 +63,13 @@ impl<'a> AiTables<'a> {
         }
     }
 
+    /// When the explorer cache lost `o` without the server saying it is
+    /// gone (ms): what is known of it is from before then (see
+    /// [`AiCatalog::missing_since`]).
+    pub fn missing_since(&self, o: &KnObject) -> Result<Option<i64>> {
+        Ok(self.cat.missing_since(&o.schema, &o.name)?)
+    }
+
     pub fn resolve_path(&self, path: &str) -> Result<Option<(KnObject, Option<String>)>> {
         match self.cat.resolve_path(path)?.filter(|(o, _)| self.readable(&o.full_name())) {
             Some((o, c)) => Ok(Some((self.scrub(o)?, c))),

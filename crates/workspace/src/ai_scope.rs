@@ -101,6 +101,10 @@ pub fn scope_allows_by(rules: &[ScopeRule], schema: &str, table: &str, ignore_ca
     best.is_some_and(|(_, allow)| allow)
 }
 
+/// Days the AI keeps what it knew of a table the explorer cache lost
+/// without the server saying it is gone (see `Workspace::keep_tx`).
+pub const KEPT_DAYS: i64 = 60;
+
 /// Object kinds the AI can use (as `meta_objects.kind`).
 const RELATIONS: &str = "('table', 'view', 'materialized_view', 'foreign_table')";
 
@@ -235,6 +239,8 @@ impl Workspace {
     /// `ai_tables` and rewritten only for tables whose search text changed,
     /// so a recompute never scans the search table.
     pub(crate) fn ai_refresh_tx(tx: &Transaction<'_>, connection_id: &str, schema: Option<&str>) -> Result<()> {
+        // Kept tables the cache lists again are the cache's again.
+        Self::kept_seen_tx(tx, connection_id, schema)?;
         let rules = Self::scope_tx(tx, connection_id)?;
         let ic = Self::ignore_case_tx(tx, connection_id);
         type Old = std::collections::HashMap<(String, String), (Option<i64>, Option<String>)>;
@@ -249,7 +255,9 @@ impl Workspace {
         if rules.is_empty() && old.is_empty() {
             return Ok(());
         }
-        let facts = Self::facts_tx(tx, connection_id, schema, None)?;
+        let mut facts = Self::facts_tx(tx, connection_id, schema, None)?;
+        // And what is kept of tables the cache lost (see `keep_tx`).
+        facts.extend(Self::kept_tx(tx, connection_id, schema)?);
         let mut seen = std::collections::HashSet::new();
         for mut o in facts.into_iter().filter(|o| scope_allows_by(&rules, &o.schema, &o.name, ic)) {
             // Its search text names the tables its keys point at: only
@@ -311,6 +319,97 @@ impl Workspace {
         ))?;
         let rows = st.query_map(params![connection_id, schema, name], Self::ai_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// The cache is about to lose `schema`'s tables (every schema's when
+    /// `None`) without the server having said each one is gone: a schema
+    /// missing from a schema list, a listing that came back empty, the
+    /// user clearing the cache. What the AI may use of them is copied to
+    /// `ai_kept` first, so the AI and MCP still have it (offline too),
+    /// marked with when. It leaves when the table is seen again
+    /// ([`Self::kept_seen_tx`]), when a filled listing of its schema
+    /// leaves it out ([`Self::kept_answered_tx`]), or after
+    /// [`KEPT_DAYS`]. A table missing from a listing that has others is
+    /// gone at once: that listing is an answer about it.
+    pub(crate) fn keep_tx(tx: &Transaction<'_>, connection_id: &str, schema: Option<&str>) -> Result<()> {
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO ai_kept (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, described_at, missing_since)                  SELECT o.connection_id, o.schema_name, o.name, o.kind, o.comment, o.row_estimate, c.columns_json, c.fks_json, c.seen_at, ?3                  FROM ai_tables a                  JOIN meta_objects o ON o.connection_id = a.connection_id AND o.schema_name = a.schema_name AND o.name = a.name AND o.kind IN {RELATIONS}                  LEFT JOIN meta_columns c ON c.connection_id = a.connection_id AND c.schema_name = a.schema_name AND c.table_name = a.name                  WHERE a.connection_id = ?1 AND (?2 IS NULL OR a.schema_name = ?2)"
+            ),
+            params![connection_id, schema, crate::now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Kept tables the cache has again (a listing, a search hit, an index
+    /// run): their kept columns go back to the cache when it has none
+    /// (stale: read again when shown online), and the kept rows go.
+    pub(crate) fn kept_seen_tx(tx: &Transaction<'_>, connection_id: &str, schema: Option<&str>) -> Result<()> {
+        let listed = format!(
+            "EXISTS (SELECT 1 FROM meta_objects o WHERE o.connection_id = k.connection_id AND o.schema_name = k.schema_name                AND o.name = k.name AND o.kind IN {RELATIONS})"
+        );
+        tx.prepare_cached(&format!(
+                "INSERT OR IGNORE INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json, stale)                  SELECT k.connection_id, k.schema_name, k.name, k.columns_json, coalesce(k.described_at, k.missing_since), k.fks_json, 1 FROM ai_kept k                  WHERE k.connection_id = ?1 AND (?2 IS NULL OR k.schema_name = ?2) AND k.columns_json IS NOT NULL AND {listed}"
+            ))?
+            .execute(params![connection_id, schema])?;
+        tx.prepare_cached(&format!("DELETE FROM ai_kept AS k WHERE k.connection_id = ?1 AND (?2 IS NULL OR k.schema_name = ?2) AND {listed}"))?
+            .execute(params![connection_id, schema])?;
+        Ok(())
+    }
+
+    /// A read of `schema` that found tables answers for all of them: kept
+    /// tables it has are the cache's again, the others are gone.
+    pub(crate) fn kept_answered_tx(tx: &Transaction<'_>, connection_id: &str, schema: &str) -> Result<()> {
+        Self::kept_seen_tx(tx, connection_id, Some(schema))?;
+        tx.execute("DELETE FROM ai_kept WHERE connection_id = ?1 AND schema_name = ?2", params![connection_id, schema])?;
+        Ok(())
+    }
+
+    /// A describe by the server of a kept table: it is there, so it is
+    /// listed in the cache again (as a search hit would be).
+    pub(crate) fn kept_described_tx(tx: &Transaction<'_>, connection_id: &str, schema: &str, name: &str) -> Result<()> {
+        let n = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO meta_objects (connection_id, schema_name, name, kind, comment, row_estimate, seen_at)                  SELECT connection_id, schema_name, name, kind, comment, row_estimate, ?4 FROM ai_kept                  WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3",
+            )?
+            .execute(params![connection_id, schema, name, crate::now_ms()])?;
+        if n > 0 {
+            tx.execute("DELETE FROM ai_kept WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3", params![connection_id, schema, name])?;
+        }
+        Ok(())
+    }
+
+    /// Forget what is kept of a connection (it points elsewhere, its index
+    /// was cleared, it was deleted).
+    pub(crate) fn kept_forget_tx(c: &rusqlite::Connection, connection_id: &str) -> Result<()> {
+        c.execute("DELETE FROM ai_kept WHERE connection_id = ?1", [connection_id])?;
+        Ok(())
+    }
+
+    fn kept_tx(c: &rusqlite::Connection, connection_id: &str, schema: Option<&str>) -> Result<Vec<KnObject>> {
+        let mut st = c.prepare_cached(
+            "SELECT schema_name, name, kind, comment, row_estimate, columns_json, fks_json FROM ai_kept              WHERE connection_id = ?1 AND (?2 IS NULL OR schema_name = ?2) ORDER BY schema_name, name",
+        )?;
+        let rows = st.query_map(params![connection_id, schema], Self::ai_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Kept tables not seen for [`KEPT_DAYS`] go (at start, and `now` for
+    /// tests), and the AI's tables follow. How many went.
+    pub(crate) fn kept_expire(&self, now: i64) -> Result<usize> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let cutoff = now - KEPT_DAYS * 24 * 60 * 60 * 1000;
+        let ids: Vec<String> = {
+            let mut st = tx.prepare("SELECT DISTINCT connection_id FROM ai_kept WHERE missing_since < ?1")?;
+            st.query_map([cutoff], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        let n = tx.execute("DELETE FROM ai_kept WHERE missing_since < ?1", [cutoff])?;
+        for id in ids {
+            Self::ai_refresh_tx(&tx, &id, None)?;
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     /// The search row of one table after its columns changed (a describe).
@@ -434,6 +533,22 @@ impl AiCatalog<'_> {
             return Ok(Some((o, Some(c))));
         }
         Ok(None)
+    }
+
+    /// When the cache lost an allowed table without the server saying it
+    /// is gone (ms): what the AI has of it is from before then, kept for
+    /// [`KEPT_DAYS`]. `None`: the cache lists it (or the AI may not use it).
+    pub fn missing_since(&self, schema: &str, name: &str) -> Result<Option<i64>> {
+        Ok(self
+            .ws
+            .conn
+            .lock()
+            .query_row(
+                "SELECT missing_since FROM ai_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 AND missing_since IS NOT NULL",
+                params![self.connection_id, schema, name],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Every table the AI may use, by schema and name.
@@ -606,23 +721,32 @@ mod tests {
         // Allowing one table alone in a schema that is off.
         ws.ai_put_rule("c", &rule("hr", "teams", true)).unwrap();
         assert_eq!(names(), vec!["hr.teams", "sales.orders", "sales.refunds"]);
-        // An incremental refresh drops one.
-        ws.meta_apply_changes("c", "sales", &[], &["view:refunds".into()], &Default::default(), None).unwrap();
+        // An incremental refresh drops one (the versions name what is left).
+        let left = std::collections::HashMap::from([("table:orders".to_string(), "1".to_string())]);
+        ws.meta_apply_changes("c", "sales", &[], &["view:refunds".into()], &left, None).unwrap();
         assert_eq!(names(), vec!["hr.teams", "sales.orders"]);
         assert!(ai.search("refund_amount", 5).unwrap().is_empty(), "its search row went with it");
-        // The schema is gone from the server.
+        // The schema left the schema list: its table is kept for the AI,
+        // marked, until the user takes it out of the scope.
         ws.meta_drop_schema("c", "hr").unwrap();
+        assert_eq!(names(), vec!["hr.teams", "sales.orders"]);
+        assert!(ai.missing_since("hr", "teams").unwrap().is_some() && ai.missing_since("sales", "orders").unwrap().is_none());
+        ws.ai_delete_rule("c", "hr", "teams").unwrap();
         assert_eq!(names(), vec!["sales.orders"]);
         // Excluding a table in an allowed schema.
         ws.ai_put_rule("c", &rule("sales", "orders", false)).unwrap();
         assert!(names().is_empty() && ai.search("orders", 5).unwrap().is_empty());
         ws.ai_put_rule("c", &rule("sales", "orders", true)).unwrap();
-        // The connection points elsewhere: the facts go, the scope stays.
+        // The user clears the cache: the explorer's facts go, the AI keeps
+        // what it may use, and the scope stays.
         ws.meta_clear("c").unwrap();
-        assert!(names().is_empty() && ai.search("orders", 5).unwrap().is_empty());
-        assert_eq!(ws.ai_scope("c").unwrap().len(), 3, "sales, hr.teams, sales.orders");
+        assert!(ws.meta_get("c", "sales.orders").unwrap().is_none());
+        assert_eq!(names(), vec!["sales.orders"]);
+        assert!(ai.missing_since("sales", "orders").unwrap().is_some());
+        assert_eq!(ws.ai_scope("c").unwrap().len(), 2, "sales, sales.orders");
         ws.meta_put_schema("c", "sales", &[o("sales", "orders", ObjectKind::Table)]).unwrap();
-        assert_eq!(names(), vec!["sales.orders"], "listed again: allowed again");
+        assert_eq!(names(), vec!["sales.orders"], "listed again: the cache's again");
+        assert!(ai.missing_since("sales", "orders").unwrap().is_none());
         // Other connections see nothing of it.
         assert!(ws.ai_catalog("other").objects().unwrap().is_empty());
     }
@@ -672,6 +796,162 @@ mod tests {
         // Out of the index scope: out of the AI's.
         ws.kn_retain_schemas("c", &["hr".into()]).unwrap();
         assert_eq!(ai.objects().unwrap().iter().map(|o| o.full_name()).collect::<Vec<_>>(), vec!["hr.teams"]);
+    }
+}
+
+#[cfg(test)]
+mod kept_tests {
+    use super::*;
+    use databrain_connector_core::{ColumnInfo, DbObject, ObjectKind, SchemaInfo};
+
+    fn k(name: &str) -> KnObject {
+        KnObject {
+            schema: "sales".into(),
+            name: name.into(),
+            kind: "table".into(),
+            comment: None,
+            row_estimate: None,
+            columns: vec![ColumnInfo { name: "amount".into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None }],
+            foreign_keys: vec![],
+        }
+    }
+    fn o(schema: &str, name: &str) -> DbObject {
+        DbObject { schema: schema.into(), name: name.into(), kind: ObjectKind::Table, comment: None, row_estimate: None }
+    }
+    fn sch(n: &str) -> SchemaInfo {
+        SchemaInfo { name: n.into(), is_default: false, catalog: None }
+    }
+    /// `sales` (orders, items) indexed and allowed; `hr.staff` listed, not allowed.
+    fn indexed() -> Workspace {
+        let ws = Workspace::open_in_memory().unwrap();
+        ws.meta_put_schemas("c", None, &[sch("sales"), sch("hr")]).unwrap();
+        ws.kn_replace_schema("c", "sales", &[k("orders"), k("items")]).unwrap();
+        ws.meta_put_schema("c", "hr", &[o("hr", "staff")]).unwrap();
+        ws
+    }
+    /// (table, has columns, marked missing) of what the AI has.
+    fn has(ws: &Workspace) -> Vec<(String, bool, bool)> {
+        let ai = ws.ai_catalog("c");
+        ai.objects().unwrap().into_iter().map(|t| (t.full_name(), !t.columns.is_empty(), ai.missing_since(&t.schema, &t.name).unwrap().is_some())).collect()
+    }
+    fn kept(a: &str, b: &str) -> Vec<(String, bool, bool)> {
+        vec![(a.to_string(), true, true), (b.to_string(), true, true)]
+    }
+    fn live(a: &str, b: &str) -> Vec<(String, bool, bool)> {
+        vec![(a.to_string(), true, false), (b.to_string(), true, false)]
+    }
+
+    /// The three losses that are no answer about each table keep what the
+    /// AI may use, columns and search included, and nothing else; the
+    /// explorer shows none of it.
+    #[test]
+    fn the_ai_keeps_its_tables_when_the_cache_loses_them_without_an_answer() {
+        let gone = |ws: &Workspace| {
+            assert_eq!(has(ws), kept("sales.items", "sales.orders"));
+            assert_eq!(ws.ai_catalog("c").search("amount", 5).unwrap().len(), 2, "still found");
+            assert_eq!(ws.ai_catalog("c").count().unwrap(), 2);
+            assert!(ws.meta_get("c", "sales.orders").unwrap().is_none() && ws.meta_table("c", "sales", "orders").unwrap().is_none(), "not in the explorer");
+            assert!(ws.kn_complete("c", None, "orders", 10).unwrap().is_empty(), "nor in completion");
+        };
+        // A schema list without the schema.
+        let ws = indexed();
+        ws.meta_put_schemas("c", None, &[sch("hr")]).unwrap();
+        gone(&ws);
+        // A listing that came back empty (routines only counts as empty).
+        let ws = indexed();
+        ws.meta_put_schema("c", "sales", &[DbObject { kind: ObjectKind::Function, ..o("sales", "f") }]).unwrap();
+        gone(&ws);
+        // An incremental refresh that removes every table.
+        let ws = indexed();
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders"), o("sales", "items")]).unwrap();
+        ws.meta_apply_changes("c", "sales", &[], &["table:orders".into(), "table:items".into()], &Default::default(), None).unwrap();
+        gone(&ws);
+        // The user clears the cache: tables outside the scope aren't kept.
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        gone(&ws);
+        ws.ai_put_rule("c", &ScopeRule { schema: "hr".into(), table: String::new(), allow: true }).unwrap();
+        assert_eq!(has(&ws).len(), 2, "hr.staff wasn't the AI's: nothing of it is kept");
+    }
+
+    /// A kept table is the cache's again when seen (a listing, a describe,
+    /// an index run), with its columns; a filled listing or read without
+    /// it is the answer that it is gone.
+    #[test]
+    fn kept_tables_return_when_seen_and_go_when_a_filled_listing_lacks_them() {
+        // Listed again: both back, with the columns kept (stale: read again when shown).
+        let ws = indexed();
+        ws.meta_put_schema("c", "sales", &[]).unwrap();
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders"), o("sales", "items")]).unwrap();
+        assert_eq!(has(&ws), live("sales.items", "sales.orders"));
+        assert!(ws.meta_table("c", "sales", "orders").unwrap().unwrap().stale);
+        assert_eq!(ws.conn.lock().query_row("SELECT count(*) FROM ai_kept", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        // A filled listing without one of them: that one is gone at once.
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders")]).unwrap();
+        assert_eq!(has(&ws), vec![("sales.orders".to_string(), true, false)]);
+        assert!(ws.ai_catalog("c").get("sales.items").unwrap().is_none());
+        // A describe by the server of one: it is there (the other stays kept).
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        ws.meta_put_table("c", "sales", "orders", &k("orders").columns, Some(&[])).unwrap();
+        assert_eq!(has(&ws), vec![("sales.items".to_string(), true, true), ("sales.orders".to_string(), true, false)]);
+        // A search hit of one.
+        ws.meta_add_objects("c", &[o("sales", "items")]).unwrap();
+        assert_eq!(has(&ws), live("sales.items", "sales.orders"));
+        // An index run that reads the schema without one of them.
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        ws.kn_replace_schema("c", "sales", &[k("orders")]).unwrap();
+        assert_eq!(has(&ws), vec![("sales.orders".to_string(), true, false)]);
+    }
+
+    /// A table missing from a listing that has others is not kept; nor is
+    /// anything when the connection points elsewhere, its index is cleared
+    /// or it is deleted; a table taken out of the scope isn't shown.
+    #[test]
+    fn nothing_is_kept_when_the_server_answered_or_the_user_said_so() {
+        let none = |ws: &Workspace| ws.conn.lock().query_row("SELECT count(*) FROM ai_kept", [], |r| r.get::<_, i64>(0)).unwrap() == 0;
+        let ws = indexed();
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders")]).unwrap();
+        assert!(none(&ws) && ws.ai_catalog("c").get("sales.items").unwrap().is_none(), "dropped on the server");
+        // Another server.
+        let ws = indexed();
+        let mut cfg = databrain_connector_core::ConnectionConfig::new(
+            databrain_connector_core::ConnectorKind::Postgres,
+            databrain_auth::AuthMethod::Password { user: "u".into() },
+        );
+        cfg.host = Some("db1".into());
+        ws.meta_check_identity("c", &cfg).unwrap();
+        cfg.host = Some("db2".into());
+        assert!(ws.meta_check_identity("c", &cfg).unwrap());
+        assert!(none(&ws) && has(&ws).is_empty(), "the old server's tables aren't the new one's");
+        // "Clear index" after a cleared cache.
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        ws.kn_clear("c").unwrap();
+        assert!(none(&ws) && has(&ws).is_empty());
+        // Excluded while kept: not the AI's any more.
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        ws.ai_put_rule("c", &ScopeRule { schema: "sales".into(), table: "orders".into(), allow: false }).unwrap();
+        assert_eq!(has(&ws), vec![("sales.items".to_string(), true, true)]);
+        assert!(ws.ai_catalog("c").search("orders", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn kept_tables_go_after_sixty_days() {
+        let ws = indexed();
+        ws.meta_clear("c").unwrap();
+        let day = 24 * 60 * 60 * 1000;
+        let now = crate::now_ms();
+        assert_eq!(ws.kept_expire(now + (KEPT_DAYS - 1) * day).unwrap(), 0);
+        assert_eq!(has(&ws).len(), 2, "still kept on day 59");
+        assert_eq!(ws.kept_expire(now + (KEPT_DAYS + 1) * day).unwrap(), 2);
+        assert!(has(&ws).is_empty() && ws.ai_catalog("c").search("amount", 5).unwrap().is_empty(), "gone, with their search rows");
+        assert_eq!(ws.ai_catalog("c").count().unwrap(), 0);
+        assert!(!ws.ai_scope("c").unwrap().is_empty(), "the scope stays: read again, they are the AI's again");
     }
 }
 
@@ -763,7 +1043,7 @@ mod review_tests {
         assert_eq!(ai.search("invoices", 5).unwrap().len(), 1);
         assert_eq!(ai.search("orders", 5).unwrap().len(), 1, "one row, not two");
         // Unchanged tables keep their search row (no rewrite); gone ones lose it.
-        ws.meta_put_schema("c", "main", &[]).unwrap();
+        ws.meta_put_schema("c", "main", &[o("main", "items")]).unwrap();
         assert!(ai.search("orders", 5).unwrap().is_empty());
         assert_eq!(ai.search("invoices", 5).unwrap().len(), 1);
         // A connection with no scope does nothing (and has nothing).
