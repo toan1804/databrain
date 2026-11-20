@@ -8,6 +8,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 - **`dbr --help` and `--version`:** `dbr --help` (`-h`, or `dbr` alone) prints its options, examples, exit codes and where it is installed; `dbr jobs --help` the jobs commands; `-v`/`--version` the version (`databrain-jobs --version` too). The README has a "Command line" section.
 
+### Changed
+
+- **Oracle: a table's Columns and DDL open faster.** Columns no longer builds the table's DDL first. The DDL of a partitioned table keeps its partitioning (keys, interval, subpartitioning, the count of a HASH table) and its first partition, which the statement needs, and says how many more there are: each partition's bound is a LONG value read a row at a time, which made tables with many partitions slow. The table explorer's Partitions part lists them. On 12.2 and later, check conditions are read without a LONG too. An INTERVAL table no longer shows "1048575 partitions" (Oracle's limit, not its count) in Indexes.
+
 ### Fixed
 
 - **Table explorer: Columns and Relations on a table without foreign keys:** they failed with "undefined is not an object (evaluating 't.foreign_keys.find')" (any database): a table with no foreign keys was sent without the list.

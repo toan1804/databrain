@@ -243,18 +243,18 @@ impl OracleSession {
                 let parts = ddl::TableParts {
                     columns: self.dict(ddl::COLUMNS_SQL, Some(ddl::COLUMNS_SQL_11G), owner, name).await?,
                     table: self.dict_opt(ddl::TABLE_SQL, None, owner, name).await,
-                    constraints: self.dict_opt(ddl::CONSTRAINTS_SQL, None, owner, name).await,
+                    constraints: self.dict_opt(ddl::CONSTRAINTS_SQL, Some(ddl::CONSTRAINTS_SQL_12_1), owner, name).await,
                     indexes: self.dict_opt(ddl::INDEXES_SQL, None, owner, name).await,
                     col_comments: self.dict_opt(ddl::COL_COMMENTS_SQL, None, owner, name).await,
                     part: self.dict_opt(ddl::PART_SQL, Some(ddl::PART_SQL_10G), owner, name).await,
                     part_keys: vec![],
-                    partitions: vec![],
+                    first_partition: vec![],
                 };
                 let partitioned = !parts.part.is_empty();
                 let parts = if partitioned {
                     ddl::TableParts {
                         part_keys: self.dict_opt(ddl::PART_KEYS_SQL, None, owner, name).await,
-                        partitions: self.dict_opt(ddl::PARTITIONS_SQL, None, owner, name).await,
+                        first_partition: self.dict_opt(ddl::FIRST_PARTITION_SQL, None, owner, name).await,
                         ..parts
                     }
                 } else {

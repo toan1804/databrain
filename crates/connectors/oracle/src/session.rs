@@ -23,7 +23,6 @@ use databrain_connector_core::Result;
 use databrain_connector_core::SchemaInfo;
 use databrain_connector_core::Session;
 use databrain_connector_core::TableColumns;
-use databrain_connector_core::quote_ident;
 use oracle::Connection;
 use oracle::sql_type::ToSql;
 use std::sync::Arc;
@@ -397,7 +396,8 @@ impl Session for OracleSession {
         {
             l.partition_by = p.iter().filter_map(|r| r[0].clone()).collect();
             l.partition_kind = p.first().and_then(|r| r[1].clone());
-            if let Some(n) = p.first().and_then(|r| r[2].clone()) {
+            // An INTERVAL table's count is the most it may have (1048575), not how many it has.
+            if let Some(n) = p.first().and_then(|r| r[2].clone()).filter(|n| n != "1048575") {
                 l.notes.push(format!("{n} partitions"));
             }
         }
@@ -446,15 +446,9 @@ impl Session for OracleSession {
         let kind = g(0).as_deref().map(kind_of).unwrap_or(ObjectKind::Table);
         let object = DbObject { schema: schema.to_string(), name: name.to_string(), kind, comment: g(1), row_estimate: g(2).and_then(|n| n.parse().ok()) };
         let columns: Vec<ColumnInfo> = self.columns(schema, Some(name)).await?.into_iter().map(|(_, c)| c).collect();
-        let ddl = self.dictionary_ddl(schema, name, kind).await.ok().flatten().or_else(|| {
-            (kind == ObjectKind::Table).then(|| {
-                let cols: Vec<String> = columns
-                    .iter()
-                    .map(|c| format!("    {} {}{}", quote_ident(ConnectorKind::Oracle, &c.name), c.data_type, if c.nullable { "" } else { " NOT NULL" }))
-                    .collect();
-                format!("CREATE TABLE {}.{} (\n{}\n);", quote_ident(ConnectorKind::Oracle, schema), quote_ident(ConnectorKind::Oracle, name), cols.join(",\n"))
-            })
-        });
+        // No DDL here: Show DDL reads it (`object_ddl`), and building it
+        // takes several dictionary reads the columns don't need.
+        let ddl = None;
         let foreign_keys = self.foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();
         Ok(ObjectDetail { object, columns, ddl, foreign_keys })
     }
@@ -930,7 +924,7 @@ mod tests {
         let t = m[0].columns.iter().find(|t| t.table == "KB_THIN").unwrap();
         assert!(t.columns[0].is_primary_key && t.columns[1].data_type == "VARCHAR2(40)");
         let d = s.describe(&me, "KB_THIN").await.unwrap();
-        assert!(d.ddl.unwrap_or_default().contains("CREATE TABLE"));
+        assert!(d.ddl.is_none() && d.columns.len() >= 2);
         // Show DDL from the dictionary: constraints, indexes, comments; views.
         run("create index kb_thin_name on kb_thin (upper(name), note desc)").await.unwrap();
         run("create or replace view kb_thin_v as select id, name from kb_thin where id > 10").await.unwrap();
@@ -941,6 +935,31 @@ mod tests {
         let v = s.object_ddl(&me, "KB_THIN_V", ObjectKind::View).await.unwrap().unwrap();
         assert!(v.starts_with("CREATE OR REPLACE VIEW") && v.contains("where id > 10"), "{driver}: {v}");
         run("drop view kb_thin_v").await.unwrap();
+        // A partitioned table's DDL: its first partition and how many more,
+        // and it runs (an INTERVAL table needs a partition in it). Checks
+        // come without a LONG on 12.2+.
+        let _ = run("drop table kb_part purge").await;
+        run("create table kb_part (id number, d date not null, constraint kb_part_ck check (id > 0)) \
+             partition by range (d) interval (numtoyminterval(1, 'MONTH')) (partition p0 values less than (date '2020-01-01'))")
+        .await
+        .unwrap();
+        run("insert into kb_part values (1, date '2024-05-01')").await.unwrap();
+        run("insert into kb_part values (2, date '2024-07-01')").await.unwrap();
+        let p = s.object_ddl(&me, "KB_PART", ObjectKind::Table).await.unwrap().unwrap();
+        assert!(
+            p.contains("PARTITION BY RANGE (\"D\") INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))") && p.contains("PARTITION \"P0\" VALUES LESS THAN (TO_DATE"),
+            "{driver}: {p}"
+        );
+        assert!(p.contains("lists them all") && !p.contains("1048575") && p.contains("CHECK (id > 0)"), "{driver}: {p}");
+        run("drop table kb_part purge").await.unwrap();
+        let create = p.split(";\n").next().unwrap().to_string();
+        s.execute(databrain_connector_core::Statement::internal(&create), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{driver}: {e:?}\n{create}"));
+        run("drop table kb_part purge").await.unwrap();
         let f0 = s.explorer_fingerprints().await.unwrap().unwrap()[&me].clone();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         run("alter table kb_thin add (extra number)").await.unwrap();
