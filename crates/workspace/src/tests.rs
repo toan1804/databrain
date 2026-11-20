@@ -293,8 +293,8 @@ fn schema_version_guard_and_backup() {
     {
         let c = Connection::open(&path).unwrap();
         c.pragma_update(None, "user_version", 19i64).unwrap();
-        // Undo v25 (its view goes with v20's below), v24, v23, v22 and v21.
-        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits; DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
+        // Undo v26, v25 (its view goes with v20's below), v24, v23, v22 and v21.
+        c.execute_batch("CREATE TABLE kn_objects (connection_id TEXT NOT NULL, schema_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, comment TEXT, row_estimate INTEGER, columns_json TEXT NOT NULL, fks_json TEXT NOT NULL, content_hash TEXT NOT NULL, indexed_at INTEGER NOT NULL, PRIMARY KEY (connection_id, schema_name, name)); DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits; DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
         // Undo v20, as an older version left it: schema `s`
         // indexed in full (index scope `*`), `hr.teams` indexed on its own,
         // and `hr.salaries` only seen in the explorer.
@@ -581,7 +581,8 @@ fn clears_are_one_transaction_each() {
     let kn =
         KnObject { schema: "s".into(), name: "orders".into(), kind: "table".into(), comment: None, row_estimate: None, columns: vec![], foreign_keys: vec![] };
     ws.kn_replace_schema("c", "s", &[kn]).unwrap();
-    let count = |ws: &Workspace| ws.conn.lock().query_row("SELECT count(*) FROM kn_objects WHERE connection_id = 'c'", [], |r| r.get::<_, i64>(0)).unwrap();
+    ws.kn_set_state(&KnState { connection_id: "c".into(), indexed_at: 1, objects: 1, schemas: vec!["s".into()], error: None }).unwrap();
+    let count = |ws: &Workspace| ws.conn.lock().query_row("SELECT count(*) FROM kn_state WHERE connection_id = 'c'", [], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(count(&ws), 1);
     ws.conn.lock().execute_batch("DROP TABLE kn_schema_state").unwrap();
     assert!(ws.kn_clear("c").is_err());
@@ -676,7 +677,7 @@ fn an_earlier_draft_of_v22_is_repaired() {
         // At v22, which then held v23's tables too: v23 runs over them.
         // Later migrations are taken back too, so they can run again.
         c.pragma_update(None, "user_version", 22i64).unwrap();
-        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits;").unwrap();
+        c.execute_batch("CREATE TABLE kn_objects (connection_id TEXT NOT NULL, schema_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, comment TEXT, row_estimate INTEGER, columns_json TEXT NOT NULL, fks_json TEXT NOT NULL, content_hash TEXT NOT NULL, indexed_at INTEGER NOT NULL, PRIMARY KEY (connection_id, schema_name, name)); DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits;").unwrap();
         c.execute_batch(
             "DROP TABLE job_after_pending; \
              CREATE TABLE job_after_pending (job_id TEXT PRIMARY KEY, after TEXT NOT NULL, added_at INTEGER NOT NULL); \

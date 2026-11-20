@@ -217,7 +217,6 @@ impl Workspace {
         if n == 0 {
             return Err(Error::NotFound(format!("connection {id}")));
         }
-        tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_fts WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_notes WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [id])?;

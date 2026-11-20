@@ -493,7 +493,6 @@ export const api = {
   /** Index in the background; unchanged schemas are skipped unless `full`. */
   knIndex: (connectionId: string, scope?: string[] | null, batch?: number | null, full = false) =>
     call<void>("kn_index", { connectionId, scope: scope ?? null, batch: batch ?? null, full }),
-  knClear: (connectionId: string) => call<void>("kn_clear", { connectionId }),
   knSaveNote: (note: KnNote) => call<KnNote>("kn_save_note", { note }),
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),
   knLearned: (connectionId: string) => call<LearnedView>("kn_learned", { connectionId }),

@@ -410,7 +410,6 @@ pub fn run() {
             commands::ai::hint_layouts,
             commands::ai::kn_read_notes_file,
             commands::ai::kn_import_notes,
-            commands::ai::kn_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DataBrain")

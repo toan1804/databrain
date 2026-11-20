@@ -1075,7 +1075,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
     let two = ["lake.s01".to_string(), "LAKE.S02".to_string()];
     let r = index_connection(&engine, &conn, Some(&two), &|_, _, _| {}, &Default::default()).await.unwrap();
     assert_eq!((r.schemas, r.objects, r.cancelled), (2, 2, false));
-    assert_eq!(f.ws.kn_count(&conn).unwrap(), 2);
+    assert_eq!(f.ws.ai_catalog(&conn).count().unwrap(), 2);
 
     // Cancel after the first batch: finished schemas stay indexed.
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -1092,7 +1092,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
     assert!(r.objects >= 25 && r.objects < 60, "{}", r.objects);
     let st = f.ws.kn_state(&conn).unwrap().unwrap();
     assert!(st.error.as_deref().unwrap_or("").contains("cancelled"), "{:?}", st.error);
-    assert_eq!(st.objects as usize, f.ws.kn_count(&conn).unwrap() as usize);
+    assert_eq!(st.objects as usize, f.ws.ai_catalog(&conn).count().unwrap() as usize);
 
     // Bigger batches: fewer metadata calls (progress fires once per batch).
     let mut p = f.ws.get_connection(&conn).unwrap();
@@ -1149,7 +1149,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
     engine.disconnect(&conn);
     let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| {}, &Default::default()).await.unwrap();
     assert_eq!((r.objects, r.skipped, r.changed), (60, 60, 1), "the other 59 schemas and main are skipped");
-    assert!(f.ws.kn_get(&conn, "lake.s07.t07").unwrap().unwrap().columns.iter().any(|c| c.name == "email"));
+    assert!(f.ws.ai_catalog(&conn).get("lake.s07.t07").unwrap().unwrap().columns.iter().any(|c| c.name == "email"));
     // Full rebuild ignores fingerprints.
     let r = databrain_ai::knowledge::index_connection_with(&engine, &conn, Some(&all), true, &|_, _, _| {}, &Default::default()).await.unwrap();
     assert_eq!((r.objects, r.skipped), (60, 0));
@@ -1640,17 +1640,17 @@ async fn index_tables_adds_missing_tables_after_approval() {
     // Declined: nothing indexed.
     let no = ctx(false).call("index_tables", &json!({"tables": ["orders"]})).await;
     assert!(no.content.contains("declined"), "{}", no.content);
-    assert_eq!(f.ws.kn_count(&f.conn).unwrap(), 0);
+    assert_eq!(f.ws.ai_catalog(&f.conn).count().unwrap(), 0);
     // Approved: orders is indexed (a wrong name is reported), described at once.
     let c = ctx(true);
     let o = c.call("index_tables", &json!({"tables": ["orders", "nope_table"], "reason": "revenue question"})).await;
     assert!(o.content.contains("Indexed 1 of 2") && o.content.contains("country") && o.content.contains("nope_table: not indexed"), "{}", o.content);
-    assert_eq!(f.ws.kn_count(&f.conn).unwrap(), 1);
+    assert_eq!(f.ws.ai_catalog(&f.conn).count().unwrap(), 1);
     let d = c.call("describe_table", &json!({"table": "orders"})).await;
     assert!(d.content.contains("customer_id"), "{}", d.content);
     // Indexing another keeps the first.
     c.call("index_tables", &json!({"tables": ["main.customers"]})).await;
-    assert_eq!(f.ws.kn_count(&f.conn).unwrap(), 2);
+    assert_eq!(f.ws.ai_catalog(&f.conn).count().unwrap(), 2);
     assert!(f.ws.kn_state(&f.conn).unwrap().is_some_and(|s| s.objects == 2));
 }
 

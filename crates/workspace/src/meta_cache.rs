@@ -1346,14 +1346,14 @@ mod tests {
         cfg.options.insert("idle_disconnect_minutes".into(), "0".into());
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "session settings don't change the server");
-        assert_eq!(ws.kn_count("c").unwrap(), 1, "the index stays for the same server");
+        assert_eq!(ws.ai_catalog("c").count().unwrap(), 1, "the index stays for the same server");
         assert!(!ws.ai_scope("c").unwrap().is_empty(), "and what the AI may use");
         // How it reaches the server or runs there: the same server.
         for (k, v) in [("warehouse", "WH2"), ("http_path", "/sql/1.0/warehouses/b"), ("tls", "true"), ("trust_cert", "true"), ("passcode", "123456")] {
             cfg.options.insert(k.into(), v.into());
             assert!(!ws.meta_check_identity("c", &cfg).unwrap(), "{k} keeps the cache");
         }
-        assert_eq!(ws.kn_count("c").unwrap(), 1);
+        assert_eq!(ws.ai_catalog("c").count().unwrap(), 1);
         assert!(!ws.ai_scope("c").unwrap().is_empty());
         // An option that may point elsewhere (a role sees other tables; one
         // DataBrain doesn't know counts too): cleared.
@@ -1374,8 +1374,8 @@ mod tests {
         assert!(ws.meta_schemas("c", None).unwrap().is_none());
         assert_eq!(ws.meta_count("c").unwrap(), 0);
         // The AI index described the old server too; the user's notes stay.
-        assert_eq!(ws.kn_count("c").unwrap(), 0);
-        assert!(ws.kn_get("c", "s.t").unwrap().is_none());
+        assert_eq!(ws.ai_catalog("c").count().unwrap(), 0);
+        assert!(ws.ai_catalog("c").get("s.t").unwrap().is_none());
         assert_eq!(ws.kn_notes("c").unwrap().len(), 1);
     }
 

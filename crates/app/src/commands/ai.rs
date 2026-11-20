@@ -240,8 +240,3 @@ pub(crate) async fn kn_read_notes_file(state: State<'_, AppState>, connection_id
 pub(crate) async fn kn_import_notes(state: State<'_, AppState>, connection_id: String, actions: Vec<databrain_workspace::ImportAction>) -> R<usize> {
     ai_api::import_notes(&state, &connection_id, actions).await
 }
-
-#[tauri::command]
-pub(crate) async fn kn_clear(state: State<'_, AppState>, connection_id: String) -> R<()> {
-    ai_api::clear_knowledge(&state, &connection_id)
-}

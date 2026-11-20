@@ -263,7 +263,7 @@ pub async fn index_connection_with(
                 .collect();
             report.objects += items.len();
             // Keys only when the read covered them (dropped ones go then).
-            let d = ws.kn_replace_schema_read(connection_id, &m.schema, &items, m.foreign_keys_read && m.error.is_none())?;
+            let d = ws.kn_replace_schema_read(connection_id, &m.schema, &items, m.foreign_keys_read && m.error.is_none(), m.error.is_none())?;
             report.changed += d.changed;
             report.removed += d.removed;
             // Fingerprint taken before the fetch: a change during the run is picked up next time.

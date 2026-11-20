@@ -310,7 +310,7 @@ impl Workspace {
 
     /// What the explorer cache knows of a schema's tables (or one table),
     /// whether or not the AI may use them.
-    fn facts_tx(c: &rusqlite::Connection, connection_id: &str, schema: Option<&str>, name: Option<&str>) -> Result<Vec<KnObject>> {
+    pub(crate) fn facts_tx(c: &rusqlite::Connection, connection_id: &str, schema: Option<&str>, name: Option<&str>) -> Result<Vec<KnObject>> {
         let mut st = c.prepare_cached(&format!(
             "SELECT o.schema_name, o.name, o.kind, o.comment, o.row_estimate, m.columns_json, m.fks_json FROM meta_objects o \
              LEFT JOIN meta_columns m ON m.connection_id = o.connection_id AND m.schema_name = o.schema_name AND m.table_name = o.name \
