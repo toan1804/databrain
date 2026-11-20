@@ -316,3 +316,19 @@ func TestQueriesFetchManyRowsPerRoundTrip(t *testing.T) {
 		t.Errorf("the connection's own value: %s", u)
 	}
 }
+
+func TestDecodeFailuresAreRetriedAsText(t *testing.T) {
+	for _, m := range []string{
+		"TTC error: received code 0 during response reading",
+		"unable to decode oracle type XMLType to its primitive value",
+		// An XMLTYPE table column (go-ora 2.9).
+		"invalid size for GetInt64: 32",
+	} {
+		if !undecodable(errors.New(m)) {
+			t.Errorf("%q: not retried", m)
+		}
+	}
+	if undecodable(errors.New("ORA-00942: table or view does not exist")) {
+		t.Error("an Oracle error isn't a decode failure")
+	}
+}
