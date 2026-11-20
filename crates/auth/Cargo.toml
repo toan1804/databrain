@@ -18,7 +18,7 @@ base64 = "0.23.1"
 dirs = "7.0.0"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 pkcs8 = { version = "0.10.2", features = ["encryption", "pem"] }
-rand = "0.8"
+rand = "0.10"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json", "form", "query", "http2", "charset"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
