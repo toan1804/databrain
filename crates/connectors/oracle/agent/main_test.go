@@ -323,6 +323,8 @@ func TestDecodeFailuresAreRetriedAsText(t *testing.T) {
 		"unable to decode oracle type XMLType to its primitive value",
 		// An XMLTYPE table column (go-ora 2.9).
 		"invalid size for GetInt64: 32",
+		"buffer under-run during read operation",
+		"receive abnormal packet type 12 instead of data packet",
 	} {
 		if !undecodable(errors.New(m)) {
 			t.Errorf("%q: not retried", m)

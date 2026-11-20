@@ -19,9 +19,16 @@ func undecodable(err error) bool {
 		return false
 	}
 	m := err.Error()
-	// "invalid size for GetInt64: 32": go-ora reading an XMLTYPE table
-	// column's type description (an XMLTYPE made in the query reads fine).
-	return strings.Contains(m, "TTC error") || strings.Contains(m, "unable to decode oracle type") || strings.Contains(m, "invalid size for Get")
+	// "invalid size for GetInt64: 32": go-ora decoding the value of an
+	// XMLTYPE table column (one made in the query reads fine). It, the
+	// buffer under-run and the unexpected packet all mean go-ora lost its
+	// place in the server's reply (the connection is reopened).
+	for _, s := range []string{"TTC error", "unable to decode oracle type", "invalid size for Get", "buffer under-run", "abnormal packet type"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // unreadableType: a column type go-ora describes but may not decode.
