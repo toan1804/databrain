@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ConnectorKind } from "./bindings/ConnectorKind";
-import { columnClass, countSql, exploreKey, profileSql, PROFILE_MAX_COLUMNS, readAllReasons, readProfile, sqlString, statisticsSql, takeExploreKeys, topValuesSql } from "./explore";
+import { asOfSql, checksSql, columnClass, countSql, exploreKey, historyKind, historySql, indexUseSql, profileSql, PROFILE_MAX_COLUMNS, readAllReasons, readConstraints, readProfile, rowsWritten, sqlString, statisticsSql, takeExploreKeys, topValuesSql, triggersSql, type Built } from "./explore";
 
 const sql = (b: { sql: string } | { unavailable: string }) => {
   if (!("sql" in b)) throw new Error(`unavailable: ${b.unavailable}`);
@@ -174,5 +174,58 @@ describe("table explorer: profile, statistics and counts", () => {
     expect(takeExploreKeys("t9").sort()).toEqual(["t9#profile", "t9#top:status"]);
     expect(takeExploreKeys("t9")).toEqual([]);
     expect(takeExploreKeys("t8")).toEqual(["t8#count"]);
+  });
+});
+
+describe("table explorer, step 4: constraints, index use, history", () => {
+  it("reads checks and triggers apart from each catalog, saying why where there are none", () => {
+    const first = (b: Built[]) => sql(b[0]);
+    for (const k of ["postgres", "mysql", "mssql", "oracle", "duckdb", "databricks"] as const) expect(checksSql(k, k === "duckdb" || k === "databricks" ? "db.sch" : "sch", "t")[0]).toHaveProperty("sql");
+    for (const k of ["postgres", "mysql", "mssql", "oracle", "sqlite"] as const) expect(triggersSql(k, "sch", "t")).toHaveProperty("sql");
+    expect(first(checksSql("postgres", "s", "o'b"))).toContain("c.relname = 'o''b'");
+    // Unique keys are among the indexes, not listed again.
+    expect(first(checksSql("postgres", "s", "t"))).toContain("con.contype IN ('c', 'x')");
+    expect(first(checksSql("duckdb", "memory.main", "t"))).toContain("constraint_type = 'CHECK'");
+    // MariaDB's form (checks named per table) first, then MySQL's.
+    const my = checksSql("mysql", "shop", "t").map(sql);
+    expect(my[0]).toContain("AND cc.TABLE_NAME = tc.TABLE_NAME");
+    expect(my[1]).not.toContain("cc.TABLE_NAME");
+    // Oracle: only system-named NOT NULL checks are left out; before 12.2, the names.
+    const ora = checksSql("oracle", "HR", "T").map(sql);
+    expect(ora[0]).toContain("NOT (generated = 'GENERATED NAME' AND search_condition_vc LIKE '% IS NOT NULL')");
+    expect(ora[1]).not.toContain("search_condition_vc");
+    expect(first(checksSql("mssql", "Shop.dbo", "t"))).toContain("FROM [Shop].sys.check_constraints cc");
+    expect(sql(triggersSql("mssql", "dbo", "t"))).toContain("FROM sys.triggers tr");
+    expect(sql(triggersSql("sqlite", "main", "t"))).toBe("SELECT 'trigger' AS what, name, sql AS definition\nFROM main.sqlite_master\nWHERE type = 'trigger' AND tbl_name = 't'");
+    expect(checksSql("sqlite", "main", "t")[0]).toHaveProperty("unavailable");
+    for (const k of ["snowflake", "bigquery", "clickhouse", "mongodb", "neo4j"] as const) {
+      expect(checksSql(k, "s", "t")[0]).toHaveProperty("unavailable");
+      expect(triggersSql(k, "s", "t")).toHaveProperty("unavailable");
+    }
+    expect(checksSql("duckdb", "results", "r", "results")[0]).toHaveProperty("unavailable");
+    // Databricks: the Delta constraints among the table properties.
+    expect(
+      readConstraints("databricks", { columns: ["key", "value"], rows: [["delta.minReaderVersion", "1"], ["delta.constraints.positive", "amount > 0"]], duration_ms: 1 }),
+    ).toEqual([{ what: "check", name: "positive", definition: "amount > 0" }]);
+    expect(readConstraints("oracle", { columns: ["WHAT", "NAME", "DEFINITION"], rows: [["check", "CK", "x > 0"]], duration_ms: 1 })).toEqual([{ what: "check", name: "CK", definition: "x > 0" }]);
+    expect(indexUseSql("postgres", "s", "t")).toHaveProperty("sql");
+    expect(indexUseSql("mysql", "s", "t")).toHaveProperty("unavailable");
+  });
+
+  it("opens a table as it was: a Delta version, or a time (checked, so it can't carry SQL)", () => {
+    expect(historyKind("databricks")).toBe("versions");
+    expect(historyKind("snowflake")).toBe("as_of");
+    expect(historyKind("postgres")).toBeNull();
+    expect(sql(historySql("databricks", "cat.sch", "t"))).toBe("DESCRIBE HISTORY cat.sch.t LIMIT 50");
+    expect(sql(asOfSql("databricks", "cat.sch", "t", { version: 7 }))).toBe("SELECT *\nFROM cat.sch.t VERSION AS OF 7\nLIMIT 100");
+    expect(sql(asOfSql("databricks", "cat.sch", "t", { time: "2026-11-20T08:30" }))).toContain("TIMESTAMP AS OF '2026-11-20 08:30'");
+    expect(sql(asOfSql("snowflake", "DB.S", "T", { time: "2026-11-20" }))).toContain("AT(TIMESTAMP => '2026-11-20'::TIMESTAMP_LTZ)");
+    expect(sql(asOfSql("bigquery", "p.d", "t", { time: "2026-11-20 08:30:05" }))).toContain("FOR SYSTEM_TIME AS OF TIMESTAMP '2026-11-20 08:30:05'");
+    expect(asOfSql("snowflake", "DB.S", "T", { time: "2026-11-20'; drop table t; --" })).toHaveProperty("unavailable");
+    expect(asOfSql("snowflake", "DB.S", "T", { version: 1 })).toHaveProperty("unavailable");
+    expect(asOfSql("postgres", "s", "t", { time: "2026-11-20" })).toHaveProperty("unavailable");
+    expect(rowsWritten("{numFiles -> 2, numOutputRows -> 1200, numOutputBytes -> 9}")).toBe(1200);
+    expect(rowsWritten('{"numOutputRows":"35"}')).toBe(35);
+    expect(rowsWritten(null)).toBeNull();
   });
 });
