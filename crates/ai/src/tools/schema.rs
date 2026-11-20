@@ -7,6 +7,27 @@ use crate::knowledge;
 use crate::policy::Decision;
 use crate::types::{AiError, Result};
 
+/// How long `describe_table` doesn't ask a server again after it couldn't
+/// be reached: each try waits for the connect timeout, and offline every
+/// stale or kept table would.
+const UNREACHABLE_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Connections whose server didn't answer a describe, and when.
+static UNREACHABLE: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::LazyLock::new(Default::default);
+
+fn recently_unreachable(connection_id: &str) -> bool {
+    UNREACHABLE.lock().get(connection_id).is_some_and(|t| t.elapsed() < UNREACHABLE_FOR)
+}
+
+fn set_unreachable(connection_id: &str, unreachable: bool) {
+    let mut m = UNREACHABLE.lock();
+    if unreachable {
+        m.insert(connection_id.to_string(), std::time::Instant::now());
+    } else {
+        m.remove(connection_id);
+    }
+}
+
 impl ToolContext {
     pub(super) fn policy(&self) -> &databrain_workspace::AiPolicy {
         &self.profile.ai_policy
@@ -43,16 +64,34 @@ impl ToolContext {
         let mut o = tables.get(t)?.ok_or_else(|| AiError::Policy(knowledge::not_available(t)))?;
         // Allowed but only listed (no columns yet), or changed since: read it
         // now (metadata of a table the user allowed; cached for next time).
-        // Offline, what is cached is answered.
+        // Offline, what is cached is answered, and the server isn't asked
+        // again for a while.
         let stale = ws.meta_table_is_stale(&target.id, &o.schema, &o.name)?;
-        if target.ai_policy.share_metadata
-            && (o.columns.is_empty() || stale)
-            && let Ok(d) = self.engine.describe(&target.id, &o.schema, &o.name).await
-            && !d.columns.is_empty()
-        {
-            ws.meta_put_table(&target.id, &o.schema, &o.name, &d.columns, Some(&d.foreign_keys))?;
-            if let Some(fresh) = tables.get(&o.full_name())? {
-                o = fresh;
+        let mut offline = false;
+        if target.ai_policy.share_metadata && (o.columns.is_empty() || stale) {
+            if recently_unreachable(&target.id) {
+                offline = true;
+            } else {
+                match self.engine.describe(&target.id, &o.schema, &o.name).await {
+                    Ok(d) => {
+                        set_unreachable(&target.id, false);
+                        if !d.columns.is_empty() {
+                            ws.meta_put_table(&target.id, &o.schema, &o.name, &d.columns, Some(&d.foreign_keys))?;
+                            if let Some(fresh) = tables.get(&o.full_name())? {
+                                o = fresh;
+                            }
+                        }
+                    }
+                    // The server couldn't be reached or signed in to (a
+                    // connect timeout is a `connection` error); not a slow
+                    // read of this one table (`timeout`), which says
+                    // nothing of the others.
+                    Err(e) if matches!(e.kind.as_str(), "connection" | "auth" | "reauth_required") => {
+                        set_unreachable(&target.id, true);
+                        offline = true;
+                    }
+                    Err(_) => {}
+                }
             }
         }
         let full = o.full_name();
@@ -74,11 +113,11 @@ impl ToolContext {
         let mut text = knowledge::render_object(&o, &target.ai_policy, &notes);
         // Kept from before the cache lost it (and not read now): say so.
         if let Some(since) = tables.missing_since(&o)? {
-            text.push_str(&format!(
-                "
-{}",
-                knowledge::kept_note(since)
-            ));
+            text.push('\n');
+            text.push_str(&knowledge::kept_note(since));
+        }
+        if offline {
+            text.push_str("\nThe server couldn't be reached just now: this is what DataBrain has cached, and it may be out of date.");
         }
         // Tables that reference this one.
         let refs: Vec<String> = tables

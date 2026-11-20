@@ -101,6 +101,186 @@ fn connections_crud() {
     assert!(ws.save_connection(profile("  ")).is_err());
 }
 
+/// Deleting a connection leaves nothing of what only belonged to it: every
+/// table with a `connection_id` but those kept on purpose (their
+/// connection becomes unset), and its settings. A table added later is
+/// checked too.
+#[test]
+fn deleting_a_connection_leaves_nothing_of_it() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let mut p = profile("Prod DB");
+    let saved = ws.save_connection(p.clone()).unwrap();
+    let id = saved.id.clone();
+    let other = ws.save_connection(profile("Other")).unwrap().id;
+    let fill = |c: &str| {
+        let col = |n: &str| databrain_connector_core::ColumnInfo {
+            name: n.into(),
+            data_type: "int".into(),
+            nullable: true,
+            is_primary_key: false,
+            default: None,
+            comment: None,
+        };
+        let k = KnObject {
+            schema: "s".into(),
+            name: "t".into(),
+            kind: "table".into(),
+            comment: None,
+            row_estimate: None,
+            columns: vec![col("id")],
+            foreign_keys: vec![],
+        };
+        ws.meta_put_schemas(c, None, &[databrain_connector_core::SchemaInfo { name: "s".into(), is_default: true, catalog: None }]).unwrap();
+        ws.meta_put_schema(c, "s", &[DbObject { schema: "s".into(), name: "v".into(), kind: ObjectKind::View, comment: None, row_estimate: None }]).unwrap();
+        ws.meta_view_sql_put(c, "s", "v", "select 1").unwrap();
+        ws.kn_replace_schema(c, "s", std::slice::from_ref(&k)).unwrap();
+        ws.kn_set_state(&KnState { connection_id: c.into(), indexed_at: 1, objects: 1, schemas: vec!["s".into()], error: None }).unwrap();
+        ws.kn_save_note(KnNote {
+            id: String::new(),
+            connection_id: c.into(),
+            target: Some("s.t".into()),
+            body: "rows of t".into(),
+            author: "user".into(),
+            status: NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        })
+        .unwrap();
+        // A schema list without `s`: its tables are kept for the AI (ai_kept).
+        ws.meta_put_schemas(c, None, &[]).unwrap();
+        ws.kn_set_fingerprint(c, "s", Some("f")).unwrap();
+        // And a schema still listed, with a view's definition.
+        ws.meta_put_schema(c, "u", &[DbObject { schema: "u".into(), name: "v".into(), kind: ObjectKind::View, comment: None, row_estimate: None }]).unwrap();
+        ws.meta_put_table(c, "u", "v", &[col("id")], Some(&[])).unwrap();
+        ws.meta_view_sql_put(c, "u", "v", "select 1").unwrap();
+    };
+    fill(&id);
+    fill(&other);
+    // Pointed elsewhere: the next index asks (a setting of the connection).
+    p.id = id.clone();
+    p.created_at = saved.created_at;
+    p.config.host = Some("elsewhere.local".into());
+    ws.save_connection(p).unwrap();
+    assert!(ws.ai_index_must_choose(&id));
+    fill(&id);
+
+    ws.delete_connection(&id).unwrap();
+    // Kept on purpose, their connection unset: the user's queries, history,
+    // notebooks, outputs, tabs and AI conversations and audit.
+    const KEPT: [&str; 7] = ["saved_queries", "query_history", "tabs", "ai_sessions", "ai_audit", "notebooks", "outputs"];
+    let c = ws.conn.lock();
+    let tables: Vec<String> = c
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND sql LIKE '%connection_id%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(tables.len() > 15, "{tables:?}");
+    for t in tables.iter().filter(|t| !KEPT.contains(&t.as_str())) {
+        let left: i64 = c.query_row(&format!("SELECT count(*) FROM \"{t}\" WHERE connection_id = ?1"), [&id], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "{t} keeps rows of the deleted connection");
+    }
+    let settings: i64 = c.query_row("SELECT count(*) FROM settings WHERE instr(key, ?1) > 0", [&id], |r| r.get(0)).unwrap();
+    assert_eq!(settings, 0, "a setting of the deleted connection is left");
+    // The other connection keeps everything.
+    for t in ["meta_objects", "meta_columns", "meta_views", "kn_notes", "kn_state", "kn_schema_state", "ai_scope", "ai_kept"] {
+        let n: i64 = c.query_row(&format!("SELECT count(*) FROM {t} WHERE connection_id = ?1"), [&other], |r| r.get(0)).unwrap();
+        assert!(n > 0, "{t} of the other connection");
+    }
+}
+
+/// A note and its search row are written together: an import that fails
+/// halfway changes nothing, and a save that can't write the search row
+/// leaves no note the AI can't find.
+#[test]
+fn note_writes_are_all_or_nothing() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let note = |body: &str| KnNote {
+        id: String::new(),
+        connection_id: "c".into(),
+        target: Some("s.t".into()),
+        body: body.into(),
+        author: "user".into(),
+        status: NoteStatus::Approved,
+        created_at: 0,
+        replaces: None,
+    };
+    let old = ws.kn_save_note(note("t holds orders")).unwrap();
+    let found = |q: &str| ws.ai_catalog("c").search(q, 10).unwrap().iter().filter(|h| h.source == "note").count();
+    let entry = |body: &str| NoteEntry { target: Some("s.t".into()), body: body.into(), author: None };
+    let replace = ImportAction { incoming: entry("t holds invoices"), action: "replace".into(), existing_ids: vec![old.id.clone()], body: None, target: None };
+    // The replace, then an action it can't read: nothing applied.
+    let bad = ImportAction { action: "rename".into(), ..replace.clone() };
+    assert!(ws.kn_import_apply("c", &[replace.clone(), bad]).is_err());
+    assert_eq!(ws.kn_notes("c").unwrap().iter().map(|n| n.body.as_str()).collect::<Vec<_>>(), vec!["t holds orders"]);
+    assert_eq!((found("orders"), found("invoices")), (1, 0));
+    // Alone it applies: the old note and its search row go, the new one is found.
+    assert_eq!(ws.kn_import_apply("c", std::slice::from_ref(&replace)).unwrap(), 1);
+    assert_eq!(ws.kn_notes("c").unwrap().iter().map(|n| n.body.as_str()).collect::<Vec<_>>(), vec!["t holds invoices"]);
+    assert_eq!((found("orders"), found("invoices")), (0, 1));
+    // An import can't remove another connection's note (nor its search row).
+    let theirs = ws.kn_save_note(KnNote { connection_id: "d".into(), ..note("d's note on payroll") }).unwrap();
+    let steal = ImportAction { existing_ids: vec![theirs.id.clone()], ..replace.clone() };
+    ws.kn_import_apply("c", &[steal]).unwrap();
+    assert_eq!(ws.kn_notes("d").unwrap().len(), 1);
+    assert_eq!(ws.ai_catalog("d").search("payroll", 5).unwrap().len(), 1);
+    // Nor can an approved update that names it.
+    ws.kn_save_note(KnNote { replaces: Some(theirs.id.clone()), ..note("c's update") }).unwrap();
+    assert_eq!(ws.ai_catalog("d").search("payroll", 5).unwrap().len(), 1);
+    // The search row can't be written: no note either.
+    ws.conn.lock().execute_batch("DROP TABLE kn_fts").unwrap();
+    assert!(ws.kn_save_note(note("t is partitioned by day")).is_err());
+    assert!(!ws.kn_notes("c").unwrap().iter().any(|n| n.body.contains("partitioned")));
+    assert!(ws.kn_delete_note(&theirs.id).is_err());
+    assert_eq!(ws.kn_notes("d").unwrap().len(), 1, "a delete that can't drop the search row keeps the note");
+}
+
+/// On a database that ignores the case of names (SQL Server), a scope
+/// chosen as `SALES` covers the listed `sales`: the end of an index run
+/// doesn't take the rule for a schema that went away.
+#[test]
+fn an_index_run_keeps_a_scope_rule_written_in_another_case() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let mut p = profile("SQL Server");
+    p.config.kind = ConnectorKind::Mssql;
+    let id = ws.save_connection(p).unwrap().id;
+    ws.ai_set_schema_rules(&id, &["SALES".into()]).unwrap();
+    let col = databrain_connector_core::ColumnInfo {
+        name: "id".into(),
+        data_type: "int".into(),
+        nullable: true,
+        is_primary_key: false,
+        default: None,
+        comment: None,
+    };
+    let t = KnObject {
+        schema: "sales".into(),
+        name: "orders".into(),
+        kind: "table".into(),
+        comment: None,
+        row_estimate: None,
+        columns: vec![col],
+        foreign_keys: vec![],
+    };
+    // A first run, then a second that reads the same schema.
+    for _ in 0..2 {
+        ws.kn_replace_schema(&id, "sales", std::slice::from_ref(&t)).unwrap();
+        ws.kn_retain_schemas(&id, &["sales".into()]).unwrap();
+        ws.kn_set_state(&KnState { connection_id: id.clone(), indexed_at: 1, objects: 1, schemas: vec!["sales".into()], error: None }).unwrap();
+    }
+    assert!(ws.ai_scope(&id).unwrap().iter().any(|r| r.schema == "SALES" && r.allow));
+    assert_eq!(ws.ai_catalog(&id).count().unwrap(), 1);
+    // Taken out of the index: its rule goes, in any case here.
+    ws.kn_retain_schemas(&id, &[]).unwrap();
+    assert_eq!(ws.ai_catalog(&id).count().unwrap(), 0);
+    // Where case counts (Postgres), `SALES` is another schema's rule: kept.
+    let pg = ws.save_connection(profile("Postgres")).unwrap().id;
+    ws.ai_set_schema_rules(&pg, &["SALES".into(), "sales".into()]).unwrap();
+    ws.ai_remove_schemas(&pg, &["sales".into()]).unwrap();
+    assert_eq!(ws.ai_scope(&pg).unwrap().iter().map(|r| r.schema.as_str()).collect::<Vec<_>>(), vec!["SALES"]);
+}
+
 #[test]
 fn saved_queries_and_folders() {
     let ws = Workspace::open_in_memory().unwrap();
@@ -158,8 +338,8 @@ fn schema_version_guard_and_backup() {
     {
         let c = Connection::open(&path).unwrap();
         c.pragma_update(None, "user_version", 19i64).unwrap();
-        // Undo v25 (its view goes with v20's below), v24, v23, v22 and v21.
-        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits; DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
+        // Undo v26, v25 (its view goes with v20's below), v24, v23, v22 and v21.
+        c.execute_batch("CREATE TABLE kn_objects (connection_id TEXT NOT NULL, schema_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, comment TEXT, row_estimate INTEGER, columns_json TEXT NOT NULL, fks_json TEXT NOT NULL, content_hash TEXT NOT NULL, indexed_at INTEGER NOT NULL, PRIMARY KEY (connection_id, schema_name, name)); DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits; DROP TABLE job_watermarks; DROP TABLE job_watermarks_pending; DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
         // Undo v20, as an older version left it: schema `s`
         // indexed in full (index scope `*`), `hr.teams` indexed on its own,
         // and `hr.salaries` only seen in the explorer.
@@ -446,7 +626,8 @@ fn clears_are_one_transaction_each() {
     let kn =
         KnObject { schema: "s".into(), name: "orders".into(), kind: "table".into(), comment: None, row_estimate: None, columns: vec![], foreign_keys: vec![] };
     ws.kn_replace_schema("c", "s", &[kn]).unwrap();
-    let count = |ws: &Workspace| ws.conn.lock().query_row("SELECT count(*) FROM kn_objects WHERE connection_id = 'c'", [], |r| r.get::<_, i64>(0)).unwrap();
+    ws.kn_set_state(&KnState { connection_id: "c".into(), indexed_at: 1, objects: 1, schemas: vec!["s".into()], error: None }).unwrap();
+    let count = |ws: &Workspace| ws.conn.lock().query_row("SELECT count(*) FROM kn_state WHERE connection_id = 'c'", [], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(count(&ws), 1);
     ws.conn.lock().execute_batch("DROP TABLE kn_schema_state").unwrap();
     assert!(ws.kn_clear("c").is_err());
@@ -541,7 +722,7 @@ fn an_earlier_draft_of_v22_is_repaired() {
         // At v22, which then held v23's tables too: v23 runs over them.
         // Later migrations are taken back too, so they can run again.
         c.pragma_update(None, "user_version", 22i64).unwrap();
-        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits;").unwrap();
+        c.execute_batch("CREATE TABLE kn_objects (connection_id TEXT NOT NULL, schema_name TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, comment TEXT, row_estimate INTEGER, columns_json TEXT NOT NULL, fks_json TEXT NOT NULL, content_hash TEXT NOT NULL, indexed_at INTEGER NOT NULL, PRIMARY KEY (connection_id, schema_name, name)); DROP VIEW ai_objects; DROP TABLE ai_kept; ALTER TABLE ai_usage DROP COLUMN credits;").unwrap();
         c.execute_batch(
             "DROP TABLE job_after_pending; \
              CREATE TABLE job_after_pending (job_id TEXT PRIMARY KEY, after TEXT NOT NULL, added_at INTEGER NOT NULL); \

@@ -273,7 +273,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 | Core | `connections`, `folders`, `saved_queries`, `query_history`, `tabs`, `settings`, `maintenance` |
 | Explorer cache | `meta_catalogs`, `meta_schemas`, `meta_objects`, `meta_columns`, `meta_conn_state` |
 | AI | `ai_providers`, `ai_sessions`, `ai_messages`, `ai_audit` |
-| Knowledge | `kn_objects`, `kn_notes`, `kn_state`, `kn_schema_state`, FTS5 `kn_fts`; learned from history: `kn_joins`, `kn_join_seen`, `kn_table_seen`, `kn_learn_state` |
+| Knowledge | `kn_notes`, `kn_state`, `kn_schema_state`, FTS5 `kn_fts`; learned from history: `kn_joins`, `kn_join_seen`, `kn_table_seen`, `kn_learn_state` |
 | Notebooks, jobs, outputs | `notebooks`, `jobs`, `job_runs` (with run logs and leases), `outputs` |
 
 How the explorer cache is filled, checked against the server and read by other features: [EXPLORER.md](EXPLORER.md).

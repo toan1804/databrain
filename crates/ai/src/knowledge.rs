@@ -263,7 +263,7 @@ pub async fn index_connection_with(
                 .collect();
             report.objects += items.len();
             // Keys only when the read covered them (dropped ones go then).
-            let d = ws.kn_replace_schema_read(connection_id, &m.schema, &items, m.foreign_keys_read && m.error.is_none())?;
+            let d = ws.kn_replace_schema_read(connection_id, &m.schema, &items, m.foreign_keys_read && m.error.is_none(), m.error.is_none())?;
             report.changed += d.changed;
             report.removed += d.removed;
             // Fingerprint taken before the fetch: a change during the run is picked up next time.
@@ -417,7 +417,7 @@ async fn describe_named(
 
 /// The database couldn't be reached or signed in to: says nothing about
 /// the table, so it is told as it is.
-fn unreachable_error(e: &databrain_query_engine::EngineError) -> bool {
+pub(crate) fn unreachable_error(e: &databrain_query_engine::EngineError) -> bool {
     matches!(e.kind.as_str(), "connection" | "auth" | "reauth_required" | "timeout")
 }
 

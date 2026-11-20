@@ -444,80 +444,88 @@ const STOPWORDS: &[&str] = &[
 ];
 
 impl Workspace {
-    /// Replace the indexed objects of one schema. Unchanged objects (same
-    /// content hash) are skipped. The facts also go to the explorer cache,
-    /// the one store the AI reads (`ai_objects`); its search rows follow
-    /// from there.
+    /// The objects of one schema as an index run read them in full: their
+    /// facts go to the explorer cache, the one store the AI reads
+    /// (`ai_objects`); its search rows follow from there. A table the read
+    /// doesn't have is gone from the server, as with a filled explorer
+    /// listing. An empty list changes nothing.
     pub fn kn_replace_schema(&self, connection_id: &str, schema: &str, objects: &[KnObject]) -> Result<IndexDelta> {
-        self.kn_replace_schema_read(connection_id, schema, objects, false)
+        self.kn_replace_schema_read(connection_id, schema, objects, false, true)
     }
 
     /// [`Self::kn_replace_schema`]; `keys_read`: the read covered foreign
     /// keys, so a table's list replaces the cached one, an empty list too
     /// (keys dropped on the server go). Otherwise keys read before stay.
-    pub fn kn_replace_schema_read(&self, connection_id: &str, schema: &str, objects: &[KnObject], keys_read: bool) -> Result<IndexDelta> {
+    /// `complete`: the read had no error, so a table it lacks is gone; a
+    /// read that failed partway removes nothing.
+    pub fn kn_replace_schema_read(&self, connection_id: &str, schema: &str, objects: &[KnObject], keys_read: bool, complete: bool) -> Result<IndexDelta> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
-        let existing: std::collections::HashMap<String, String> = {
-            let mut stmt = tx.prepare("SELECT name, content_hash FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2")?;
-            stmt.query_map(params![connection_id, schema], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-        };
+        let before = Self::known_tx(&tx, connection_id, Some(schema))?;
         let now = now_ms();
         let mut delta = IndexDelta::default();
-        let keep: HashSet<&str> = objects.iter().map(|o| o.name.as_str()).collect();
-        for name in existing.keys().filter(|n| !keep.contains(n.as_str())) {
-            tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3", params![connection_id, schema, name])?;
-            // A re-read of the schema without it: it is gone from the server
-            // (an empty list only takes the schema out of the index).
-            if !objects.is_empty() {
+        if !objects.is_empty() && complete {
+            let keep: HashSet<&str> = objects.iter().map(|o| o.name.as_str()).collect();
+            for name in before.keys().map(|(_, n)| n).filter(|n| !keep.contains(n.as_str())) {
                 tx.execute(
                     "DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 \
                        AND kind IN ('table', 'view', 'materialized_view', 'foreign_table')",
                     params![connection_id, schema, name],
                 )?;
                 tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1 AND schema_name = ?2 AND table_name = ?3", params![connection_id, schema, name])?;
+                delta.removed += 1;
             }
-            delta.removed += 1;
         }
         for o in objects {
+            let old = before.get(&(o.schema.clone(), o.name.clone()));
             Self::meta_put_known_tx(&tx, connection_id, o, now, keys_read)?;
-            let hash = o.hash();
-            if existing.get(&o.name).is_some_and(|h| *h == hash) {
+            if Self::changes(old, o, keys_read) {
+                delta.changed += 1;
+            } else {
                 delta.unchanged += 1;
-                continue;
             }
-            tx.prepare_cached(
-                "INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-                 ON CONFLICT(connection_id, schema_name, name) DO UPDATE SET kind = excluded.kind, comment = excluded.comment, \
-                   row_estimate = excluded.row_estimate, columns_json = excluded.columns_json, fks_json = excluded.fks_json, \
-                   content_hash = excluded.content_hash, indexed_at = excluded.indexed_at",
-            )?
-            .execute(params![
-                connection_id,
-                o.schema,
-                o.name,
-                o.kind,
-                o.comment,
-                o.row_estimate,
-                serde_json::to_string(&o.columns)?,
-                serde_json::to_string(&o.foreign_keys)?,
-                hash,
-                now
-            ])?;
-            delta.changed += 1;
         }
-        // Indexing a schema lets the AI use it (step 1 of the metadata
-        // store: the Knowledge page's scope controls replace this later).
-        // An existing rule (the user excluded the schema) is kept.
+        // Indexing a schema lets the AI use it. An existing rule (the user
+        // excluded the schema) is kept.
         if !objects.is_empty() {
             Self::put_rule_if_absent(&tx, connection_id, &crate::ScopeRule { schema: schema.to_string(), table: String::new(), allow: true })?;
-            // A read that found tables answers for the schema's kept ones.
-            Self::kept_answered_tx(&tx, connection_id, schema)?;
+            // A read that found tables and had no error answers for the
+            // schema's kept ones.
+            if complete {
+                Self::kept_answered_tx(&tx, connection_id, schema)?;
+            }
         }
         Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
         Ok(delta)
+    }
+
+    /// What the explorer cache knows of a schema's tables (every schema's
+    /// with `None`), by (schema, name): the table before a view of the same name.
+    fn known_tx(c: &rusqlite::Connection, connection_id: &str, schema: Option<&str>) -> Result<std::collections::HashMap<(String, String), KnObject>> {
+        let mut out = std::collections::HashMap::new();
+        for o in Self::facts_tx(c, connection_id, schema, None)? {
+            out.entry((o.schema.clone(), o.name.clone())).or_insert(o);
+        }
+        Ok(out)
+    }
+
+    /// Whether writing `o` ([`Self::meta_put_known_tx`]) changes what the
+    /// cache had (`old`): columns not read and keys not read keep the
+    /// cached ones, as does a row estimate not read.
+    fn changes(old: Option<&KnObject>, o: &KnObject, keys_read: bool) -> bool {
+        let Some(old) = old else { return true };
+        let mut now = o.clone();
+        if now.columns.is_empty() {
+            now.columns = old.columns.clone();
+            now.foreign_keys = old.foreign_keys.clone();
+        } else if now.foreign_keys.is_empty() && !keys_read {
+            now.foreign_keys = old.foreign_keys.clone();
+        }
+        if now.row_estimate.is_none() {
+            now.row_estimate = old.row_estimate;
+        }
+        now.hash() != old.hash()
     }
 
     /// An indexed object's facts into the explorer cache: the object, and
@@ -559,29 +567,6 @@ impl Workspace {
         Ok(())
     }
 
-    /// Indexed foreign keys that reference `table` (any schema of the
-    /// connection), as (schema, table, key). `None`: the connection has no
-    /// indexed objects, so the index can't tell.
-    pub fn kn_foreign_keys_to(&self, connection_id: &str, table: &str) -> Result<Option<Vec<(String, String, ForeignKey)>>> {
-        let c = self.conn.lock();
-        let any: i64 = c.query_row("SELECT COUNT(*) FROM (SELECT 1 FROM kn_objects WHERE connection_id = ?1 LIMIT 1)", [connection_id], |r| r.get(0))?;
-        if any == 0 {
-            return Ok(None);
-        }
-        let mut stmt = c.prepare("SELECT schema_name, name, fks_json FROM kn_objects WHERE connection_id = ?1 AND fks_json LIKE ?2")?;
-        let like = format!("%{}%", table.replace('%', "").replace('_', "%"));
-        let mut out = Vec::new();
-        for row in stmt.query_map(params![connection_id, like], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
-            let (schema, name, json) = row?;
-            for fk in serde_json::from_str::<Vec<ForeignKey>>(&json).unwrap_or_default() {
-                if fk.ref_table.eq_ignore_ascii_case(table) {
-                    out.push((schema.clone(), name.clone(), fk));
-                }
-            }
-        }
-        Ok(Some(out))
-    }
-
     /// Add or refresh single objects (indexing chosen tables), keeping the
     /// rest of their schemas. Returns how many changed.
     pub fn kn_upsert_objects(&self, connection_id: &str, objects: &[KnObject]) -> Result<usize> {
@@ -589,46 +574,18 @@ impl Workspace {
         let tx = c.transaction()?;
         let now = now_ms();
         let mut changed = 0;
+        let schemas: HashSet<&str> = objects.iter().map(|o| o.schema.as_str()).collect();
         for o in objects {
+            // Only this table's facts (not its whole schema's).
+            let old = Self::facts_tx(&tx, connection_id, Some(&o.schema), Some(&o.name))?.into_iter().next();
+            changed += usize::from(Self::changes(old.as_ref(), o, false));
             Self::meta_put_known_tx(&tx, connection_id, o, now, false)?;
-            let hash = o.hash();
-            let old: Option<String> = tx
-                .query_row(
-                    "SELECT content_hash FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3",
-                    params![connection_id, o.schema, o.name],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if old.as_deref() == Some(hash.as_str()) {
-                continue;
-            }
-            tx.execute(
-                "INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-                 ON CONFLICT(connection_id, schema_name, name) DO UPDATE SET kind = excluded.kind, comment = excluded.comment, \
-                   row_estimate = excluded.row_estimate, columns_json = excluded.columns_json, fks_json = excluded.fks_json, \
-                   content_hash = excluded.content_hash, indexed_at = excluded.indexed_at",
-                params![
-                    connection_id,
-                    o.schema,
-                    o.name,
-                    o.kind,
-                    o.comment,
-                    o.row_estimate,
-                    serde_json::to_string(&o.columns)?,
-                    serde_json::to_string(&o.foreign_keys)?,
-                    hash,
-                    now
-                ],
-            )?;
-            changed += 1;
         }
         // Indexing a table lets the AI use it.
         // An existing rule (the user excluded the table) is kept.
         for o in objects {
             Self::put_rule_if_absent(&tx, connection_id, &crate::ScopeRule { schema: o.schema.clone(), table: o.name.clone(), allow: true })?;
         }
-        let schemas: HashSet<&str> = objects.iter().map(|o| o.schema.as_str()).collect();
         for s in schemas {
             Self::ai_refresh_tx(&tx, connection_id, Some(s))?;
         }
@@ -660,18 +617,18 @@ impl Workspace {
 
     /// Remove indexed schemas that no longer exist / are excluded.
     pub fn kn_retain_schemas(&self, connection_id: &str, schemas: &[String]) -> Result<usize> {
-        let current: Vec<String> = {
-            let c = self.conn.lock();
-            let mut stmt = c.prepare("SELECT DISTINCT schema_name FROM kn_objects WHERE connection_id = ?1")?;
-            stmt.query_map([connection_id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut removed = 0;
-        let gone: Vec<String> = current.iter().filter(|s| !schemas.contains(s)).cloned().collect();
-        for s in &gone {
-            removed += self.kn_replace_schema(connection_id, s, &[])?.removed;
-        }
+        // The schemas earlier runs indexed: the last run's list and those
+        // with a fingerprint, both as the server listed them (a scope rule
+        // may be written in another case, and must not be taken for one).
+        let mut current: Vec<String> = self.kn_state(connection_id)?.map(|s| s.schemas).unwrap_or_default();
+        current.extend(self.kn_fingerprints(connection_id)?.into_keys());
+        current.sort();
+        current.dedup();
+        let gone: Vec<String> = current.into_iter().filter(|s| !schemas.contains(s)).collect();
         // Out of the index: out of the AI's scope.
+        let mut removed = 0;
         if !gone.is_empty() {
+            removed = self.ai_catalog(connection_id).count_in(&gone)?;
             self.ai_remove_schemas(connection_id, &gone)?;
         }
         self.conn.lock().execute(
@@ -705,59 +662,6 @@ impl Workspace {
         .optional()?)
     }
 
-    /// Number of indexed objects in the given schemas.
-    pub fn kn_objects_in(&self, connection_id: &str, schemas: &[String]) -> Result<usize> {
-        let n: i64 = self.conn.lock().query_row(
-            "SELECT count(*) FROM kn_objects WHERE connection_id = ?1 AND schema_name IN (SELECT value FROM json_each(?2))",
-            params![connection_id, serde_json::to_string(schemas)?],
-            |r| r.get(0),
-        )?;
-        Ok(n as usize)
-    }
-
-    pub fn kn_count(&self, connection_id: &str) -> Result<i64> {
-        Ok(self.conn.lock().query_row("SELECT count(*) FROM kn_objects WHERE connection_id = ?1", [connection_id], |r| r.get(0))?)
-    }
-
-    fn kn_object_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<KnObject> {
-        Ok(KnObject {
-            schema: r.get(0)?,
-            name: r.get(1)?,
-            kind: r.get(2)?,
-            comment: r.get(3)?,
-            row_estimate: r.get(4)?,
-            columns: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
-            foreign_keys: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
-        })
-    }
-
-    pub fn kn_objects(&self, connection_id: &str) -> Result<Vec<KnObject>> {
-        let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT schema_name, name, kind, comment, row_estimate, columns_json, fks_json FROM kn_objects \
-             WHERE connection_id = ?1 ORDER BY schema_name, name",
-        )?;
-        let rows = stmt.query_map([connection_id], Self::kn_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    /// A page of indexed objects whose `schema.name comment` contains `filter`
-    /// (case-insensitive; empty = all), ordered by schema and name, plus how
-    /// many match in total. Keeps the Knowledge view fast on 10k+ tables.
-    pub fn kn_list_objects(&self, connection_id: &str, filter: &str, offset: usize, limit: usize) -> Result<(Vec<KnObject>, usize)> {
-        let c = self.conn.lock();
-        let q = filter.trim().to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        const MATCH: &str =
-            "connection_id = ?1 AND (?2 = '' OR lower(schema_name || '.' || name || ' ' || coalesce(comment, '')) LIKE '%' || ?2 || '%' ESCAPE '\\')";
-        let total: i64 = c.query_row(&format!("SELECT count(*) FROM kn_objects WHERE {MATCH}"), params![connection_id, q], |r| r.get(0))?;
-        let mut stmt = c.prepare_cached(&format!(
-            "SELECT schema_name, name, kind, comment, row_estimate, columns_json, fks_json FROM kn_objects WHERE {MATCH} \
-             ORDER BY schema_name, name LIMIT ?3 OFFSET ?4"
-        ))?;
-        let rows = stmt.query_map(params![connection_id, q, limit as i64, offset as i64], Self::kn_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((rows, total as usize))
-    }
-
     /// Completion from the local index (no network): tables/views whose name
     /// contains `query` (empty = any), in `schema` when given, prefix matches
     /// and short names first. Returns (schema, name, kind, comment).
@@ -786,54 +690,10 @@ impl Workspace {
         Ok(self.meta_table(connection_id, schema, name)?.map(|t| t.columns.into_iter().map(|c| c.name).collect()))
     }
 
-    /// Look up an object by `schema.name` or bare `name` (case-insensitive).
-    pub fn kn_get(&self, connection_id: &str, reference: &str) -> Result<Option<KnObject>> {
-        let c = self.conn.lock();
-        let (schema, name) = match reference.rsplit_once('.') {
-            Some((s, n)) => (Some(s.to_string()), n.to_string()),
-            None => (None, reference.to_string()),
-        };
-        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string();
-        let schema = schema.map(|s| s.replace(['"', '`', '[', ']'], ""));
-        Ok(c.query_row(
-            "SELECT schema_name, name, kind, comment, row_estimate, columns_json, fks_json FROM kn_objects \
-             WHERE connection_id = ?1 AND lower(name) = lower(?2) \
-               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
-             ORDER BY length(schema_name) LIMIT 1",
-            params![connection_id, name, schema],
-            Self::kn_object_row,
-        )
-        .optional()?)
-    }
-
-    /// Resolve one target path (`schema.table` or `schema.table.column`, bare
-    /// `table` too) against the index: the table and the column, if any.
-    pub fn kn_resolve_path(&self, connection_id: &str, path: &str) -> Result<Option<(KnObject, Option<String>)>> {
-        if let Some(o) = self.kn_get(connection_id, path)? {
-            return Ok(Some((o, None)));
-        }
-        let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
-        if let Some(o) = self.kn_get(connection_id, table)?
-            && let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)).map(|c| c.name.clone())
-        {
-            return Ok(Some((o, Some(c))));
-        }
-        Ok(None)
-    }
-
-    pub fn kn_search(&self, connection_id: &str, text: &str, limit: usize) -> Result<Vec<KnHit>> {
-        let Some(q) = fts_query(text) else { return Ok(vec![]) };
-        let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT source, ref, title, bm25(kn_fts, 0, 0, 0, 5.0, 1.0) AS score FROM kn_fts \
-             WHERE kn_fts MATCH ?2 AND connection_id = ?1 ORDER BY score LIMIT ?3",
-        )?;
-        let rows = stmt
-            .query_map(params![connection_id, q, limit as i64], |r| Ok(KnHit { source: r.get(0)?, reference: r.get(1)?, title: r.get(2)?, score: r.get(3)? }))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
+    /// Forget what index runs recorded (their state and fingerprints, so
+    /// the next run reads every schema) and the tables kept for the AI.
+    /// What the AI may use (its scope) and the explorer cache stay, so the
+    /// tables the scope allows remain the AI's.
     pub fn kn_clear(&self, connection_id: &str) -> Result<()> {
         // One transaction: all of it goes, or none.
         let mut c = self.conn.lock();
@@ -844,7 +704,6 @@ impl Workspace {
     }
 
     pub(crate) fn kn_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
-        tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
         Self::kept_forget_tx(tx, connection_id)?;
         // Search rows go with `ai_tables` (kept in step); the scope stays.
         Self::ai_forget_tx(tx, connection_id)?;
@@ -862,14 +721,25 @@ impl Workspace {
             n.created_at = now_ms();
         }
         n.target = n.target.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        let c = self.conn.lock();
+        // The note and its search row change together, or neither does.
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let n = Self::save_note_tx(&tx, n)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// [`Self::kn_save_note`] inside the caller's transaction (`n` checked and given an id).
+    fn save_note_tx(c: &rusqlite::Transaction<'_>, mut n: KnNote) -> Result<KnNote> {
         // Approving an update: the new text takes the old note's place.
         if n.status == NoteStatus::Approved
             && let Some(old) = n.replaces.take()
             && old != n.id
         {
-            c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![old, n.connection_id])?;
-            c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&old])?;
+            // Only a note of the same connection (and so only its search row).
+            if c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![old, n.connection_id])? > 0 {
+                c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&old])?;
+            }
         }
         c.execute(
             "INSERT INTO kn_notes (id, connection_id, target, body, author, status, created_at, replaces) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
@@ -914,9 +784,11 @@ impl Workspace {
     }
 
     pub fn kn_delete_note(&self, id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM kn_notes WHERE id = ?1", [id])?;
-        c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM kn_notes WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -948,8 +820,12 @@ impl Workspace {
         Ok(plan_import(&existing, &file.notes))
     }
 
-    /// Apply the user's choices. Returns how many notes were added or changed.
+    /// Apply the user's choices, all of them or none (a failure halfway
+    /// left some notes replaced and others not). Returns how many notes
+    /// were added or changed.
     pub fn kn_import_apply(&self, connection_id: &str, actions: &[ImportAction]) -> Result<usize> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
         let mut n = 0;
         for a in actions {
             let body = a.body.clone().unwrap_or_else(|| a.incoming.body.clone());
@@ -961,27 +837,32 @@ impl Workspace {
                     }
                     if a.action != "add" {
                         for id in &a.existing_ids {
-                            // Only this connection's notes.
-                            let c = self.conn.lock();
-                            c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![id, connection_id])?;
-                            c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+                            // Only this connection's notes (and so only their search rows).
+                            if tx.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![id, connection_id])? > 0 {
+                                tx.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+                            }
                         }
                     }
-                    self.kn_save_note(KnNote {
-                        id: String::new(),
-                        connection_id: connection_id.to_string(),
-                        target: a.target.clone().or_else(|| a.incoming.target.clone()),
-                        body,
-                        author: if a.action == "merge" { "merged".into() } else { a.incoming.author.clone().unwrap_or_else(|| "import".into()) },
-                        status: NoteStatus::Approved,
-                        created_at: 0,
-                        replaces: None,
-                    })?;
+                    let target = a.target.clone().or_else(|| a.incoming.target.clone()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                    Self::save_note_tx(
+                        &tx,
+                        KnNote {
+                            id: new_id(),
+                            connection_id: connection_id.to_string(),
+                            target,
+                            body,
+                            author: if a.action == "merge" { "merged".into() } else { a.incoming.author.clone().unwrap_or_else(|| "import".into()) },
+                            status: NoteStatus::Approved,
+                            created_at: now_ms(),
+                            replaces: None,
+                        },
+                    )?;
                     n += 1;
                 }
                 other => return Err(Error::Invalid(format!("unknown import action {other}"))),
             }
         }
+        tx.commit()?;
         Ok(n)
     }
 
@@ -1026,13 +907,13 @@ mod tests {
         let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
         assert_eq!((t.columns.len(), t.foreign_keys.map(|f| f.len())), (3, Some(1)));
         // A read that covered keys and found none: the key was dropped on the server.
-        ws.kn_replace_schema_read("c", "sales", &[obj("sales", "orders", &["id", "cid", "total"], None)], true).unwrap();
+        ws.kn_replace_schema_read("c", "sales", &[obj("sales", "orders", &["id", "cid", "total"], None)], true, true).unwrap();
         let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
         assert_eq!(t.foreign_keys.as_deref(), Some(&[][..]), "dropped keys go");
         // And one that found it again keeps it.
         let mut with_key = obj("sales", "orders", &["id", "cid", "total"], None);
         with_key.foreign_keys = vec![fk.clone()];
-        ws.kn_replace_schema_read("c", "sales", &[with_key], true).unwrap();
+        ws.kn_replace_schema_read("c", "sales", &[with_key], true, true).unwrap();
         assert_eq!(ws.meta_table("c", "sales", "orders").unwrap().unwrap().foreign_keys, Some(vec![fk]));
     }
 
@@ -1071,15 +952,15 @@ mod tests {
         ws.kn_replace_schema("c1", "big", &many).unwrap();
         ws.kn_replace_schema("c2", "big", &[obj("big", "other", &[], None)]).unwrap();
         let t = std::time::Instant::now();
-        let (page, total) = ws.kn_list_objects("c1", "", 0, 300).unwrap();
+        let (page, total) = ws.ai_catalog("c1").page("", 0, 300).unwrap();
         assert_eq!((page.len(), total), (300, 12_000));
         assert_eq!(page[0].name, "t00000");
         assert_eq!(page[0].columns.len(), 1);
-        assert_eq!(ws.kn_list_objects("c1", "", 300, 2).unwrap().0[0].name, "t00300");
+        assert_eq!(ws.ai_catalog("c1").page("", 300, 2).unwrap().0[0].name, "t00300");
         // schema.name and comments, case-insensitive; `%` / `_` are literal.
-        assert_eq!(ws.kn_list_objects("c1", "BIG.T0001", 0, 5).unwrap().1, 10);
-        assert_eq!(ws.kn_list_objects("c1", "100% done", 0, 5).unwrap().1, 12);
-        assert_eq!(ws.kn_list_objects("c1", "t_", 0, 5).unwrap().1, 0);
+        assert_eq!(ws.ai_catalog("c1").page("BIG.T0001", 0, 5).unwrap().1, 10);
+        assert_eq!(ws.ai_catalog("c1").page("100% done", 0, 5).unwrap().1, 12);
+        assert_eq!(ws.ai_catalog("c1").page("t_", 0, 5).unwrap().1, 0);
         assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
@@ -1096,28 +977,54 @@ mod tests {
         let d = ws.kn_replace_schema("c1", "public", &objs[..2]).unwrap();
         assert_eq!((d.changed, d.removed, d.unchanged), (0, 1, 2));
 
-        let hits = ws.kn_search("c1", "revenue by customer orders", 5).unwrap();
+        let hits = ws.ai_catalog("c1").search("revenue by customer orders", 5).unwrap();
         assert_eq!(hits[0].reference, "public.customer_orders");
         // Search rows follow removals and changes (one row per object).
-        assert!(ws.kn_search("c1", "inventory", 5).unwrap().iter().all(|h| h.reference != "public.inventory"));
+        assert!(ws.ai_catalog("c1").search("inventory", 5).unwrap().iter().all(|h| h.reference != "public.inventory"));
         let mut changed = objs[1].clone();
         changed.comment = Some("Loyalty members".into());
         let d = ws.kn_replace_schema("c1", "public", &[objs[0].clone(), changed]).unwrap();
         assert_eq!((d.changed, d.unchanged), (1, 1));
-        let hits = ws.kn_search("c1", "loyalty", 5).unwrap();
+        let hits = ws.ai_catalog("c1").search("loyalty", 5).unwrap();
         assert_eq!(hits.iter().map(|h| h.reference.as_str()).collect::<Vec<_>>(), vec!["public.customers"]);
-        assert_eq!(ws.kn_search("c1", "customers", 10).unwrap().iter().filter(|h| h.reference == "public.customers").count(), 1);
-        assert!(ws.kn_search("c1", "", 5).unwrap().is_empty());
-        assert!(ws.kn_search("other", "orders", 5).unwrap().is_empty());
+        assert_eq!(ws.ai_catalog("c1").search("customers", 10).unwrap().iter().filter(|h| h.reference == "public.customers").count(), 1);
+        assert!(ws.ai_catalog("c1").search("", 5).unwrap().is_empty());
+        assert!(ws.ai_catalog("other").search("orders", 5).unwrap().is_empty());
         // FTS syntax characters are neutralized.
-        assert!(ws.kn_search("c1", "\"orders\" AND (x OR", 5).is_ok());
+        assert!(ws.ai_catalog("c1").search("\"orders\" AND (x OR", 5).is_ok());
 
-        assert_eq!(ws.kn_get("c1", "CUSTOMERS").unwrap().unwrap().columns.len(), 2);
-        assert!(ws.kn_get("c1", "public.customers").unwrap().is_some());
-        assert!(ws.kn_get("c1", "nope").unwrap().is_none());
+        assert_eq!(ws.ai_catalog("c1").get("CUSTOMERS").unwrap().unwrap().columns.len(), 2);
+        assert!(ws.ai_catalog("c1").get("public.customers").unwrap().is_some());
+        assert!(ws.ai_catalog("c1").get("nope").unwrap().is_none());
 
-        ws.kn_retain_schemas("c1", &[]).unwrap();
-        assert_eq!(ws.kn_count("c1").unwrap(), 0);
+        ws.kn_set_state(&KnState { connection_id: "c1".into(), indexed_at: 1, objects: 2, schemas: vec!["public".into()], error: None }).unwrap();
+        assert_eq!(ws.kn_retain_schemas("c1", &[]).unwrap(), 2, "out of the index: out of the AI's scope");
+        assert_eq!(ws.ai_catalog("c1").count().unwrap(), 0);
+    }
+
+    /// A read that failed partway (some tables, an error) adds what it has
+    /// and removes nothing: the tables it lacks may still be on the server.
+    #[test]
+    fn a_read_with_an_error_removes_nothing() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let objs = [obj("s", "a", &["id"], None), obj("s", "b", &["id"], None)];
+        ws.kn_replace_schema("c1", "s", &objs).unwrap();
+        ws.meta_clear("c1").unwrap();
+        let kept = || ws.conn.lock().query_row("SELECT count(*) FROM ai_kept", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(kept(), 2, "the cache was cleared: kept for the AI");
+        let d = ws.kn_replace_schema_read("c1", "s", &objs[..1], false, false).unwrap();
+        assert_eq!(d.removed, 0);
+        assert_eq!(kept(), 1, "b is still kept: the read didn't answer for it");
+        assert!(ws.ai_catalog("c1").get("s.b").unwrap().is_some());
+        // Read in full without b: gone.
+        let d = ws.kn_replace_schema_read("c1", "s", &objs[..1], false, true).unwrap();
+        assert_eq!((kept(), ws.ai_catalog("c1").get("s.b").unwrap().is_none()), (0, true));
+        assert_eq!(d.removed, 0, "b was no longer in the cache, only kept");
+        ws.kn_replace_schema("c1", "s", &objs).unwrap();
+        assert_eq!(ws.kn_replace_schema_read("c1", "s", &objs[..1], false, false).unwrap().removed, 0);
+        assert!(ws.meta_table("c1", "s", "b").unwrap().is_some());
+        assert_eq!(ws.kn_replace_schema("c1", "s", &objs[..1]).unwrap().removed, 1);
+        assert!(ws.meta_table("c1", "s", "b").unwrap().is_none());
     }
 
     #[test]
@@ -1174,11 +1081,11 @@ mod tests {
                 replaces: None,
             })
             .unwrap();
-        assert!(ws.kn_search("c1", "recurring revenue", 5).unwrap().is_empty());
+        assert!(ws.ai_catalog("c1").search("recurring revenue", 5).unwrap().is_empty());
         let mut a = n.clone();
         a.status = NoteStatus::Approved;
         ws.kn_save_note(a).unwrap();
-        let hits = ws.kn_search("c1", "recurring revenue", 5).unwrap();
+        let hits = ws.ai_catalog("c1").search("recurring revenue", 5).unwrap();
         assert_eq!(hits[0].source, "note");
         ws.kn_delete_note(&n.id).unwrap();
         assert!(ws.kn_notes("c1").unwrap().is_empty());

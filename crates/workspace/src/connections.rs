@@ -217,7 +217,6 @@ impl Workspace {
         if n == 0 {
             return Err(Error::NotFound(format!("connection {id}")));
         }
-        tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_fts WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_notes WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [id])?;
@@ -230,6 +229,8 @@ impl Workspace {
         tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_conn_state WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM meta_views WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM settings WHERE key = ?1", [crate::meta_cache::index_ask_key(id)])?;
         tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM ai_tables WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM ai_kept WHERE connection_id = ?1", [id])?;

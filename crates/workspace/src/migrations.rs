@@ -530,6 +530,12 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         WHERE NOT EXISTS (SELECT 1 FROM meta_objects o WHERE o.connection_id = k.connection_id AND o.schema_name = k.schema_name
             AND o.name = k.name AND o.kind IN ('table', 'view', 'materialized_view', 'foreign_table'));
     "#,
+    // v26: the AI index's own copy of table facts, unread since v20 (the
+    // explorer cache holds them; docs/design/metadata-store.md, step 4).
+    // kn_schema_state stays: index runs skip unchanged schemas by it.
+    r#"
+    DROP TABLE kn_objects;
+    "#,
 ];
 
 impl Workspace {

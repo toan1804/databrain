@@ -185,10 +185,13 @@ impl Workspace {
     pub fn ai_remove_schemas(&self, connection_id: &str, schemas: &[String]) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
+        // Where the database ignores the case of names, so does the match
+        // (a rule `SALES` is the listed `sales`'s).
+        let ic = Self::ignore_case_tx(&tx, connection_id);
         tx.execute(
             "DELETE FROM ai_scope WHERE connection_id = ?1 AND table_name = '' AND allow = 1 \
-               AND schema_rule IN (SELECT value FROM json_each(?2))",
-            params![connection_id, serde_json::to_string(schemas)?],
+               AND (schema_rule IN (SELECT value FROM json_each(?2)) OR (?3 AND lower(schema_rule) IN (SELECT lower(value) FROM json_each(?2))))",
+            params![connection_id, serde_json::to_string(schemas)?, ic],
         )?;
         Self::ai_refresh_tx(&tx, connection_id, None)?;
         tx.commit()?;
@@ -310,7 +313,7 @@ impl Workspace {
 
     /// What the explorer cache knows of a schema's tables (or one table),
     /// whether or not the AI may use them.
-    fn facts_tx(c: &rusqlite::Connection, connection_id: &str, schema: Option<&str>, name: Option<&str>) -> Result<Vec<KnObject>> {
+    pub(crate) fn facts_tx(c: &rusqlite::Connection, connection_id: &str, schema: Option<&str>, name: Option<&str>) -> Result<Vec<KnObject>> {
         let mut st = c.prepare_cached(&format!(
             "SELECT o.schema_name, o.name, o.kind, o.comment, o.row_estimate, m.columns_json, m.fks_json FROM meta_objects o \
              LEFT JOIN meta_columns m ON m.connection_id = o.connection_id AND m.schema_name = o.schema_name AND m.table_name = o.name \
@@ -509,7 +512,7 @@ impl AiCatalog<'_> {
         Ok(c.query_row(
             &format!(
                 "SELECT {} FROM ai_objects WHERE connection_id = ?1 AND lower(name) = lower(?2) \
-                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
                  ORDER BY length(schema_name) LIMIT 1",
                 Workspace::AI_COLUMNS
             ),
@@ -793,7 +796,9 @@ mod tests {
         // A re-read without `items`: gone from the server, and from the AI.
         ws.kn_replace_schema("c", "sales", &[k("sales", "orders")]).unwrap();
         assert!(ai.get("sales.items").unwrap().is_none());
-        // Out of the index scope: out of the AI's.
+        // Out of the index scope: out of the AI's (as a run records it).
+        ws.kn_set_state(&crate::KnState { connection_id: "c".into(), indexed_at: 1, objects: 3, schemas: vec!["sales".into(), "hr".into()], error: None })
+            .unwrap();
         ws.kn_retain_schemas("c", &["hr".into()]).unwrap();
         assert_eq!(ai.objects().unwrap().iter().map(|o| o.full_name()).collect::<Vec<_>>(), vec!["hr.teams"]);
     }
@@ -989,6 +994,8 @@ mod review_tests {
         // A table allowed on its own elsewhere, then the schema leaves the index scope:
         // only its schema-level rule goes.
         ws.kn_upsert_objects("c", &[k("hr", "teams")]).unwrap();
+        ws.kn_set_state(&crate::KnState { connection_id: "c".into(), indexed_at: 1, objects: 3, schemas: vec!["sales".into(), "hr".into()], error: None })
+            .unwrap();
         ws.kn_retain_schemas("c", &["hr".into()]).unwrap();
         assert!(ws.ai_scope("c").unwrap().contains(&ScopeRule { schema: "sales".into(), table: "salaries".into(), allow: false }));
         assert!(ws.ai_scope("c").unwrap().contains(&ScopeRule { schema: "hr".into(), table: "teams".into(), allow: true }));
@@ -1028,6 +1035,32 @@ mod review_tests {
         // Excluded again: the reference goes with it.
         ws.ai_put_rule("c", &rule("hr", "payroll", false)).unwrap();
         assert!(found("payroll").is_empty(), "{:?}", found("payroll"));
+    }
+
+    /// A schema written without its catalog matches the end of a schema
+    /// id exactly: `_` and `%` in it are characters, not wildcards.
+    #[test]
+    fn a_schema_without_its_catalog_matches_only_itself() {
+        let o = |s: &str, n: &str| DbObject { schema: s.into(), name: n.into(), kind: ObjectKind::Table, comment: None, row_estimate: None };
+        let ws = Workspace::open_in_memory().unwrap();
+        ws.ai_set_scope("c", &[ScopeRule { schema: "*".into(), table: String::new(), allow: true }]).unwrap();
+        ws.meta_put_schema("c", "lake.myxschema", &[o("lake.myxschema", "t")]).unwrap();
+        ws.meta_put_schema("c", "lake.a5b", &[o("lake.a5b", "t")]).unwrap();
+        ws.meta_put_schema("c", "lake.my_schema", &[o("lake.my_schema", "u")]).unwrap();
+        let ai = ws.ai_catalog("c");
+        let got = |r: &str| ai.get(r).unwrap().map(|o| o.full_name());
+        let meta = |r: &str| ws.meta_get("c", r).unwrap().map(|(s, n)| format!("{s}.{n}"));
+        let named = |r: &str| ws.meta_find_named("c", r).unwrap().into_iter().map(|(s, n)| format!("{s}.{n}")).collect::<Vec<_>>();
+        for r in ["my_schema.t", "a%b.t", "a_b.t", "chema.t"] {
+            assert_eq!(got(r), None, "{r}");
+            assert_eq!(meta(r), None, "{r}");
+            assert!(named(r).is_empty(), "{r}");
+        }
+        assert_eq!(got("myxschema.t").as_deref(), Some("lake.myxschema.t"));
+        assert_eq!(got("MY_SCHEMA.u").as_deref(), Some("lake.my_schema.u"), "case still ignored");
+        assert_eq!(meta("my_schema.u").as_deref(), Some("lake.my_schema.u"));
+        assert_eq!(named("a5b.t"), vec!["lake.a5b.t"]);
+        assert_eq!(got("lake.my_schema.u").as_deref(), Some("lake.my_schema.u"), "the whole id");
     }
 
     #[test]

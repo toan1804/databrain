@@ -78,7 +78,7 @@ pub struct ExplorerCacheState {
 /// Which server a connection points at (kind, address, database, user,
 /// options, SSH hop). A change makes the cached explorer meaningless.
 /// Settings key: the connection moved; its next index asks first.
-fn index_ask_key(connection_id: &str) -> String {
+pub(crate) fn index_ask_key(connection_id: &str) -> String {
     format!("ai_index_ask.{connection_id}")
 }
 
@@ -787,7 +787,7 @@ impl Workspace {
             .query_row(
                 "SELECT schema_name, name FROM meta_objects \
                  WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other') \
-                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
                  ORDER BY length(schema_name) LIMIT 1",
                 params![connection_id, name, schema],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -805,7 +805,7 @@ impl Workspace {
         let mut st = c.prepare_cached(
             "SELECT DISTINCT schema_name, name FROM meta_objects \
              WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other') \
-               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR substr(lower(schema_name), -length(?3) - 1) = '.' || lower(?3)) \
              ORDER BY length(schema_name), schema_name",
         )?;
         let rows = st.query_map(params![connection_id, name, schema], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1346,14 +1346,14 @@ mod tests {
         cfg.options.insert("idle_disconnect_minutes".into(), "0".into());
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "session settings don't change the server");
-        assert_eq!(ws.kn_count("c").unwrap(), 1, "the index stays for the same server");
+        assert_eq!(ws.ai_catalog("c").count().unwrap(), 1, "the index stays for the same server");
         assert!(!ws.ai_scope("c").unwrap().is_empty(), "and what the AI may use");
         // How it reaches the server or runs there: the same server.
         for (k, v) in [("warehouse", "WH2"), ("http_path", "/sql/1.0/warehouses/b"), ("tls", "true"), ("trust_cert", "true"), ("passcode", "123456")] {
             cfg.options.insert(k.into(), v.into());
             assert!(!ws.meta_check_identity("c", &cfg).unwrap(), "{k} keeps the cache");
         }
-        assert_eq!(ws.kn_count("c").unwrap(), 1);
+        assert_eq!(ws.ai_catalog("c").count().unwrap(), 1);
         assert!(!ws.ai_scope("c").unwrap().is_empty());
         // An option that may point elsewhere (a role sees other tables; one
         // DataBrain doesn't know counts too): cleared.
@@ -1374,8 +1374,8 @@ mod tests {
         assert!(ws.meta_schemas("c", None).unwrap().is_none());
         assert_eq!(ws.meta_count("c").unwrap(), 0);
         // The AI index described the old server too; the user's notes stay.
-        assert_eq!(ws.kn_count("c").unwrap(), 0);
-        assert!(ws.kn_get("c", "s.t").unwrap().is_none());
+        assert_eq!(ws.ai_catalog("c").count().unwrap(), 0);
+        assert!(ws.ai_catalog("c").get("s.t").unwrap().is_none());
         assert_eq!(ws.kn_notes("c").unwrap().len(), 1);
     }
 

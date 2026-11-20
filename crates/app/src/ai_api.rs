@@ -1026,10 +1026,6 @@ pub fn forget_learned(state: &AppState, connection_id: &str) -> Result<()> {
     Ok(state.workspace.forget_learned(Some(connection_id))?)
 }
 
-pub fn clear_knowledge(state: &AppState, connection_id: &str) -> Result<()> {
-    Ok(state.workspace.kn_clear(connection_id)?)
-}
-
 /// Snippet for configuring external MCP clients (Kiro CLI, Claude Code...).
 pub fn mcp_config() -> Value {
     let exe = std::env::current_exe()
