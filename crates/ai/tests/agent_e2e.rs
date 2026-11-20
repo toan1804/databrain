@@ -903,6 +903,18 @@ async fn pii_rules_follow_tables_through_views() {
     assert!(f.ws.kept_view(&conn.id, "v_people").unwrap().is_some());
     let o = ctx.call("run_query", &json!({"sql": "select id, reach from v_people order by id"})).await;
     assert!(!o.content.contains("@x.io"), "kept view: {}", o.content);
+    // The bare name also names a table cached in another schema (shorter,
+    // so the cache's first pick): which one runs isn't known, masked whole.
+    let t = databrain_connector_core::DbObject {
+        schema: "zz".into(),
+        name: "v_people".into(),
+        kind: databrain_connector_core::ObjectKind::Table,
+        comment: None,
+        row_estimate: None,
+    };
+    f.ws.meta_put_schema(&conn.id, "zz", &[t]).unwrap();
+    let o = ctx.call("run_query", &json!({"sql": "select id, reach from v_people order by id"})).await;
+    assert!(!o.content.contains("@x.io"), "kept view behind a cached table's name: {}", o.content);
     // A kept table is masked by its rules as before.
     let o = ctx.call("run_query", &json!({"sql": "select id, country from orders order by id"})).await;
     assert!(o.content.contains("Vietnam") && !o.content.contains("***"), "{}", o.content);
@@ -1221,16 +1233,31 @@ async fn knowledge_note_tools_add_list_update() {
     };
     let filler: Vec<String> = (1..databrain_ai::tools::MAX_PENDING_NOTES).map(|i| f.ws.kn_save_note(pending(format!("filler {i}"))).unwrap().id).collect();
     let o = ctx.call("add_knowledge_note", &json!({"note": "one too many"})).await;
-    assert!(o.content.contains("wait for the user's review"), "{}", o.content);
+    assert!(o.content.contains("too many notes"), "{}", o.content);
     f.ws.kn_save_note(databrain_workspace::KnNote { status: databrain_workspace::NoteStatus::Approved, id: filler[0].clone(), ..pending("filler 1".into()) })
         .unwrap();
     let o = ctx.call("add_knowledge_note", &json!({"note": "room again"})).await;
-    assert!(o.content.contains("review") && !o.content.contains("wait for the user's review"), "{}", o.content);
+    assert!(o.content.contains("review") && !o.content.contains("too many"), "{}", o.content);
     for id in &filler {
         f.ws.kn_delete_note(id).unwrap();
     }
     let extra = f.ws.kn_notes(&f.conn).unwrap().into_iter().find(|n| n.body == "room again").unwrap();
     f.ws.kn_delete_note(&extra.id).unwrap();
+    // Documented joins waiting for review stop there too.
+    let cols = |c: &str| vec![c.to_string()];
+    let ids: Vec<i64> = (0..databrain_ai::tools::MAX_PENDING_NOTES)
+        .map(|i| f.ws.document_join(&f.conn, "main.orders", &cols(&format!("c{i}")), "main.customers", &cols("id"), "spec", "ai", false).unwrap().0)
+        .collect();
+    let o = ctx
+        .call(
+            "add_knowledge_join",
+            &json!({"left_table": "orders", "left_columns": ["customer_id"], "right_table": "customers", "right_columns": ["id"], "source": "spec"}),
+        )
+        .await;
+    assert!(o.content.contains("too many joins"), "{}", o.content);
+    for id in ids {
+        f.ws.review_documented_join(id, false).unwrap();
+    }
     // A user note the AI later corrects.
     let user =
         f.ws.kn_save_note(databrain_workspace::KnNote {

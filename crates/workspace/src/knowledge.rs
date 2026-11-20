@@ -475,7 +475,6 @@ impl Workspace {
                     params![connection_id, schema, name],
                 )?;
                 tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1 AND schema_name = ?2 AND table_name = ?3", params![connection_id, schema, name])?;
-                delta.removed += 1;
             }
         }
         if !objects.is_empty() && complete {
@@ -1025,7 +1024,7 @@ mod tests {
         let objs = [obj("s", "a", &["id"], None), obj("s", "b", &["id"], None)];
         ws.kn_replace_schema("c1", "s", &objs).unwrap();
         let d = ws.kn_replace_schema("c1", "s", &[]).unwrap();
-        assert_eq!(d.removed, 2);
+        assert_eq!(d.removed, 0, "kept, not removed");
         assert!(ws.meta_table("c1", "s", "a").unwrap().is_none() && ws.meta_get("c1", "s.a").unwrap().is_none(), "not in the explorer");
         let ai = ws.ai_catalog("c1");
         assert_eq!(ai.count().unwrap(), 2);

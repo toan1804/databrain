@@ -18,19 +18,31 @@ fn note_arg(args: &Value) -> Result<&str> {
     Ok(note)
 }
 
-/// Notes the AI may leave waiting for the user's review on a connection:
-/// past this it is told to have them reviewed first, so a model that keeps
-/// proposing can't bury the user's review list.
+/// Notes, and documented joins, the AI may leave waiting for the user's
+/// review on a connection (each): past this it is told to have them
+/// reviewed first, so a model that keeps proposing can't bury the user's
+/// review list. Two proposals at once (app and MCP) may pass it by one.
 pub const MAX_PENDING_NOTES: usize = 100;
 
 impl ToolContext {
     /// Refuses a new proposal when [`MAX_PENDING_NOTES`] already wait.
+    /// (No count in the answer: some may be about tables the AI can't see.)
     fn room_for_proposal(&self) -> Result<()> {
         let waiting = self.engine.workspace().kn_notes(&self.profile.id)?.iter().filter(|n| n.status == NoteStatus::Proposed).count();
         if waiting >= MAX_PENDING_NOTES {
-            return Err(AiError::Policy(format!(
-                "{waiting} notes already wait for the user's review on this connection (AI panel → Knowledge → Notes): ask the user to review them before proposing more"
-            )));
+            return Err(AiError::Policy(
+                "too many notes already wait for the user's review on this connection (AI panel → Knowledge → Notes): ask the user to review them before proposing more".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::room_for_proposal`] for documented joins.
+    fn room_for_join_proposal(&self) -> Result<()> {
+        if self.engine.workspace().proposed_join_count(&self.profile.id)? >= MAX_PENDING_NOTES {
+            return Err(AiError::Policy(
+                "too many joins already wait for the user's review on this connection (AI panel → Knowledge → Learned): ask the user to review them before proposing more".into(),
+            ));
         }
         Ok(())
     }
@@ -183,6 +195,9 @@ impl ToolContext {
             return Err(AiError::Policy("a table joined to itself on the same columns is not a join".into()));
         }
         let approved = self.ai_note_status() == NoteStatus::Approved;
+        if !approved {
+            self.room_for_join_proposal()?;
+        }
         let by = if self.caller == super::Caller::Mcp { "mcp" } else { "ai" };
         let (join_id, what) = ws.document_join(id, &lt, &lc, &rt, &rc, source, by, approved)?;
         let on: Vec<String> = lc.iter().zip(&rc).map(|(a, b)| format!("{lt}.{a} = {rt}.{b}")).collect();

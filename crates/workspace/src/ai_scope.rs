@@ -525,6 +525,8 @@ impl Workspace {
             && self.kept_checked.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
             && let Err(e) = self.kept_expire(now)
         {
+            // E.g. the other process (app, MCP) writing: again in 5 minutes.
+            self.kept_checked.store(now - 55 * 60 * 1000, Ordering::Relaxed);
             tracing::warn!("expiring kept tables failed: {e}");
         }
     }

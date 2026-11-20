@@ -293,6 +293,13 @@ impl Workspace {
         }
     }
 
+    /// Documented joins waiting for the user's review on a connection.
+    pub fn proposed_join_count(&self, connection_id: &str) -> Result<usize> {
+        let n: i64 =
+            self.conn.lock().query_row("SELECT count(*) FROM kn_joins WHERE connection_id = ?1 AND doc_state = 'proposed'", [connection_id], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
     /// The user's answer to a documented join the assistant proposed:
     /// approve it, or drop what was documented (a join also seen in
     /// queries stays, learned from them).
