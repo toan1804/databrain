@@ -128,6 +128,6 @@ describe("stopping a step", () => {
     await useJobs.getState().cancelStep("bg", "n1");
     expect(toast).toHaveBeenLastCalledWith("Asked the background runner to stop this step: it stops within a few seconds", "info");
     await useJobs.getState().cancelStep("ended", "n1");
-    expect(toast).toHaveBeenLastCalledWith("The run had already ended", "info");
+    expect(toast).toHaveBeenLastCalledWith("The step isn't running (it ended, or hasn't started)", "info");
   });
 });

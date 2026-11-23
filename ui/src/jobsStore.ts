@@ -313,7 +313,7 @@ export const useJobs = create<JobsState>((set, get) => ({
     try {
       const ok = await api.cancelJobStep(id, nodeId);
       if (away) {
-        toast(ok ? "Asked the background runner to stop this step: it stops within a few seconds" : "The run had already ended", "info");
+        toast(ok ? "Asked the background runner to stop this step: it stops within a few seconds" : "The step isn't running (it ended, or hasn't started)", "info");
         if (ok) for (const ms of [3_000, 8_000]) setTimeout(() => void get().refresh().catch(() => {}), ms);
       } else if (!ok) toast("The step wasn't stopped: it had already ended", "info");
     } catch (e) {

@@ -240,7 +240,7 @@ pub async fn stop_step(state: &crate::api::AppState, which: &str, step: &str, no
         let status = r.as_ref().and_then(|r| r.nodes.iter().find(|n| n.node_id == node.id)).map(|n| n.summary.status.clone());
         match (r.as_ref().map(|r| r.status.as_str()), status.as_deref()) {
             // The step ended (or never started: the run ended first).
-            (_, Some(s)) if s != "running" && s != "pending" => {
+            (_, Some(s)) if !matches!(s, "running" | "waiting" | "pending") => {
                 out.push_str(&format!("{:?}: {s}\n", node.name));
                 return (0, out, String::new());
             }
@@ -420,8 +420,9 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
                         println!("{name} (after {}): {}", job.name, after.status);
                         ok &= after.status == "success";
                     }
-                    // Stopped (from the app, `dbr jobs stop`, a time limit): 130,
-                    // as a stopped `dbr` query, not a failure.
+                    // Stopped (from the app, `dbr jobs stop`, the background
+                    // runner's deadline): 130, as a stopped `dbr` query, not a
+                    // failure (a job's own time limit is a failure: 1).
                     if ok {
                         ExitCode::SUCCESS
                     } else if run.status == "cancelled" {
@@ -463,6 +464,7 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
             let step = args.iter().position(|a| a == "--step").map(|i| args.get(i + 1));
             let (code, out, err) = match step {
                 Some(None) => return usage(),
+                Some(Some(s)) if s.starts_with("--") => return usage(),
                 Some(Some(step)) => stop_step(state, which, step, no_wait, STOP_WAIT).await,
                 None => stop(state, which, no_wait, STOP_WAIT).await,
             };

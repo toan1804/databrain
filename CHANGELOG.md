@@ -11,7 +11,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Changed
 
-- **`dbr jobs run` exits 130 when its run is stopped** (from the app, `dbr jobs stop` or a time limit), with why, instead of 1 as for a failure.
+- **`dbr jobs run` exits 130 when its run is stopped** (from the app or `dbr jobs stop`), with why, instead of 1 as for a failure.
 
 ## 0.5.1 - 2026-11-20
 

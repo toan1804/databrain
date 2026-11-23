@@ -4092,6 +4092,10 @@ async fn a_step_is_stopped_from_another_process() {
         assert!(!api::cancel_job_step(&terminal, &job.id, "n2"), "nothing to stop once it ended");
         assert!(terminal.workspace.job_stop_ask(&job.id).unwrap().is_none());
 
+        // Read and removed at once (the heartbeat's take): a request written after is kept.
+        terminal.workspace.request_job_step_stop(&job.id, 7, "n2", "app").unwrap();
+        assert_eq!(terminal.workspace.take_job_stop(&job.id).unwrap().map(|a| a.steps), Some(vec!["n2".to_string()]));
+        assert!(terminal.workspace.take_job_stop(&job.id).unwrap().is_none());
         // A step stop asked after a whole-run stop keeps the whole-run stop.
         terminal.workspace.request_job_stop(&job.id, 7, "terminal").unwrap();
         terminal.workspace.request_job_step_stop(&job.id, 7, "n1", "app").unwrap();
