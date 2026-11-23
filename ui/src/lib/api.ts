@@ -130,6 +130,7 @@ import type {
   TerminalSetting,
 } from "./types";
 import type { RowChange } from "./gridEdits";
+import type { DbrOpen } from "./bindings/DbrOpen";
 
 export const isTauri = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -521,6 +522,8 @@ export const api = {
 
   getSettings: () => call<Record<string, unknown>>("get_settings"),
   setSetting: (key: string, value: unknown) => call<void>("set_setting", { key, value }),
+  /** What `dbr` asked to open since the last call (each handed once). */
+  takeDbrOpens: () => call<DbrOpen[]>("take_dbr_opens"),
 };
 
 export function onJobEvent(handler: (e: JobEvent) => void): Promise<UnlistenFn> {
@@ -576,4 +579,9 @@ export function onUpdateEvent(handler: (e: UpdateProgress) => void): Promise<Unl
 
 export function onKnowledgeEvent(handler: (e: KnowledgeEvent) => void): Promise<UnlistenFn> {
   return listen<KnowledgeEvent>("knowledge-event", (e) => handler(e.payload));
+}
+
+/** `dbr` handed something to open: take it with `api.takeDbrOpens`. */
+export function onDbrOpen(handler: () => void): Promise<UnlistenFn> {
+  return listen("dbr-open", () => handler());
 }

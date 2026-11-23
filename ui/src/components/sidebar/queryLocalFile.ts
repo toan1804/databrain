@@ -20,20 +20,44 @@ export async function queryLocalFile(importIt = false) {
   if (reading) return;
   reading = true;
   try {
-    await openLocalFile(importIt);
+    const picked = await openDialog({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Data files", extensions: ["csv", "tsv", "txt", "parquet", "json", "ndjson", "jsonl", "xlsx", "gz"] }],
+    });
+    if (typeof picked !== "string") return;
+    await openLocalFile(picked, importIt);
   } finally {
     reading = false;
   }
 }
 
-async function openLocalFile(importIt: boolean) {
+/**
+ * The "Local files (DuckDB)" connection (the app's in-memory DuckDB),
+ * saved first when there is none; `undefined` when it couldn't be.
+ */
+export async function localFilesConnection() {
   const st = useStore.getState();
-  const picked = await openDialog({
-    multiple: false,
-    directory: false,
-    filters: [{ name: "Data files", extensions: ["csv", "tsv", "txt", "parquet", "json", "ndjson", "jsonl", "xlsx", "gz"] }],
-  });
-  if (typeof picked !== "string") return;
+  const found = st.connections.find((c) => c.config.kind === "duckdb" && !c.config.file_path);
+  if (found) return found;
+  const saved = await api.saveConnection({
+    id: "",
+    name: "Local files (DuckDB)",
+    config: { kind: "duckdb", auth: { method: "none" }, ssl_mode: "disable", read_only: false, options: {} },
+    color: "#fbbf24",
+    env: "none",
+    has_secret: false,
+    ai_policy: DEFAULT_POLICY,
+    created_at: 0,
+    updated_at: 0,
+  }, null);
+  await st.refreshConnections();
+  return useStore.getState().connections.find((c) => c.id === saved.id);
+}
+
+/** Open a data file (or a Delta/Iceberg folder) at `picked`: its rows in a new tab. */
+export async function openLocalFile(picked: string, importIt = false) {
+  const st = useStore.getState();
   try {
     // Workbooks with several sheets: first sheet with data (default) or all of them.
     let allSheets = false;
@@ -58,24 +82,9 @@ async function openLocalFile(importIt: boolean) {
     // An import reads every row: no LIMIT. The tab shows the first rows (the
     // row limit); "Load into…" then streams every row of the file.
     const sql = await api.fileScanSql(picked, allSheets, !importIt);
-    let conn = st.connections.find((c) => c.config.kind === "duckdb" && !c.config.file_path);
-    if (!conn) {
-      const saved = await api.saveConnection({
-        id: "",
-        name: "Local files (DuckDB)",
-        config: { kind: "duckdb", auth: { method: "none" }, ssl_mode: "disable", read_only: false, options: {} },
-        color: "#fbbf24",
-        env: "none",
-        has_secret: false,
-        ai_policy: DEFAULT_POLICY,
-        created_at: 0,
-        updated_at: 0,
-      }, null);
-      await st.refreshConnections();
-      conn = useStore.getState().connections.find((c) => c.id === saved.id);
-    }
+    const conn = await localFilesConnection();
     if (!conn) return;
-    const id = useStore.getState().newTab({ title: picked.split(/[\\/]/).pop() ?? "file", sql, connection_id: conn.id });
+    const id = useStore.getState().newTab({ title: picked.split(/[\\/]/).filter(Boolean).pop() ?? "file", sql, connection_id: conn.id });
     if (importIt) {
       useStore.getState().setLoadIntoOnResult(id, true);
       void useStore.getState().runSql(id, conn.id, sql, 0);

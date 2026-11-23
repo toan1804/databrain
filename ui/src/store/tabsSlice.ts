@@ -30,8 +30,8 @@ export interface TabsSlice {
   activeTabId: string | null;
   /** Recently opened or saved .sql files, newest first. */
   recentFiles: string[];
-  /** Open a .sql file in a tab (asks for one without `path`); focuses its tab when open. */
-  openSqlFile: (path?: string) => Promise<void>;
+  /** Open a .sql file in a tab (asks for one without `path`); focuses its tab when open. Its tab's id, `undefined` when none opened. */
+  openSqlFile: (path?: string) => Promise<string | undefined>;
   /** Save a tab to its file (asks for a path for other tabs, or with `saveAs`). */
   saveTabFile: (tabId: string, saveAs?: boolean) => Promise<void>;
   /** Re-read files changed by other programs (on window focus). */
@@ -74,7 +74,10 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
       path = picked;
     }
     const open = s.tabs.find((t) => t.file_path === path);
-    if (open) return s.setActiveTab(open.id);
+    if (open) {
+      s.setActiveTab(open.id);
+      return open.id;
+    }
     try {
       const f = await api.readSqlFile(path);
       flushDrafts();
@@ -85,6 +88,7 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
       if (lone && active) get().closeTab(active.id);
       get().setActiveTab(id);
       rememberFile(store, f.path);
+      return id;
     } catch (e) {
       s.toast(toError(e).message, "error");
     }
