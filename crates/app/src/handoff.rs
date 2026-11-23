@@ -2,9 +2,11 @@
 //! results, `.sql` files in tabs (run with `--run`), SQL in tabs that run it. The app listens on a
 //! socket in its data folder that only its user may use; on Windows on a
 //! named pipe with a random name, written to `dbr.pipe` in the data folder
-//! (other users can't read it, so they can't take the name first, and the
-//! pipe's default access lets them read but not write). `dbr` writes one
-//! JSON line and reads the app's one-line answer. Nothing runs on the
+//! with a random token the app greets each client with (other users can't
+//! read the file: they can't take the name first, and a pipe they make by
+//! that name after the app quits doesn't know the token, so `dbr` sends it
+//! nothing; the pipe's default access lets them read but not write). `dbr`
+//! writes one JSON line and reads the app's one-line answer. Nothing runs on the
 //! socket's say-so alone: the request opens tabs, and they run as the
 //! editor's do (the read-only setting and the production confirmation).
 
@@ -145,27 +147,52 @@ fn same_user(stream: &tokio::net::UnixStream, dir: &Path) -> bool {
     }
 }
 
-/// The file in the data folder holding the app's pipe name.
+/// The file in the data folder holding the app's pipe name and token.
 #[cfg(windows)]
 fn pipe_file(dir: &Path) -> PathBuf {
     dir.join("dbr.pipe")
 }
 
-/// The pipe the app on data folder `dir` listens on, as it wrote it.
+/// The pipe the app on data folder `dir` listens on and the token it
+/// greets each client with, as it wrote them. The token proves the pipe is
+/// that app's: another user can see the pipe's name (pipes are listed) and
+/// make one by that name once the app quits, but can't read this file.
 #[cfg(windows)]
-fn pipe_name(dir: &Path) -> Option<String> {
-    let name = std::fs::read_to_string(pipe_file(dir)).ok()?;
-    let name = name.trim();
-    name.starts_with(r"\\.\pipe\databrain-").then(|| name.to_string())
+fn pipe_info(dir: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(pipe_file(dir)).ok()?;
+    let mut lines = text.lines().map(str::trim);
+    let (name, token) = (lines.next()?, lines.next()?);
+    (name.starts_with(r"\\.\pipe\databrain-") && token.len() >= 32).then(|| (name.to_string(), token.to_string()))
+}
+
+/// Open pipe `name` (waiting while every instance is taken).
+#[cfg(windows)]
+async fn open_pipe(name: &str) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, SendError> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    for _ in 0..50 {
+        match ClientOptions::new().open(name) {
+            Ok(c) => return Ok(c),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SendError::NotRunning),
+            Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(e) => return Err(SendError::Failed(e.to_string())),
+        }
+    }
+    Err(SendError::Failed("the app is busy".into()))
 }
 
 /// ERROR_PIPE_BUSY: every instance taken for a moment.
 #[cfg(windows)]
 const PIPE_BUSY: i32 = 231;
 
-/// Read one request line from `stream`, answer it with `handle`'s result.
-async fn answer<S: AsyncRead + AsyncWrite + Unpin>(stream: S, handle: &(dyn Fn(OpenRequest) -> Result<(), String> + Send + Sync)) {
+/// Greet with `greeting` (the pipe's token), read one request line from
+/// `stream`, answer it with `handle`'s result.
+async fn answer<S: AsyncRead + AsyncWrite + Unpin>(stream: S, handle: &(dyn Fn(OpenRequest) -> Result<(), String> + Send + Sync), greeting: Option<&str>) {
     let (r, mut w) = tokio::io::split(stream);
+    if let Some(g) = greeting
+        && (w.write_all(format!("{g}\n").as_bytes()).await.is_err() || w.flush().await.is_err())
+    {
+        return;
+    }
     let mut line = String::new();
     let read = tokio::time::timeout(Duration::from_secs(10), BufReader::new(r.take_limit()).read_line(&mut line)).await;
     let reply = match read {
@@ -229,28 +256,24 @@ pub async fn serve(dir: PathBuf, handle: Handler) {
             continue;
         }
         let handle = handle.clone();
-        tokio::spawn(async move { answer(stream, &*handle).await });
+        tokio::spawn(async move { answer(stream, &*handle, None).await });
     }
 }
 
 #[cfg(windows)]
 pub async fn serve(dir: PathBuf, handle: Handler) {
-    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
-    // Another DataBrain on this data folder answers already.
-    if let Some(old) = pipe_name(&dir) {
-        match ClientOptions::new().open(&old) {
-            Ok(_) => {
-                tracing::info!("another DataBrain answers dbr");
-                return;
-            }
-            Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => {
-                tracing::info!("another DataBrain answers dbr");
-                return;
-            }
-            Err(_) => {}
-        }
+    use tokio::net::windows::named_pipe::ServerOptions;
+    // Another DataBrain on this data folder answers already (with its token:
+    // a pipe by that name without it is someone else's).
+    if let Some((old, token)) = pipe_info(&dir)
+        && let Ok(c) = open_pipe(&old).await
+        && greeted(c, &token).await
+    {
+        tracing::info!("another DataBrain answers dbr");
+        return;
     }
     let name = format!(r"\\.\pipe\databrain-{}", uuid::Uuid::new_v4().simple());
+    let token = uuid::Uuid::new_v4().simple().to_string();
     let mut server = match ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name) {
         Ok(s) => s,
         Err(e) => {
@@ -258,10 +281,13 @@ pub async fn serve(dir: PathBuf, handle: Handler) {
             return;
         }
     };
-    if let Err(e) = std::fs::write(pipe_file(&dir), &name) {
+    // Written whole, then renamed: a dbr reading it meanwhile never sees half.
+    let tmp = dir.join("dbr.pipe.tmp");
+    if let Err(e) = std::fs::write(&tmp, format!("{name}\n{token}\n")).and_then(|()| std::fs::rename(&tmp, pipe_file(&dir))) {
         tracing::warn!(error = %e, "dbr can't reach this app");
         return;
     }
+    let token: std::sync::Arc<str> = token.into();
     loop {
         if server.connect().await.is_err() {
             // A client that left before it was connected: this instance is
@@ -271,8 +297,8 @@ pub async fn serve(dir: PathBuf, handle: Handler) {
         }
         let next = next_instance(&name).await;
         let conn = std::mem::replace(&mut server, next);
-        let handle = handle.clone();
-        tokio::spawn(async move { answer(conn, &*handle).await });
+        let (handle, token) = (handle.clone(), token.clone());
+        tokio::spawn(async move { answer(conn, &*handle, Some(&*token)).await });
     }
 }
 
@@ -305,17 +331,43 @@ pub enum SendError {
 pub async fn send(dir: &Path, req: &OpenRequest) -> Result<Reply, SendError> {
     let mut text = serde_json::to_string(req).map_err(|e| SendError::Failed(e.to_string()))?;
     text.push('\n');
-    let stream = connect(dir).await?;
-    exchange(stream, text).await
+    #[cfg(unix)]
+    {
+        let stream = connect(dir).await?;
+        exchange(stream, text, None).await
+    }
+    #[cfg(windows)]
+    {
+        let Some((name, token)) = pipe_info(dir) else { return Err(SendError::NotRunning) };
+        let stream = open_pipe(&name).await?;
+        exchange(stream, text, Some(&token)).await
+    }
 }
 
-async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(stream: S, text: String) -> Result<Reply, SendError> {
+/// Whether the app at the other end of `stream` greets with `token`.
+#[cfg_attr(unix, allow(dead_code))]
+async fn greeted<S: AsyncRead + Unpin>(stream: S, token: &str) -> bool {
+    let mut line = String::new();
+    matches!(tokio::time::timeout(Duration::from_secs(5), BufReader::new(stream).read_line(&mut line)).await, Ok(Ok(n)) if n > 0) && line.trim_end() == token
+}
+
+/// Send `text` and read the answer; first, with `expect`, the app's
+/// greeting must be that token (nothing is sent to a pipe that isn't it).
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(stream: S, text: String, expect: Option<&str>) -> Result<Reply, SendError> {
     let (r, mut w) = tokio::io::split(stream);
+    let mut r = BufReader::new(r);
+    if let Some(token) = expect {
+        let mut line = String::new();
+        let ok = matches!(tokio::time::timeout(Duration::from_secs(10), r.read_line(&mut line)).await, Ok(Ok(n)) if n > 0) && line.trim_end() == token;
+        if !ok {
+            return Err(SendError::Failed("the pipe named in dbr.pipe isn't this user's DataBrain".into()));
+        }
+    }
     let fail = |e: std::io::Error| SendError::Failed(e.to_string());
     w.write_all(text.as_bytes()).await.map_err(fail)?;
     w.flush().await.map_err(fail)?;
     let mut line = String::new();
-    match tokio::time::timeout(Duration::from_secs(30), BufReader::new(r).read_line(&mut line)).await {
+    match tokio::time::timeout(Duration::from_secs(30), r.read_line(&mut line)).await {
         Ok(Ok(n)) if n > 0 => serde_json::from_str(&line).map_err(|e| SendError::Failed(format!("the app's answer: {e}"))),
         Ok(Ok(_)) => Err(SendError::Failed("the app closed the connection without answering".into())),
         Ok(Err(e)) => Err(fail(e)),
@@ -333,21 +385,6 @@ async fn connect(dir: &Path) -> Result<tokio::net::UnixStream, SendError> {
         Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => Err(SendError::NotRunning),
         Err(e) => Err(SendError::Failed(e.to_string())),
     }
-}
-
-#[cfg(windows)]
-async fn connect(dir: &Path) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, SendError> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    let Some(name) = pipe_name(dir) else { return Err(SendError::NotRunning) };
-    for _ in 0..50 {
-        match ClientOptions::new().open(&name) {
-            Ok(c) => return Ok(c),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SendError::NotRunning),
-            Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => tokio::time::sleep(Duration::from_millis(100)).await,
-            Err(e) => return Err(SendError::Failed(e.to_string())),
-        }
-    }
-    Err(SendError::Failed("the app is busy".into()))
 }
 
 /// Start the app (this program without arguments) apart from the terminal:
@@ -466,12 +503,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nothing_is_sent_to_an_end_without_the_token() {
+        // The app's side greets with its token; dbr sends only after it.
+        let (app, cli) = tokio::net::UnixStream::pair().unwrap();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let seen = got.clone();
+        let h: Handler = Arc::new(move |r| {
+            seen.lock().unwrap().push(r);
+            Ok(())
+        });
+        tokio::spawn(async move { answer(app, &*h, Some("t0k3n")).await });
+        let text = serde_json::to_string(&req(None)).unwrap() + "\n";
+        assert_eq!(exchange(cli, text.clone(), Some("t0k3n")).await, Ok(Reply { error: None }));
+        assert_eq!(got.lock().unwrap().len(), 1);
+        // Someone else's pipe by that name: another greeting, or none.
+        let (other, cli) = tokio::net::UnixStream::pair().unwrap();
+        let read = tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(other);
+            w.write_all(b"guess\n").await.unwrap();
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf).await.unwrap();
+            buf
+        });
+        assert!(matches!(exchange(cli, text.clone(), Some("t0k3n")).await, Err(SendError::Failed(e)) if e.contains("isn't this user's")));
+        assert!(read.await.unwrap().is_empty(), "nothing was sent to it");
+        let (other, cli) = tokio::net::UnixStream::pair().unwrap();
+        drop(other);
+        assert!(exchange(cli, text, Some("t0k3n")).await.is_err());
+        let (app, cli) = tokio::net::UnixStream::pair().unwrap();
+        let h: Handler = Arc::new(|_| Ok(()));
+        tokio::spawn(async move { answer(app, &*h, Some("t0k3n")).await });
+        assert!(greeted(cli, "t0k3n").await);
+    }
+
+    #[tokio::test]
     async fn garbage_gets_an_error_not_a_hang() {
         let dir = tempfile::tempdir().unwrap();
         tokio::spawn(serve(dir.path().to_path_buf(), Arc::new(|_| Ok(()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let s = tokio::net::UnixStream::connect(endpoint(dir.path())).await.unwrap();
-        let reply = exchange(s, "{\"nope\":1}\n".into()).await.unwrap();
+        let reply = exchange(s, "{\"nope\":1}\n".into(), None).await.unwrap();
         assert!(reply.error.unwrap().starts_with("not a dbr request"));
     }
 }
