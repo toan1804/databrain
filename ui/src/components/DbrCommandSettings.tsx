@@ -9,8 +9,9 @@ import { useStore } from "../store";
 export function DbrCommandSettings() {
   const [status, setStatus] = useState<DbrCommand | null>(null);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    if (isTauri()) void api.dbrCommandStatus().then(setStatus).catch(() => {});
+    if (isTauri()) void api.dbrCommandStatus().then(setStatus, (e) => setError(toError(e).message));
   }, []);
   const install = async () => {
     setBusy(true);
@@ -46,6 +47,7 @@ export function DbrCommandSettings() {
           )}
         </div>
       )}
+      {error && <p className="text-[11.5px] text-danger">Couldn't tell where dbr stands: {error}</p>}
       {status?.note && <p className="text-[11.5px] text-muted">{status.note}</p>}
       {status?.other && (
         <p className="text-[11.5px] text-muted">

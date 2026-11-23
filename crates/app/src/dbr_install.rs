@@ -35,9 +35,31 @@ pub struct DbrCommand {
 /// The `dbr` next to this program (`dbr.exe` on Windows), following links.
 fn program() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = std::fs::canonicalize(&exe).map(plain).unwrap_or(exe);
     let p = exe.parent()?.join(if cfg!(windows) { "dbr.exe" } else { "dbr" });
     p.is_file().then_some(p)
+}
+
+/// A canonical Windows path without its `\\?\` prefix (`\\?\C:\…` → `C:\…`):
+/// a PATH entry with it isn't searched reliably. UNC paths keep theirs.
+fn plain(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => p,
+    }
+}
+
+/// Whether the link at `link` is a DataBrain `dbr` (this one, an older or
+/// moved copy): its target is named `dbr` and sits next to a `databrain`
+/// program, or in an app bundle. Another tool's `dbr` link is left alone.
+#[cfg(unix)]
+fn our_link(link: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(link) else { return false };
+    let target = if target.is_relative() { link.parent().map(|d| d.join(&target)).unwrap_or(target) } else { target };
+    target.file_name().is_some_and(|n| n == "dbr")
+        && (target.parent().is_some_and(|d| d.join("databrain").is_file() || d.join("DataBrain").is_file())
+            || target.to_string_lossy().contains(".app/Contents/MacOS/"))
 }
 
 /// The first `name` on `path` (a PATH value).
@@ -83,25 +105,64 @@ mod imp {
         };
         let link = Path::new(LINK);
         let installed = same_file(link, &program);
-        // The PATH a login shell gets (/etc/paths): the app's own may be shorter.
-        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = terminal_path();
         let first = on_path(&path, "dbr").filter(|p| !same_file(p, &program) && p != link);
         let other = match (installed, std::fs::symlink_metadata(link)) {
-            // A link to another DataBrain (moved, or a second copy).
+            // Something else at the link's place (a moved DataBrain, a file).
             (false, Ok(_)) => Some(std::fs::read_link(link).map(|t| format!("{LINK} → {}", t.display())).unwrap_or_else(|_| LINK.into())),
             _ => first.map(|p| p.display().to_string()),
         };
-        DbrCommand { installed, location: Some(LINK.into()), program: Some(program.display().to_string()), other, can_install: !installed, note: None }
+        let temporary = temporary_copy(&program);
+        DbrCommand {
+            installed,
+            location: Some(LINK.into()),
+            program: Some(program.display().to_string()),
+            other,
+            can_install: !installed && temporary.is_none(),
+            note: temporary,
+        }
+    }
+
+    /// Why a link to `program` wouldn't last: DataBrain runs from the disk
+    /// image, or from the copy macOS makes of an app not moved yet.
+    fn temporary_copy(program: &Path) -> Option<String> {
+        let s = program.to_string_lossy();
+        (s.starts_with("/Volumes/") || s.contains("/AppTranslocation/"))
+            .then(|| "DataBrain runs from a temporary place (the disk image, or a copy macOS made): move it to Applications first, then install".into())
+    }
+
+    /// The PATH a terminal gets: Homebrew's folder, /etc/paths and
+    /// /etc/paths.d (the app's own PATH, started from the Finder, is shorter).
+    fn terminal_path() -> std::ffi::OsString {
+        let mut dirs: Vec<PathBuf> = vec!["/opt/homebrew/bin".into()];
+        let mut add = |text: String| dirs.extend(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from));
+        if let Ok(t) = std::fs::read_to_string("/etc/paths") {
+            add(t);
+        }
+        if let Ok(rd) = std::fs::read_dir("/etc/paths.d") {
+            let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+            files.sort();
+            for f in files {
+                if let Ok(t) = std::fs::read_to_string(f) {
+                    add(t);
+                }
+            }
+        }
+        if let Some(p) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&p));
+        }
+        std::env::join_paths(dirs).unwrap_or_default()
     }
 
     pub fn install() -> Result<(), String> {
         let program = program().ok_or("dbr isn't next to this DataBrain")?;
+        if let Some(why) = temporary_copy(&program) {
+            return Err(why);
+        }
         let link = Path::new(LINK);
-        // Only a link is replaced: a file there is someone else's dbr.
-        if let Ok(m) = std::fs::symlink_metadata(link)
-            && !m.file_type().is_symlink()
-        {
-            return Err(format!("{LINK} is a file, not a link to DataBrain: remove it first if you no longer need it"));
+        // Only a DataBrain link is replaced: anything else there is someone else's dbr.
+        if std::fs::symlink_metadata(link).is_ok() && !our_link(link) {
+            return Err(format!("{LINK} is another program's dbr: remove it first if you no longer need it"));
         }
         let tmp = PathBuf::from(format!("{LINK}.databrain-{}", std::process::id()));
         let direct = std::os::unix::fs::symlink(&program, &tmp).and_then(|()| std::fs::rename(&tmp, link));
@@ -144,7 +205,9 @@ mod imp {
 
     pub fn status() -> DbrCommand {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let found = on_path(&path, "dbr");
+        // The AppImage's own files (its folder may be on the PATH it runs with) aren't another dbr.
+        let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+        let found = on_path(&path, "dbr").filter(|f| appdir.as_ref().is_none_or(|a| !f.starts_with(a)));
         // The .deb / .rpm: /usr/bin/dbr comes with the package.
         let packaged = Path::new("/usr/bin/dbr");
         if let Some(p) = program()
@@ -165,7 +228,7 @@ mod imp {
         let script = dir.join("dbr");
         let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
         let program = appimage.clone().or_else(program);
-        let installed = match (&appimage, &program) {
+        let placed = match (&appimage, &program) {
             (Some(a), _) => std::fs::read_to_string(&script).is_ok_and(|s| s == wrapper(a)),
             (None, Some(p)) => same_file(&script, p),
             _ => false,
@@ -173,12 +236,18 @@ mod imp {
         let other = found.filter(|f| f != &script).map(|f| f.display().to_string());
         let dir_on_path = std::env::split_paths(&path).any(|d| d == dir);
         DbrCommand {
-            installed,
+            // A terminal finds it only with the folder on its PATH.
+            installed: placed && dir_on_path,
             location: Some(script.display().to_string()),
             program: program.map(|p| p.display().to_string()),
             other,
-            can_install: !installed,
-            note: (!dir_on_path).then(|| format!("{} isn't on your PATH: add it in your shell's profile", dir.display())),
+            can_install: !placed,
+            note: (!dir_on_path).then(|| {
+                format!(
+                    "{} isn't on the PATH yet: log out and back in (most systems add it at login once it exists), or add it in your shell's profile",
+                    dir.display()
+                )
+            }),
         }
     }
 
@@ -195,8 +264,8 @@ mod imp {
         let dir = user_bin().ok_or("no home folder")?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let target = dir.join("dbr");
-        if let Ok(m) = std::fs::symlink_metadata(&target) {
-            let ours = m.file_type().is_symlink() || std::fs::read_to_string(&target).is_ok_and(|s| s.contains("written by DataBrain"));
+        if std::fs::symlink_metadata(&target).is_ok() {
+            let ours = our_link(&target) || std::fs::read_to_string(&target).is_ok_and(|s| s.contains("written by DataBrain"));
             if !ours {
                 return Err(format!("{} is someone else's dbr: remove it first if you no longer need it", target.display()));
             }
@@ -218,9 +287,10 @@ mod imp {
     use super::*;
     use std::process::Command;
 
-    /// The user's PATH as saved (what new terminals get), via PowerShell.
+    /// The user's PATH as saved, unexpanded (`%VAR%` entries as written),
+    /// via PowerShell.
     fn user_path() -> Option<String> {
-        let out = powershell("[Environment]::GetEnvironmentVariable('Path','User')", None).ok()?;
+        let out = powershell(r"(Get-Item -Path 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')", None).ok()?;
         Some(out.trim().to_string())
     }
 
@@ -256,7 +326,8 @@ mod imp {
         };
         let dir = program.parent().map(Path::to_path_buf).unwrap_or_default();
         let saved = user_path().unwrap_or_default();
-        let installed = has_dir(&saved, &dir) || std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == dir));
+        let env_path = std::env::var_os("PATH").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let installed = has_dir(&saved, &dir) || has_dir(&env_path, &dir);
         let other = std::env::var_os("PATH").and_then(|p| on_path(&p, "dbr.exe")).filter(|p| !same_file(p, &program)).map(|p| p.display().to_string());
         DbrCommand {
             installed,
@@ -271,12 +342,18 @@ mod imp {
     pub fn install() -> Result<(), String> {
         let program = program().ok_or("dbr isn't next to this DataBrain")?;
         let dir = program.parent().ok_or("no install folder")?;
-        // Appended to the user's own PATH (not the machine's: no administrator needed).
+        // Appended to the user's own PATH (not the machine's: no administrator
+        // needed), read and written unexpanded and as an expandable string,
+        // so its `%VAR%` entries stay as they are. Setting and clearing a
+        // variable through .NET then tells running programs (Explorer) that
+        // the environment changed, so new terminals see it.
         powershell(
-            "$p = [Environment]::GetEnvironmentVariable('Path','User'); $d = $env:DATABRAIN_DBR_DIR; \
-             if (-not (($p -split ';') | Where-Object { $_.TrimEnd('\\') -ieq $d.TrimEnd('\\') })) { \
-               $n = if ([string]::IsNullOrEmpty($p)) { $d } else { $p.TrimEnd(';') + ';' + $d }; \
-               [Environment]::SetEnvironmentVariable('Path', $n, 'User') }",
+            r"$k = Get-Item -Path 'HKCU:\Environment'; $p = $k.GetValue('Path', '', 'DoNotExpandEnvironmentNames'); $d = $env:DATABRAIN_DBR_DIR;
+              if (-not (($p -split ';') | Where-Object { $_.Trim().TrimEnd('\') -ieq $d.TrimEnd('\') })) {
+                $n = if ([string]::IsNullOrEmpty($p)) { $d } else { $p.TrimEnd(';') + ';' + $d };
+                New-ItemProperty -Path 'HKCU:\Environment' -Name 'Path' -PropertyType ExpandString -Value $n -Force | Out-Null;
+                [Environment]::SetEnvironmentVariable('DATABRAIN_PATH_CHANGED', '1', 'User');
+                [Environment]::SetEnvironmentVariable('DATABRAIN_PATH_CHANGED', $null, 'User') }",
             Some(dir),
         )
         .map(|_| ())
@@ -308,6 +385,36 @@ mod tests {
         assert_eq!(on_path(&path, "nope"), None);
         assert!(same_file(&b.path().join("dbr"), &b.path().join(".").join("dbr")));
         assert!(!same_file(&b.path().join("dbr"), &a.path().join("dbr")));
+    }
+
+    #[test]
+    fn a_windows_path_loses_its_long_prefix() {
+        assert_eq!(plain(PathBuf::from(r"\\?\C:\Program Files\DataBrain\dbr.exe")), PathBuf::from(r"C:\Program Files\DataBrain\dbr.exe"));
+        assert_eq!(plain(PathBuf::from(r"\\?\UNC\srv\share\dbr.exe")), PathBuf::from(r"\\?\UNC\srv\share\dbr.exe"));
+        assert_eq!(plain(PathBuf::from("/usr/bin/dbr")), PathBuf::from("/usr/bin/dbr"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_databrain_link_counts_as_ours() {
+        let d = tempfile::tempdir().unwrap();
+        let app = d.path().join("app");
+        let tool = d.path().join("tool");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(app.join("databrain"), "").unwrap();
+        std::fs::write(app.join("dbr"), "").unwrap();
+        std::fs::write(tool.join("dbr"), "").unwrap();
+        let ours = d.path().join("ours");
+        let theirs = d.path().join("theirs");
+        let moved = d.path().join("moved");
+        std::os::unix::fs::symlink(app.join("dbr"), &ours).unwrap();
+        std::os::unix::fs::symlink(tool.join("dbr"), &theirs).unwrap();
+        std::os::unix::fs::symlink("/Applications/Old DataBrain.app/Contents/MacOS/dbr", &moved).unwrap();
+        assert!(our_link(&ours));
+        assert!(!our_link(&theirs), "another tool's dbr");
+        assert!(our_link(&moved), "a DataBrain moved or deleted since");
+        assert!(!our_link(&app.join("dbr")), "a file isn't a link");
     }
 
     #[cfg(target_os = "macos")]
