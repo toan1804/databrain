@@ -287,10 +287,10 @@ mod imp {
     use super::*;
     use std::process::Command;
 
-    /// The user's PATH as saved, unexpanded (`%VAR%` entries as written),
-    /// via PowerShell.
+    /// The user's PATH as saved (what new terminals get), its `%VAR%`
+    /// entries expanded, via PowerShell.
     fn user_path() -> Option<String> {
-        let out = powershell(r"(Get-Item -Path 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')", None).ok()?;
+        let out = powershell("[Environment]::GetEnvironmentVariable('Path','User')", None).ok()?;
         Some(out.trim().to_string())
     }
 
@@ -348,12 +348,15 @@ mod imp {
         // variable through .NET then tells running programs (Explorer) that
         // the environment changed, so new terminals see it.
         powershell(
-            r"$k = Get-Item -Path 'HKCU:\Environment'; $p = $k.GetValue('Path', '', 'DoNotExpandEnvironmentNames'); $d = $env:DATABRAIN_DBR_DIR;
-              if (-not (($p -split ';') | Where-Object { $_.Trim().TrimEnd('\') -ieq $d.TrimEnd('\') })) {
-                $n = if ([string]::IsNullOrEmpty($p)) { $d } else { $p.TrimEnd(';') + ';' + $d };
-                New-ItemProperty -Path 'HKCU:\Environment' -Name 'Path' -PropertyType ExpandString -Value $n -Force | Out-Null;
-                [Environment]::SetEnvironmentVariable('DATABRAIN_PATH_CHANGED', '1', 'User');
-                [Environment]::SetEnvironmentVariable('DATABRAIN_PATH_CHANGED', $null, 'User') }",
+            concat!(
+                r"$ErrorActionPreference = 'Stop'; ",
+                r"$p = (Get-Item -Path 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames'); $d = $env:DATABRAIN_DBR_DIR; ",
+                r"if (-not (($p -split ';') | Where-Object { [Environment]::ExpandEnvironmentVariables($_).Trim().TrimEnd('\') -ieq $d.TrimEnd('\') })) { ",
+                r"$n = if ([string]::IsNullOrEmpty($p)) { $d } else { $p.TrimEnd(';') + ';' + $d }; ",
+                r"New-ItemProperty -Path 'HKCU:\Environment' -Name 'Path' -PropertyType ExpandString -Value $n -Force | Out-Null; ",
+                r"[Environment]::SetEnvironmentVariable('DATABRAIN_PATH_CHANGED', '1', 'User'); ",
+                r"[Environment]::SetEnvironmentVariable('DATABRAIN_PATH_CHANGED', $null, 'User') }",
+            ),
             Some(dir),
         )
         .map(|_| ())

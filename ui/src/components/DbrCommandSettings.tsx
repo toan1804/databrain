@@ -38,7 +38,15 @@ export function DbrCommandSettings() {
               <Check size={13} className="text-success" /> Installed{status.location && <> at <code className="break-all">{status.location}</code></>}
             </span>
           ) : (
-            <span className="text-[12px] text-muted">Not on the PATH{status.location && <>: installing puts it at <code className="break-all">{status.location}</code></>}</span>
+            <span className="text-[12px] text-muted">
+              {status.can_install ? "Not on the PATH" : "Placed"}
+              {status.location && (
+                <>
+                  {status.can_install ? ": installing puts it at " : " at "}
+                  <code className="break-all">{status.location}</code>
+                </>
+              )}
+            </span>
           )}
           {status.can_install && (
             <button className="btn-ghost ml-auto shrink-0 border border-line" onClick={() => void install()} disabled={busy}>
