@@ -1,7 +1,9 @@
 //! `dbr` without `-i` hands what to open to the running app: data files as
-//! results, SQL and `.sql` files in tabs that run them. The app listens on a
-//! socket in its data folder that only its user may use (a named pipe on
-//! Windows, which other users may read but not write); `dbr` writes one
+//! results, `.sql` files in tabs (run with `--run`), SQL in tabs that run it. The app listens on a
+//! socket in its data folder that only its user may use; on Windows on a
+//! named pipe with a random name, written to `dbr.pipe` in the data folder
+//! (other users can't read it, so they can't take the name first, and the
+//! pipe's default access lets them read but not write). `dbr` writes one
 //! JSON line and reads the app's one-line answer. Nothing runs on the
 //! socket's say-so alone: the request opens tabs, and they run as the
 //! editor's do (the read-only setting and the production confirmation).
@@ -36,6 +38,9 @@ pub struct OpenRequest {
     pub items: Vec<OpenItem>,
     #[serde(default)]
     pub params: HashMap<String, ParamValue>,
+    /// `--run`: run the `.sql` files too (SQL text always runs).
+    #[serde(default)]
+    pub run: bool,
 }
 
 /// What the UI is handed: the request, its connection found (`None`: the
@@ -46,6 +51,8 @@ pub struct DbrOpen {
     pub connection_id: Option<String>,
     pub items: Vec<OpenItem>,
     pub params: HashMap<String, ParamValue>,
+    /// Run the `.sql` files too (`--run`).
+    pub run: bool,
 }
 
 /// The app's answer: `error` when it opened nothing.
@@ -79,24 +86,52 @@ pub fn resolve(conns: &[databrain_workspace::ConnectionProfile], req: OpenReques
         Some(name) => Some(crate::cli::query::find_connection(conns, name)?.id.clone()),
         None => None,
     };
-    Ok(DbrOpen { connection_id, items: req.items, params: req.params })
+    Ok(DbrOpen { connection_id, items: req.items, params: req.params, run: req.run })
 }
 
 /// Where the app listens for the app data folder `dir`: `dbr.sock` in it,
 /// or, when that path is too long for a socket (about 104 bytes on macOS),
-/// a socket named after the folder in the user's runtime folder
-/// (`XDG_RUNTIME_DIR`) or the temporary folder. Each side checks that the
-/// other is the folder's user ([`same_user`]), which a shared `/tmp` needs.
+/// a socket named after the folder in a folder of the user's own
+/// (`databrain-<uid>`, 0700) in the runtime folder (`XDG_RUNTIME_DIR`) or
+/// the temporary folder. Each side also checks that the other is the
+/// folder's user ([`same_user`]).
 #[cfg(unix)]
 pub fn endpoint(dir: &Path) -> PathBuf {
     let p = dir.join("dbr.sock");
     if p.as_os_str().len() <= 100 {
         return p;
     }
-    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
     // FNV-1a: the same name in the app and in dbr, whatever Rust built them.
     let hash = dir.as_os_str().as_encoded_bytes().iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
-    base.join(format!("databrain-{hash:016x}.sock"))
+    short_dir(dir).join(format!("{hash:016x}.sock"))
+}
+
+/// The user's own folder for sockets whose path in the data folder is too long.
+#[cfg(unix)]
+fn short_dir(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+    let uid = std::fs::metadata(dir).map(|m| m.uid()).unwrap_or(0);
+    base.join(format!("databrain-{uid}"))
+}
+
+/// Make the folder the socket goes in when it isn't the data folder: the
+/// user's own (0700). Another user's folder there (made first in a shared
+/// `/tmp`) is refused.
+#[cfg(unix)]
+fn ensure_socket_dir(dir: &Path, socket: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let Some(parent) = socket.parent().filter(|p| *p != dir) else { return Ok(()) };
+    match std::fs::DirBuilder::new().mode(0o700).create(parent) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let (m, owner) = (std::fs::symlink_metadata(parent)?, std::fs::metadata(dir)?.uid());
+    if !m.is_dir() || m.uid() != owner || m.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(format!("{} isn't this user's own folder", parent.display())));
+    }
+    Ok(())
 }
 
 /// Whether the program at the other end of `stream` runs as the user who
@@ -110,14 +145,23 @@ fn same_user(stream: &tokio::net::UnixStream, dir: &Path) -> bool {
     }
 }
 
-/// Where the app listens for the app data folder `dir`: a pipe named after
-/// it, so a second data folder (`DATABRAIN_DATA_DIR`) has its own.
+/// The file in the data folder holding the app's pipe name.
 #[cfg(windows)]
-pub fn endpoint(dir: &Path) -> PathBuf {
-    let tag: String = dir.to_string_lossy().to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-    let tag: String = tag.chars().rev().take(180).collect::<Vec<_>>().into_iter().rev().collect();
-    PathBuf::from(format!(r"\\.\pipe\databrain-{tag}"))
+fn pipe_file(dir: &Path) -> PathBuf {
+    dir.join("dbr.pipe")
 }
+
+/// The pipe the app on data folder `dir` listens on, as it wrote it.
+#[cfg(windows)]
+fn pipe_name(dir: &Path) -> Option<String> {
+    let name = std::fs::read_to_string(pipe_file(dir)).ok()?;
+    let name = name.trim();
+    name.starts_with(r"\\.\pipe\databrain-").then(|| name.to_string())
+}
+
+/// ERROR_PIPE_BUSY: every instance taken for a moment.
+#[cfg(windows)]
+const PIPE_BUSY: i32 = 231;
 
 /// Read one request line from `stream`, answer it with `handle`'s result.
 async fn answer<S: AsyncRead + AsyncWrite + Unpin>(stream: S, handle: &(dyn Fn(OpenRequest) -> Result<(), String> + Send + Sync)) {
@@ -154,7 +198,13 @@ pub type Handler = std::sync::Arc<dyn Fn(OpenRequest) -> Result<(), String> + Se
 pub async fn serve(dir: PathBuf, handle: Handler) {
     use std::os::unix::fs::PermissionsExt;
     let path = endpoint(&dir);
-    if tokio::net::UnixStream::connect(&path).await.is_ok() {
+    if let Err(e) = ensure_socket_dir(&dir, &path) {
+        tracing::warn!(error = %e, "dbr can't reach this app");
+        return;
+    }
+    if let Ok(s) = tokio::net::UnixStream::connect(&path).await
+        && same_user(&s, &dir)
+    {
         tracing::info!("another DataBrain answers dbr");
         return;
     }
@@ -169,7 +219,11 @@ pub async fn serve(dir: PathBuf, handle: Handler) {
     };
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            // Out of file handles, say: not a loop at full speed.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
         // Only this user's programs: the one owning the data folder.
         if !same_user(&stream, &dir) {
             continue;
@@ -181,29 +235,61 @@ pub async fn serve(dir: PathBuf, handle: Handler) {
 
 #[cfg(windows)]
 pub async fn serve(dir: PathBuf, handle: Handler) {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    let name = endpoint(&dir);
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+    // Another DataBrain on this data folder answers already.
+    if let Some(old) = pipe_name(&dir) {
+        match ClientOptions::new().open(&old) {
+            Ok(_) => {
+                tracing::info!("another DataBrain answers dbr");
+                return;
+            }
+            Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => {
+                tracing::info!("another DataBrain answers dbr");
+                return;
+            }
+            Err(_) => {}
+        }
+    }
+    let name = format!(r"\\.\pipe\databrain-{}", uuid::Uuid::new_v4().simple());
     let mut server = match ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name) {
         Ok(s) => s,
         Err(e) => {
-            tracing::info!(error = %e, "dbr can't reach this app (another DataBrain answers it?)");
+            tracing::warn!(error = %e, "dbr can't reach this app");
             return;
         }
     };
+    if let Err(e) = std::fs::write(pipe_file(&dir), &name) {
+        tracing::warn!(error = %e, "dbr can't reach this app");
+        return;
+    }
     loop {
         if server.connect().await.is_err() {
+            // A client that left before it was connected: this instance is
+            // spent (connecting it again fails at once), so a new one.
+            server = next_instance(&name).await;
             continue;
         }
-        let next = match ServerOptions::new().reject_remote_clients(true).create(&name) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "dbr pipe");
-                return;
-            }
-        };
+        let next = next_instance(&name).await;
         let conn = std::mem::replace(&mut server, next);
         let handle = handle.clone();
         tokio::spawn(async move { answer(conn, &*handle).await });
+    }
+}
+
+/// Another instance of pipe `name`, made before the one in hand is given
+/// up, so the pipe never vanishes (a dbr then would think the app isn't
+/// running); retried until it can be made.
+#[cfg(windows)]
+async fn next_instance(name: &str) -> tokio::net::windows::named_pipe::NamedPipeServer {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    loop {
+        match ServerOptions::new().reject_remote_clients(true).create(name) {
+            Ok(s) => return s,
+            Err(e) => {
+                tracing::warn!(error = %e, "dbr pipe");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -252,10 +338,9 @@ async fn connect(dir: &Path) -> Result<tokio::net::UnixStream, SendError> {
 #[cfg(windows)]
 async fn connect(dir: &Path) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, SendError> {
     use tokio::net::windows::named_pipe::ClientOptions;
-    // ERROR_PIPE_BUSY: every instance taken for a moment.
-    const PIPE_BUSY: i32 = 231;
+    let Some(name) = pipe_name(dir) else { return Err(SendError::NotRunning) };
     for _ in 0..50 {
-        match ClientOptions::new().open(endpoint(dir)) {
+        match ClientOptions::new().open(&name) {
             Ok(c) => return Ok(c),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SendError::NotRunning),
             Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -271,8 +356,10 @@ async fn connect(dir: &Path) -> Result<tokio::net::windows::named_pipe::NamedPip
 pub fn start_app() -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
+    // `open` starts the app without this environment: with another data
+    // folder, the app is started as a program so it uses the same one.
     #[cfg(target_os = "macos")]
-    {
+    if std::env::var_os("DATABRAIN_DATA_DIR").is_none() && std::env::var_os("DATABRAIN_WORKSPACE").is_none() {
         // …/DataBrain.app/Contents/MacOS/databrain
         let bundle = exe.parent().and_then(Path::parent).and_then(Path::parent).filter(|b| b.extension().is_some_and(|e| e == "app"));
         if let Some(bundle) = bundle {
@@ -302,7 +389,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn req(conn: Option<&str>) -> OpenRequest {
-        OpenRequest { connection: conn.map(str::to_string), items: vec![OpenItem::Data { path: "/tmp/a.csv".into() }], params: HashMap::new() }
+        OpenRequest { connection: conn.map(str::to_string), items: vec![OpenItem::Data { path: "/tmp/a.csv".into() }], params: HashMap::new(), run: false }
     }
 
     #[tokio::test]

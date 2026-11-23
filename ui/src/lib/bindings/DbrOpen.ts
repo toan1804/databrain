@@ -6,4 +6,8 @@ import type { ParamValue } from "./ParamValue";
  * What the UI is handed: the request, its connection found (`None`: the
  * local DuckDB, "Local files").
  */
-export type DbrOpen = { connection_id: string | null, items: Array<OpenItem>, params: { [key in string]?: ParamValue }, };
+export type DbrOpen = { connection_id: string | null, items: Array<OpenItem>, params: { [key in string]?: ParamValue }, 
+/**
+ * Run the `.sql` files too (`--run`).
+ */
+run: boolean, };

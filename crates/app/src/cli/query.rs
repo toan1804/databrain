@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! dbr orders.csv                                   the file's rows in a tab of the app
-//! dbr -c sales report.sql                          the file in a tab, run on "sales"
+//! dbr -c sales --run report.sql                    the file in a tab, run on "sales"
 //! dbr -c "Sales PG" -i "select * from orders"      a table of the first rows (100; --limit up to 1,000)
 //! dbr -c sales -i --csv "select …" > out.csv       every row as CSV (also --json, --tsv)
 //! dbr -i data.parquet orders.xlsx                  data files, read by the local DuckDB
@@ -34,7 +34,7 @@ use databrain_workspace::{ConnectionProfile, Origin};
 use crate::api::AppState;
 use crate::background;
 
-const USAGE: &str = "usage: dbr [-c <connection>] [-p name=value]… <sql | file.sql | data file>…   (opens them in DataBrain)
+const USAGE: &str = "usage: dbr [-c <connection>] [--run] [-p name=value]… <sql | file.sql | data file>…   (opens them in DataBrain)
        dbr [-c <connection>] -i [--csv|--json|--tsv] [--limit N] [-p name=value]… [--yes] <sql | file.sql | data file>…
        dbr jobs list | run <job> | runs <job> | stop <job>   (dbr jobs --help)
        dbr --help | --version";
@@ -43,19 +43,21 @@ const USAGE: &str = "usage: dbr [-c <connection>] [-p name=value]… <sql | file
 const HELP: &str = "dbr: open data files and SQL in DataBrain, or run SQL on a DataBrain
 connection and print the rows here (-i).
 
-usage: dbr [-c <connection>] [-p name=value]… <sql | file.sql | data file>…
+usage: dbr [-c <connection>] [--run] [-p name=value]… <sql | file.sql | data file>…
        dbr [-c <connection>] -i [options] <sql | file.sql | data file>…
        dbr jobs list | run <job> | runs <job> | stop <job>
 
 Without -i, the running DataBrain (started when it isn't) opens each one in a
-tab: a data file's rows as a result, a .sql file or SQL run on the
-connection (the local DuckDB without -c), as the editor runs them.
+tab: a data file's rows as a result; a .sql file in its file tab (on -c's
+connection when given; run too with --run); SQL run on the connection (the
+local DuckDB without -c). They run as the editor runs them.
 
 options:
   -c, --conn <name>    a saved connection: its name (any case), a part of it
                        when only one matches, or its id; default: the local
                        DuckDB
   -i, --inline         print the rows here instead of opening them in the app
+  --run                without -i: run the .sql files the app opens
   -e, --execute <sql>  this text is SQL (when it could be read as a file name)
   --csv, --json, --tsv with -i: every row in that format (CSV by default
                        when piped)
@@ -74,7 +76,7 @@ app's query history as \"Terminal\".
 
 examples:
   dbr orders.csv                               (opens it in DataBrain)
-  dbr -c sales report.sql                      (opens and runs it there)
+  dbr -c sales report.sql --run                (opens and runs it there)
   dbr -c \"Sales PG\" -i \"select * from orders limit 10\"
   dbr -c sales -i report.sql -p day=2026-11-20
   dbr -c sales -i --csv \"select * from orders\" > orders.csv
@@ -117,6 +119,8 @@ pub struct Opts {
     pub limit: Option<usize>,
     pub params: HashMap<String, ParamValue>,
     pub yes: bool,
+    /// `--run`: the app runs the `.sql` files it opens.
+    pub run: bool,
     pub help: bool,
     pub version: bool,
 }
@@ -139,6 +143,7 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
             "-v" | "-V" | "--version" => o.version = true,
             "-i" | "--inline" => o.inline = true,
             "-y" | "--yes" => o.yes = true,
+            "--run" => o.run = true,
             "-c" | "--conn" => o.conn = Some(value(&mut it, a)?),
             "-e" | "--execute" => o.sources.push(Source::Sql(value(&mut it, a)?)),
             "--csv" => o.format = Some(Format::Csv),
@@ -399,8 +404,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
 }
 
 /// What the app is asked to open for `opts` (no `-i`): data files and
-/// folders as results, `.sql` files and SQL in tabs that run them, files by
-/// their full paths (the app runs elsewhere). Printing options need `-i`.
+/// folders as results, `.sql` files in tabs (run with `--run`), SQL in tabs
+/// that run it, files by their full paths (the app runs elsewhere).
+/// Printing options need `-i`.
 pub fn open_request(opts: &Opts) -> Result<crate::handoff::OpenRequest, String> {
     use crate::handoff::{OpenItem, OpenRequest};
     if opts.format.is_some() || opts.limit.is_some() {
@@ -423,7 +429,7 @@ pub fn open_request(opts: &Opts) -> Result<crate::handoff::OpenRequest, String> 
             }
         });
     }
-    Ok(OpenRequest { connection: opts.conn.clone(), items, params: opts.params.clone() })
+    Ok(OpenRequest { connection: opts.conn.clone(), items, params: opts.params.clone(), run: opts.run })
 }
 
 /// Longest wait for a DataBrain started here to answer.
@@ -463,7 +469,12 @@ fn open_in_app(opts: &Opts) -> ExitCode {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             match send(&dir, &req).await {
                 Err(SendError::NotRunning) if std::time::Instant::now() < until => continue,
-                Err(SendError::NotRunning) => return Err(SendError::Failed("DataBrain didn't start in a minute".into())),
+                Err(SendError::NotRunning) => {
+                    return Err(SendError::Failed(
+                        "DataBrain didn't answer in a minute (a DataBrain from before dbr opened files, still open, doesn't take them: quit it and try again)"
+                            .into(),
+                    ));
+                }
                 other => return other,
             }
         }
@@ -910,9 +921,10 @@ mod tests {
         std::fs::write(&sql, "select 1").unwrap();
         std::fs::write(&csv, "a\n1\n").unwrap();
         let s = |p: &Path| p.to_string_lossy().into_owned();
-        let o = parse(&args(&["-c", "sales", &s(&sql), &s(&csv), "select 2", "-p", "day=1"]), |p| p.exists()).unwrap();
+        let o = parse(&args(&["-c", "sales", &s(&sql), &s(&csv), "select 2", "-p", "day=1", "--run"]), |p| p.exists()).unwrap();
         let r = open_request(&o).unwrap();
         assert_eq!(r.connection.as_deref(), Some("sales"));
+        assert!(r.run);
         assert_eq!(r.items, [OpenItem::SqlFile { path: s(&sql) }, OpenItem::Data { path: s(&csv) }, OpenItem::Sql { text: "select 2".into() }]);
         assert_eq!(r.params["day"].value, "1");
         // A folder (Delta, Iceberg) is data; a relative path is sent in full (the app runs elsewhere).
@@ -945,7 +957,8 @@ mod tests {
         let all = [p("c1", "Sales PG"), p("c2", "Ops")];
         let dir = tempfile::tempdir().unwrap();
         let full = dir.path().to_string_lossy().into_owned();
-        let req = |conn: Option<&str>, items: Vec<OpenItem>| OpenRequest { connection: conn.map(str::to_string), items, params: Default::default() };
+        let req =
+            |conn: Option<&str>, items: Vec<OpenItem>| OpenRequest { connection: conn.map(str::to_string), items, params: Default::default(), run: false };
         let ok = resolve(&all, req(Some("sales"), vec![OpenItem::Data { path: full.clone() }, OpenItem::Sql { text: "select 1".into() }])).unwrap();
         assert_eq!(ok.connection_id.as_deref(), Some("c1"));
         assert_eq!(resolve(&all, req(None, vec![OpenItem::Sql { text: "select 1".into() }])).unwrap().connection_id, None);
