@@ -14,6 +14,7 @@ import { UsageDetails } from "./ProviderUsage";
 import { DuckdbEngineSettings } from "./DuckdbEngine";
 import { UpdateSettings } from "./UpdateBanner";
 import { BackgroundJobsSettings } from "./BackgroundJobsSettings";
+import { DbrCommandSettings } from "./DbrCommandSettings";
 import { ResultsMemorySettings } from "./ResultsMemorySettings";
 
 export const PROVIDER_KINDS: { kind: ProviderKind; label: string; base: string; auth: ProviderAuth[]; model: string; hint?: string }[] = [
@@ -107,7 +108,12 @@ export function SettingsDialog() {
           {section === "queries" && <Queries />}
           {section === "jobs" && <BackgroundJobsSettings />}
           {section === "duckdb" && <DuckdbEngineSettings />}
-          {section === "terminal" && <TerminalSettings />}
+          {section === "terminal" && (
+            <>
+              <DbrCommandSettings />
+              <TerminalSettings />
+            </>
+          )}
           {section === "security" && <CredentialStore />}
           {section === "mcp" && <Mcp />}
           {section === "audit" && <Audit />}
