@@ -116,7 +116,7 @@ describe("live run logs", () => {
 });
 
 describe("stopping a step", () => {
-  it("says when it couldn't, and that the background runner's steps can't be stopped here", async () => {
+  it("says when it couldn't, and asks the background runner to stop its run's step", async () => {
     const toast = vi.spyOn(useStore.getState(), "toast");
     await useJobs.getState().cancelStep("ok", "n1");
     expect(toast).not.toHaveBeenCalled();
@@ -124,8 +124,10 @@ describe("stopping a step", () => {
     expect(toast).toHaveBeenLastCalledWith("The step wasn't stopped: it had already ended", "info");
     await useJobs.getState().cancelStep("boom", "n1");
     expect(toast).toHaveBeenLastCalledWith("The step couldn't be stopped: the job store is busy", "error");
-    useJobs.setState({ elsewhere: { bg: true }, running: {} });
+    useJobs.setState({ elsewhere: { bg: true, ended: true }, running: {} });
     await useJobs.getState().cancelStep("bg", "n1");
-    expect(toast).toHaveBeenLastCalledWith("This run belongs to the background runner: its steps can't be stopped from here", "info");
+    expect(toast).toHaveBeenLastCalledWith("Asked the background runner to stop this step: it stops within a few seconds", "info");
+    await useJobs.getState().cancelStep("ended", "n1");
+    expect(toast).toHaveBeenLastCalledWith("The run had already ended", "info");
   });
 });

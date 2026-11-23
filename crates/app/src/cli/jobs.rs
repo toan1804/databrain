@@ -130,12 +130,15 @@ const JOBS_HELP: &str = "usage: dbr jobs <command>   (also databrain-jobs <comma
 commands:
   list                      the jobs, with their next and last run
   run <job>                 run a job now; exit code 1 when it (or a job run
-                            after it) fails, 2 when it can't start
+                            after it) fails, 130 when it is stopped, 2 when
+                            it can't start
       [--set <parameter set>] [--param name=value]...
   runs <job> [--limit N]    its last runs (5 by default) and the latest one's steps
   stop <job> [--no-wait]    stop its run wherever it runs and wait (up to a
                             minute) for it to end; exit code 1 when it isn't
                             running or hasn't ended
+      [--step <step>]       stop that step only (its name or id); the rest
+                            of the run goes on
   tick [--force]            run the jobs that are due (what the OS timer starts)
 
 <job> is its name (any case) or id.";
@@ -161,7 +164,7 @@ fn job_arg(args: &[String]) -> Option<&str> {
     let mut words = args.iter().skip(1);
     while let Some(a) = words.next() {
         match a.as_str() {
-            "--limit" => {
+            "--limit" | "--step" => {
                 words.next();
             }
             o if o.starts_with("--") => {}
@@ -202,6 +205,54 @@ pub async fn stop(state: &crate::api::AppState, which: &str, no_wait: bool, wait
                     1,
                     out,
                     format!("databrain-jobs: {} was asked to stop and hasn't ended yet (a statement can take a while to stop on its server)\n", job.name),
+                );
+            }
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
+/// `stop <job> --step <step>`: ask one step of its run to stop, wherever
+/// it runs (the rest of the run goes on), and wait up to `wait` for the
+/// step to end (not with `no_wait`). (exit code, output, errors).
+pub async fn stop_step(state: &crate::api::AppState, which: &str, step: &str, no_wait: bool, wait: Duration) -> (u8, String, String) {
+    let job = match find_job(state, which).and_then(|j| state.workspace.get_job(&j.id).map_err(|e| e.to_string())) {
+        Ok(j) => j,
+        Err(e) => return (2, String::new(), format!("databrain-jobs: {e}\n")),
+    };
+    let Some(node) = job.nodes.iter().find(|n| n.id == step).or_else(|| job.nodes.iter().find(|n| n.name.eq_ignore_ascii_case(step))) else {
+        let names = job.nodes.iter().map(|n| format!("{:?}", n.name)).collect::<Vec<_>>().join(", ");
+        return (2, String::new(), format!("databrain-jobs: {} has no step named {step:?}; its steps: {names}\n", job.name));
+    };
+    let run = match jobs::request_stop_step(&state.job_ctx(), &job.id, &node.id, "terminal") {
+        Ok(jobs::StopAsked::NotRunning) => return (1, String::new(), format!("databrain-jobs: {} isn't running {:?}\n", job.name, node.name)),
+        Ok(jobs::StopAsked::Stopped) => return (0, format!("Stopped {:?} of {}\n", node.name, job.name), String::new()),
+        Ok(jobs::StopAsked::Asked(run)) => run,
+        Err(e) => return (2, String::new(), format!("databrain-jobs: {}\n", e.message)),
+    };
+    if no_wait {
+        return (0, format!("Asked {} (run #{run}) to stop {:?}\n", job.name, node.name), String::new());
+    }
+    let mut out = format!("Stopping {:?} of {} (run #{run})…\n", node.name, job.name);
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        let r = state.workspace.job_run(&job.id, run).ok().flatten();
+        let status = r.as_ref().and_then(|r| r.nodes.iter().find(|n| n.node_id == node.id)).map(|n| n.summary.status.clone());
+        match (r.as_ref().map(|r| r.status.as_str()), status.as_deref()) {
+            // The step ended (or never started: the run ended first).
+            (_, Some(s)) if s != "running" && s != "pending" => {
+                out.push_str(&format!("{:?}: {s}\n", node.name));
+                return (0, out, String::new());
+            }
+            (Some(rs), _) if rs != "running" => {
+                out.push_str(&format!("{}: {rs}\n", job.name));
+                return (0, out, String::new());
+            }
+            _ if tokio::time::Instant::now() >= until => {
+                return (
+                    1,
+                    out,
+                    format!("databrain-jobs: {:?} was asked to stop and hasn't ended yet (a statement can take a while to stop on its server)\n", node.name),
                 );
             }
             _ => tokio::time::sleep(Duration::from_millis(500)).await,
@@ -357,7 +408,10 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
                             n.summary.rows.map(|r| format!("{r} rows")).or(n.summary.error.clone()).unwrap_or_default()
                         );
                     }
-                    println!("{}: {}", job.name, run.status);
+                    match (&run.error, run.status.as_str()) {
+                        (Some(why), "cancelled") => println!("{}: stopped ({why})", job.name),
+                        _ => println!("{}: {}", job.name, run.status),
+                    }
                     // Jobs that run after this one (it succeeded) run before the command ends.
                     let mut ok = run.status == "success";
                     for id in jobs::wait_all(&ctx).await {
@@ -366,7 +420,15 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
                         println!("{name} (after {}): {}", job.name, after.status);
                         ok &= after.status == "success";
                     }
-                    if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
+                    // Stopped (from the app, `dbr jobs stop`, a time limit): 130,
+                    // as a stopped `dbr` query, not a failure.
+                    if ok {
+                        ExitCode::SUCCESS
+                    } else if run.status == "cancelled" {
+                        ExitCode::from(130)
+                    } else {
+                        ExitCode::from(1)
+                    }
                 }
                 Err(e) => {
                     eprintln!("databrain-jobs: {}", e.message);
@@ -397,7 +459,13 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
         }
         "stop" => {
             let Some(which) = job_arg(args) else { return usage() };
-            let (code, out, err) = stop(state, which, args.iter().any(|a| a == "--no-wait"), STOP_WAIT).await;
+            let no_wait = args.iter().any(|a| a == "--no-wait");
+            let step = args.iter().position(|a| a == "--step").map(|i| args.get(i + 1));
+            let (code, out, err) = match step {
+                Some(None) => return usage(),
+                Some(Some(step)) => stop_step(state, which, step, no_wait, STOP_WAIT).await,
+                None => stop(state, which, no_wait, STOP_WAIT).await,
+            };
             print!("{out}");
             eprint!("{err}");
             ExitCode::from(code)
@@ -469,6 +537,7 @@ mod tests {
         assert_eq!(job_arg(&args(&["runs", "Daily", "--limit", "3"])), Some("Daily"));
         assert_eq!(job_arg(&args(&["runs", "--limit", "3", "Daily"])), Some("Daily"));
         assert_eq!(job_arg(&args(&["stop", "--no-wait", "Daily"])), Some("Daily"));
+        assert_eq!(job_arg(&args(&["stop", "--step", "Load", "Daily"])), Some("Daily"));
         assert_eq!(job_arg(&args(&["runs", "--limit", "3"])), None);
     }
 }

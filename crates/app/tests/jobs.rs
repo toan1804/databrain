@@ -4037,6 +4037,70 @@ async fn a_run_is_stopped_from_another_process() {
     .await;
 }
 
+/// One step of a run in another process is stopped (`dbr jobs stop --step`,
+/// the app's step Stop on the background runner's run): that step only,
+/// within seconds; the rest of the run goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_is_stopped_from_another_process() {
+    guarded_within(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let open = |kind: &str| {
+            let mut st = AppState::new(Arc::new(Workspace::open(&path).unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+            st.jobs = Arc::new(databrain_app::jobs::JobsState::new(kind));
+            st
+        };
+        let (runner, terminal) = (open("cli"), open("terminal"));
+        let a = sqlite(&runner, "A", &dir.path().join("a.db"), false);
+        let b = sqlite(&runner, "B", &dir.path().join("b.db"), false);
+        let slow = "with recursive c(i) as (select 1 union all select i + 1 from c where i < 300000000) select count(*) from c";
+        let job = runner
+            .workspace
+            .save_job(plain_job(
+                "Two",
+                vec![node("n1", "slow_step", JobNodeKind::Query, Some(&a), slow), node("n2", "other_slow", JobNodeKind::Query, Some(&b), slow)],
+            ))
+            .unwrap();
+        let cli = databrain_app::cli::jobs::stop_step;
+
+        // Not running: nothing to ask; an unknown step lists the job's steps.
+        let (code, _, err) = cli(&terminal, "Two", "slow_step", true, Duration::ZERO).await;
+        assert_eq!(code, 1, "{err}");
+        let (code, _, err) = cli(&terminal, "Two", "nope", true, Duration::ZERO).await;
+        assert_eq!(code, 2);
+        assert!(err.contains("\"slow_step\"") && err.contains("\"other_slow\""), "{err}");
+
+        api::run_job(&runner, &job.id, None).unwrap();
+        until("both steps running", 30, || {
+            step_status(&runner, &job.id, "n1").as_deref() == Some("running") && step_status(&runner, &job.id, "n2").as_deref() == Some("running")
+        })
+        .await;
+        // Asked from the terminal, by the step's name (any case): it stops, the other goes on.
+        let started = std::time::Instant::now();
+        let (code, out, err) = cli(&terminal, "two", "SLOW_STEP", false, Duration::from_secs(30)).await;
+        assert_eq!(code, 0, "{out}{err}");
+        assert!(started.elapsed() < Duration::from_secs(15), "took {:?}", started.elapsed());
+        assert!(out.contains("\"slow_step\": "), "{out}");
+        assert_ne!(step_status(&runner, &job.id, "n1").as_deref(), Some("running"));
+        assert_eq!(step_status(&runner, &job.id, "n2").as_deref(), Some("running"), "only that step stops");
+        assert!(runner.workspace.job_runs(&job.id, 1).unwrap()[0].status == "running");
+        // The app's step Stop on another process's run: asked too.
+        assert!(api::cancel_job_step(&terminal, &job.id, "n2"));
+        let run = finished_within(&runner, &job.id, Duration::from_secs(30)).await;
+        assert_ne!(run.error.as_deref(), Some("Stopped from DataBrain"), "the run wasn't stopped as a whole: {run:?}");
+        assert!(run.nodes.iter().all(|n| n.summary.status != "running" && n.summary.status != "success"), "{run:?}");
+        assert!(!api::cancel_job_step(&terminal, &job.id, "n2"), "nothing to stop once it ended");
+        assert!(terminal.workspace.job_stop_ask(&job.id).unwrap().is_none());
+
+        // A step stop asked after a whole-run stop keeps the whole-run stop.
+        terminal.workspace.request_job_stop(&job.id, 7, "terminal").unwrap();
+        terminal.workspace.request_job_step_stop(&job.id, 7, "n1", "app").unwrap();
+        let ask = terminal.workspace.job_stop_ask(&job.id).unwrap().unwrap();
+        assert!(ask.whole && ask.steps == ["n1"], "{ask:?}");
+    })
+    .await;
+}
+
 /// The table explorer's Usage lists the job steps that read or write a
 /// table, from their SQL and load targets as written: its own name in any
 /// case, qualified by its schema or not; not a table of the same name in

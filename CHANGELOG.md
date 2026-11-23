@@ -7,6 +7,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Added
 
 - **`dbr` opens files in the app:** without `-i`, `dbr orders.csv` opens the file's rows in a tab of the running DataBrain (started when it isn't), `dbr -c sales report.sql` opens the `.sql` file there on that connection (`--run` runs it too), and `dbr -c sales "select …"` opens the SQL in a new tab and runs it, as the editor runs it: the read-only setting and the production confirmation apply. `-i` still prints the rows in the terminal.
+- **Stop one step of a background run:** a step's Stop now works on a run the background runner (or `dbr jobs run`) is doing, as on the app's own runs; `dbr jobs stop <job> --step <step>` does it from a terminal. The rest of the run goes on.
+
+### Changed
+
+- **`dbr jobs run` exits 130 when its run is stopped** (from the app, `dbr jobs stop` or a time limit), with why, instead of 1 as for a failure.
 
 ## 0.5.1 - 2026-11-20
 

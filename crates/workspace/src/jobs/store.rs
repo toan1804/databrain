@@ -764,7 +764,43 @@ impl Workspace {
     /// app, the background runner, `databrain-jobs run`), which reads this
     /// on its heartbeat ([`Workspace::job_stop_request`]).
     pub fn request_job_stop(&self, job_id: &str, run_id: i64, by: &str) -> Result<()> {
-        self.set_setting(&format!("{JOB_STOP_PREFIX}{job_id}"), &serde_json::json!({ "run_id": run_id, "by": by, "at": now_ms() }))
+        // Steps asked to stop for the same run stay asked (the whole run stops anyway).
+        let steps = self.job_stop_ask(job_id)?.filter(|a| a.run_id == run_id).map(|a| a.steps).unwrap_or_default();
+        self.set_setting(
+            &format!("{JOB_STOP_PREFIX}{job_id}"),
+            &serde_json::json!({ "run_id": run_id, "by": by, "at": now_ms(), "whole": true, "steps": steps }),
+        )
+    }
+
+    /// Ask the process running run `run_id` of `job_id` to stop its step
+    /// `node_id` only (the rest of the run goes on, as when the step is
+    /// stopped where it runs). A stop of the whole run asked before stays.
+    pub fn request_job_step_stop(&self, job_id: &str, run_id: i64, node_id: &str, by: &str) -> Result<()> {
+        let (whole, mut steps) = match self.job_stop_ask(job_id)?.filter(|a| a.run_id == run_id) {
+            Some(a) => (a.whole, a.steps),
+            None => (false, Vec::new()),
+        };
+        if !steps.iter().any(|s| s == node_id) {
+            steps.push(node_id.to_string());
+        }
+        self.set_setting(
+            &format!("{JOB_STOP_PREFIX}{job_id}"),
+            &serde_json::json!({ "run_id": run_id, "by": by, "at": now_ms(), "whole": whole, "steps": steps }),
+        )
+    }
+
+    /// What is asked to stop of `job_id`'s run: the whole run, or some of
+    /// its steps ([`JobStopAsk`]).
+    pub fn job_stop_ask(&self, job_id: &str) -> Result<Option<JobStopAsk>> {
+        Ok(self.get_setting(&format!("{JOB_STOP_PREFIX}{job_id}"))?.and_then(|v| {
+            Some(JobStopAsk {
+                run_id: v.get("run_id")?.as_i64()?,
+                by: v.get("by")?.as_str()?.to_string(),
+                // A request written before steps could be stopped is for the whole run.
+                whole: v.get("whole").and_then(|w| w.as_bool()).unwrap_or(true),
+                steps: v.get("steps").and_then(|s| s.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            })
+        }))
     }
 
     /// A stop asked for `job_id`'s run: (run id, who asked).
@@ -777,6 +813,18 @@ impl Workspace {
         self.conn.lock().execute("DELETE FROM settings WHERE key = ?1", [format!("{JOB_STOP_PREFIX}{job_id}")])?;
         Ok(())
     }
+}
+
+/// A stop asked from another process for a job's run ([`Workspace::job_stop_ask`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobStopAsk {
+    pub run_id: i64,
+    /// `terminal` or `app`.
+    pub by: String,
+    /// The whole run is to stop.
+    pub whole: bool,
+    /// Steps (node ids) to stop, the rest of the run going on.
+    pub steps: Vec<String>,
 }
 
 /// Settings keys of stop requests (not settings the app shows: left out of `all_settings`).
