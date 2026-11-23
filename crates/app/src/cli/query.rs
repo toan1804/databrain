@@ -1,7 +1,10 @@
 //! `databrain query` (also started as `dbr`): run SQL from a terminal on a
-//! saved connection, with its credentials and rules, and print the rows.
+//! saved connection, with its credentials and rules, and print the rows
+//! (`-i`); without `-i`, the running app opens them ([`crate::handoff`]).
 //!
 //! ```text
+//! dbr orders.csv                                   the file's rows in a tab of the app
+//! dbr -c sales report.sql                          the file in a tab, run on "sales"
 //! dbr -c "Sales PG" -i "select * from orders"      a table of the first rows (100; --limit up to 1,000)
 //! dbr -c sales -i --csv "select …" > out.csv       every row as CSV (also --json, --tsv)
 //! dbr -i data.parquet orders.xlsx                  data files, read by the local DuckDB
@@ -31,36 +34,47 @@ use databrain_workspace::{ConnectionProfile, Origin};
 use crate::api::AppState;
 use crate::background;
 
-const USAGE: &str = "usage: dbr [-c <connection>] -i [--csv|--json|--tsv] [--limit N] [-p name=value]… [--yes] <sql | file.sql | data file>…
+const USAGE: &str = "usage: dbr [-c <connection>] [-p name=value]… <sql | file.sql | data file>…   (opens them in DataBrain)
+       dbr [-c <connection>] -i [--csv|--json|--tsv] [--limit N] [-p name=value]… [--yes] <sql | file.sql | data file>…
        dbr jobs list | run <job> | runs <job> | stop <job>   (dbr jobs --help)
        dbr --help | --version";
 
 /// `dbr --help`: what it does, its options, examples and exit codes.
-const HELP: &str = "dbr: run SQL from a terminal on a DataBrain connection and print the rows.
+const HELP: &str = "dbr: open data files and SQL in DataBrain, or run SQL on a DataBrain
+connection and print the rows here (-i).
 
-usage: dbr [-c <connection>] -i [options] <sql | file.sql | data file>…
+usage: dbr [-c <connection>] [-p name=value]… <sql | file.sql | data file>…
+       dbr [-c <connection>] -i [options] <sql | file.sql | data file>…
        dbr jobs list | run <job> | runs <job> | stop <job>
+
+Without -i, the running DataBrain (started when it isn't) opens each one in a
+tab: a data file's rows as a result, a .sql file or SQL run on the
+connection (the local DuckDB without -c), as the editor runs them.
 
 options:
   -c, --conn <name>    a saved connection: its name (any case), a part of it
                        when only one matches, or its id; default: the local
                        DuckDB
-  -i, --inline         print the rows here (needed for now: opening them in
-                       the app comes later)
+  -i, --inline         print the rows here instead of opening them in the app
   -e, --execute <sql>  this text is SQL (when it could be read as a file name)
-  --csv, --json, --tsv every row in that format (CSV by default when piped)
-  --limit <n>          at most n rows: a table shows 100 by default and at
-                       most 1,000; CSV, JSON and TSV every row unless given
+  --csv, --json, --tsv with -i: every row in that format (CSV by default
+                       when piped)
+  --limit <n>          with -i: at most n rows: a table shows 100 by default
+                       and at most 1,000; CSV, JSON and TSV every row unless
+                       given
   -p, --param <n=v>    a value for :n in the SQL (repeatable)
-  -y, --yes            run on a production connection without asking
+  -y, --yes            with -i: run on a production connection without asking
   -h, --help           this help
   -v, --version        the version
 
-It runs as the app's editor does: a read-only connection refuses writes,
-and what the app would confirm on a production connection is asked here
-([y/N]; refused without a terminal unless --yes). Each run is in the app's query history as \"Terminal\".
+With -i it runs as the app's editor does: a read-only connection refuses
+writes, and what the app would confirm on a production connection is asked
+here ([y/N]; refused without a terminal unless --yes). Each run is in the
+app's query history as \"Terminal\".
 
 examples:
+  dbr orders.csv                               (opens it in DataBrain)
+  dbr -c sales report.sql                      (opens and runs it there)
   dbr -c \"Sales PG\" -i \"select * from orders limit 10\"
   dbr -c sales -i report.sql -p day=2026-11-20
   dbr -c sales -i --csv \"select * from orders\" > orders.csv
@@ -68,8 +82,9 @@ examples:
                                                Delta/Iceberg folders)
   dbr jobs run \"Daily load\"
 
-exit codes: 0 done, 1 a statement failed, 2 bad arguments (an unknown
-connection too) or a question answered no, 130 stopped (Ctrl-C).
+exit codes: 0 done (opened in the app), 1 a statement failed, 2 bad
+arguments (an unknown connection too), a question answered no or the app
+not reached, 130 stopped (Ctrl-C).
 
 where it is: macOS DataBrain.app/Contents/MacOS/dbr (link it into your
 PATH); Windows the install folder (add it to PATH); Linux /usr/bin/dbr
@@ -371,8 +386,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if !opts.inline {
-        eprintln!("dbr: opening the rows in the DataBrain app isn't available yet: add -i to print them here\n{USAGE}");
-        return ExitCode::from(2);
+        return open_in_app(&opts);
     }
     let rt = match crate::cli::runtime() {
         Ok(rt) => rt,
@@ -382,6 +396,98 @@ pub fn main(args: Vec<String>) -> ExitCode {
         }
     };
     rt.block_on(run(opts))
+}
+
+/// What the app is asked to open for `opts` (no `-i`): data files and
+/// folders as results, `.sql` files and SQL in tabs that run them, files by
+/// their full paths (the app runs elsewhere). Printing options need `-i`.
+pub fn open_request(opts: &Opts) -> Result<crate::handoff::OpenRequest, String> {
+    use crate::handoff::{OpenItem, OpenRequest};
+    if opts.format.is_some() || opts.limit.is_some() {
+        return Err("--csv, --json, --tsv and --limit are for rows printed here: add -i".into());
+    }
+    if opts.yes {
+        return Err("--yes is for runs here (-i): the app asks itself before running on a production connection".into());
+    }
+    let mut items = Vec::new();
+    for s in &opts.sources {
+        items.push(match s {
+            Source::Sql(text) => OpenItem::Sql { text: text.clone() },
+            Source::File(p) => {
+                let full = std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()))?.to_string_lossy().into_owned();
+                if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) {
+                    OpenItem::SqlFile { path: full }
+                } else {
+                    OpenItem::Data { path: full }
+                }
+            }
+        });
+    }
+    Ok(OpenRequest { connection: opts.conn.clone(), items, params: opts.params.clone() })
+}
+
+/// Longest wait for a DataBrain started here to answer.
+const START_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Hand `opts` to the running app (started when it isn't): 0 when it opened
+/// them, 2 when it refused (an unknown connection, a missing file) or
+/// can't be reached.
+fn open_in_app(opts: &Opts) -> ExitCode {
+    use crate::handoff::{SendError, send, start_app};
+    let req = match open_request(opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dbr: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let rt = match crate::cli::runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("dbr: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let dir = background::data_dir();
+    let reply = rt.block_on(async {
+        match send(&dir, &req).await {
+            Err(SendError::NotRunning) => {}
+            other => return other,
+        }
+        eprintln!("dbr: starting DataBrain…");
+        if let Err(e) = start_app() {
+            return Err(SendError::Failed(format!("couldn't start DataBrain: {e}")));
+        }
+        let until = std::time::Instant::now() + START_WAIT;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            match send(&dir, &req).await {
+                Err(SendError::NotRunning) if std::time::Instant::now() < until => continue,
+                Err(SendError::NotRunning) => return Err(SendError::Failed("DataBrain didn't start in a minute".into())),
+                other => return other,
+            }
+        }
+    });
+    match reply {
+        Ok(r) => match r.error {
+            None => {
+                eprintln!("dbr: opened in DataBrain");
+                ExitCode::SUCCESS
+            }
+            Some(e) => {
+                eprintln!("dbr: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Err(e) => {
+            let e = match e {
+                SendError::NotRunning => "DataBrain isn't running".to_string(),
+                SendError::Failed(e) => e,
+            };
+            eprintln!("dbr: {e} (-i prints the rows here instead)");
+            ExitCode::from(2)
+        }
+    }
 }
 
 async fn run(opts: Opts) -> ExitCode {
@@ -793,6 +899,62 @@ mod tests {
         assert!(parse(&args(&["-h"]), files).unwrap().help);
         assert!(parse(&args(&["--version"]), files).unwrap().version);
         assert!(parse(&args(&["-v"]), files).unwrap().version);
+    }
+
+    #[test]
+    fn without_i_the_app_opens_them() {
+        use crate::handoff::OpenItem;
+        let dir = tempfile::tempdir().unwrap();
+        let sql = dir.path().join("report.SQL");
+        let csv = dir.path().join("orders.csv");
+        std::fs::write(&sql, "select 1").unwrap();
+        std::fs::write(&csv, "a\n1\n").unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let o = parse(&args(&["-c", "sales", &s(&sql), &s(&csv), "select 2", "-p", "day=1"]), |p| p.exists()).unwrap();
+        let r = open_request(&o).unwrap();
+        assert_eq!(r.connection.as_deref(), Some("sales"));
+        assert_eq!(r.items, [OpenItem::SqlFile { path: s(&sql) }, OpenItem::Data { path: s(&csv) }, OpenItem::Sql { text: "select 2".into() }]);
+        assert_eq!(r.params["day"].value, "1");
+        // A folder (Delta, Iceberg) is data; a relative path is sent in full (the app runs elsewhere).
+        let o = parse(&args(&[&s(dir.path()), "x.csv"]), |p| p.is_dir() || p.ends_with("x.csv")).unwrap();
+        let r = open_request(&o).unwrap();
+        assert_eq!(r.items[0], OpenItem::Data { path: s(dir.path()) });
+        assert!(matches!(&r.items[1], OpenItem::Data { path } if Path::new(path).is_absolute() && path.ends_with("x.csv")));
+        // Printing options are for -i; --yes too (the app asks itself).
+        for a in [&["--csv", "x"][..], &["--limit", "5", "x"], &["-y", "x"]] {
+            let e = open_request(&parse(&args(a), |_| false).unwrap()).unwrap_err();
+            assert!(e.contains("-i"), "{a:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn the_app_finds_the_connection_and_the_files() {
+        use crate::handoff::{OpenItem, OpenRequest, resolve};
+        let p = |id: &str, name: &str| ConnectionProfile {
+            id: id.into(),
+            name: name.into(),
+            config: databrain_connector_core::ConnectionConfig::new(databrain_connector_core::ConnectorKind::Sqlite, databrain_auth::AuthMethod::None),
+            color: None,
+            env: databrain_workspace::EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let all = [p("c1", "Sales PG"), p("c2", "Ops")];
+        let dir = tempfile::tempdir().unwrap();
+        let full = dir.path().to_string_lossy().into_owned();
+        let req = |conn: Option<&str>, items: Vec<OpenItem>| OpenRequest { connection: conn.map(str::to_string), items, params: Default::default() };
+        let ok = resolve(&all, req(Some("sales"), vec![OpenItem::Data { path: full.clone() }, OpenItem::Sql { text: "select 1".into() }])).unwrap();
+        assert_eq!(ok.connection_id.as_deref(), Some("c1"));
+        assert_eq!(resolve(&all, req(None, vec![OpenItem::Sql { text: "select 1".into() }])).unwrap().connection_id, None);
+        assert!(resolve(&all, req(Some("nope"), vec![OpenItem::Sql { text: "x".into() }])).unwrap_err().contains("no connection named"));
+        assert!(resolve(&all, req(None, vec![OpenItem::Data { path: "rel.csv".into() }])).unwrap_err().contains("not a full path"));
+        let gone = dir.path().join("gone.csv").to_string_lossy().into_owned();
+        assert!(resolve(&all, req(None, vec![OpenItem::SqlFile { path: gone }])).unwrap_err().contains("no such file"));
+        assert!(resolve(&all, req(None, vec![OpenItem::Sql { text: " ".into() }])).is_err());
+        assert!(resolve(&all, req(None, vec![])).is_err());
     }
 
     #[test]

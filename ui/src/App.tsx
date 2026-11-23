@@ -30,6 +30,7 @@ import { useAi } from "./aiStore";
 import { isMac, kbd, modalOpen } from "./lib/platform";
 import { globalRunApplies } from "./lib/shortcuts";
 import { ActivityBar } from "./components/ActivityBar";
+import { startDbrOpens } from "./dbrOpen";
 
 function useGlobalShortcuts() {
   useEffect(() => {
@@ -128,7 +129,14 @@ export default function App() {
       .getState()
       .init()
       .catch(toast("DataBrain"))
-      .then(() => Promise.allSettled([useAi.getState().init().catch(toast("The assistant")), useJobs.getState().init().catch(toast("Jobs"))]));
+      .then(() =>
+        Promise.allSettled([
+          useAi.getState().init().catch(toast("The assistant")),
+          useJobs.getState().init().catch(toast("Jobs")),
+          // What `dbr` hands the app (and sent while it was starting).
+          startDbrOpens().catch(toast("Opening from dbr")),
+        ]),
+      );
   }, []);
 
   useEffect(() => {

@@ -33,6 +33,12 @@ pub(crate) async fn reveal_job_file(app: AppHandle, state: State<'_, AppState>, 
     app.opener().reveal_item_in_dir(&file).map_err(|e| EngineError::new("internal", e.to_string()))
 }
 
+/// What `dbr` asked to open since the last call (each handed once).
+#[tauri::command]
+pub(crate) async fn take_dbr_opens(opens: State<'_, crate::DbrOpens>) -> R<Vec<crate::handoff::DbrOpen>> {
+    Ok(std::mem::take(&mut *opens.0.lock()))
+}
+
 /// Open a provider's billing page in the browser (https only).
 #[tauri::command]
 pub(crate) async fn open_link(app: AppHandle, url: String) -> R<()> {

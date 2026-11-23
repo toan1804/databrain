@@ -6,6 +6,7 @@ pub mod background;
 pub mod cli;
 mod commands;
 pub mod conn_io;
+pub mod handoff;
 pub mod jobs;
 pub mod logging;
 pub mod meta_writer;
@@ -27,6 +28,14 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Name of the event carrying [`JobEvent`] payloads.
 pub const JOB_EVENT: &str = "job-event";
+
+/// Said to the UI when `dbr` has handed something to open ([`DbrOpens`]).
+pub const DBR_OPEN_EVENT: &str = "dbr-open";
+
+/// What `dbr` asked to open, kept until the UI takes it (`take_dbr_opens`):
+/// a request that comes while the app is still starting waits for the UI.
+#[derive(Default)]
+pub(crate) struct DbrOpens(parking_lot::Mutex<Vec<handoff::DbrOpen>>);
 
 struct TauriUi(AppHandle);
 
@@ -160,6 +169,24 @@ pub fn run() {
             let jobs = state.job_ctx();
             let (ws, engine) = (state.workspace.clone(), state.engine.clone());
             app.manage(state);
+            app.manage(DbrOpens::default());
+            // `dbr` without -i: what it opens here.
+            {
+                let h = app.handle().clone();
+                let handle: handoff::Handler = Arc::new(move |req| {
+                    let conns = h.state::<AppState>().workspace.list_connections().map_err(|e| e.to_string())?;
+                    let open = handoff::resolve(&conns, req)?;
+                    h.state::<DbrOpens>().0.lock().push(open);
+                    let _ = h.emit(DBR_OPEN_EVENT, ());
+                    if let Some(w) = h.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                    Ok(())
+                });
+                tauri::async_runtime::spawn(handoff::serve(dir.clone(), handle));
+            }
             // History older than the retention setting (default a month), now and daily.
             {
                 tauri::async_runtime::spawn(async move {
@@ -359,6 +386,7 @@ pub fn run() {
             commands::drivers::duckdb_engine_load,
             commands::ai::ai_provider_usage,
             commands::system::open_link,
+            commands::system::take_dbr_opens,
             commands::system::app_in_downloads,
             commands::system::check_for_update,
             commands::system::install_update,

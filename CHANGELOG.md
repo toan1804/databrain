@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **`dbr` opens files in the app:** without `-i`, `dbr orders.csv` opens the file's rows in a tab of the running DataBrain (started when it isn't), and `dbr -c sales report.sql` opens the `.sql` file there and runs it on that connection (SQL text too), as the editor runs it: the read-only setting and the production confirmation apply. `-i` still prints the rows in the terminal.
+
 ## 0.5.1 - 2026-11-20
 
 ### Added
