@@ -16,6 +16,7 @@ pub use limits::*;
 pub use model::*;
 pub use node::*;
 pub use schedule::*;
+pub use store::JobStopAsk;
 
 /// Run history kept per job.
 pub const RUNS_KEPT: i64 = 200;

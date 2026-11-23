@@ -140,14 +140,21 @@ async fn heartbeat(ws: Arc<Workspace>, id: String, owner: String, run_id: i64, s
         tokio::time::sleep(poll).await;
         // Stop asked from another process (`dbr jobs stop`, the app for the
         // background runner's run): this run only; an earlier run's is dropped.
-        if !stopping && let Ok(Some((asked, by))) = ws.job_stop_request(&id) {
-            let _ = ws.clear_job_stop(&id);
-            if asked == run_id {
-                let why = if by == "terminal" { STOPPED_FROM_TERMINAL } else { STOPPED_FROM_APP };
-                tracing::info!(job = %id, run = run_id, by, "stop asked from another process");
+        // Read and removed at once: a request written meanwhile is read next time.
+        if !stopping && let Ok(Some(ask)) = ws.take_job_stop(&id) {
+            if ask.run_id == run_id && ask.whole {
+                let why = if ask.by == "terminal" { STOPPED_FROM_TERMINAL } else { STOPPED_FROM_APP };
+                tracing::info!(job = %id, run = run_id, by = ask.by, "stop asked from another process");
                 jobs.stop_reasons.lock().entry(id.clone()).or_insert_with(|| why.to_string());
                 stop.cancel();
                 stopping = true;
+            } else if ask.run_id == run_id {
+                // Some steps only: each stops as when stopped here (a step that
+                // already ended is left as it is).
+                for node in &ask.steps {
+                    let stopped = jobs.cancel_step(&id, node);
+                    tracing::info!(job = %id, run = run_id, step = %node, by = ask.by, stopped, "step stop asked from another process");
+                }
             }
         }
         if tried.elapsed() < renew {
@@ -221,6 +228,28 @@ pub fn request_stop(ctx: &JobCtx, job_id: &str, by: &str) -> Result<StopAsked> {
     match (held, run) {
         (true, Some(r)) => {
             ctx.workspace.request_job_stop(job_id, r.id, by)?;
+            Ok(StopAsked::Asked(r.id))
+        }
+        _ => Ok(StopAsked::NotRunning),
+    }
+}
+
+/// Stop step `node_id` of `job_id`'s run, wherever it runs: in this
+/// process directly; in another by a request it reads within
+/// [`STOP_POLL`]. `NotRunning` when the step isn't running (or waiting for
+/// a slot), as in the app: a step not started yet isn't asked (the request
+/// would be gone before it starts). The rest of the run goes on.
+pub fn request_stop_step(ctx: &JobCtx, job_id: &str, node_id: &str, by: &str) -> Result<StopAsked> {
+    if ctx.jobs.is_running(job_id) {
+        return Ok(if ctx.jobs.cancel_step(job_id, node_id) { StopAsked::Stopped } else { StopAsked::NotRunning });
+    }
+    let held = ctx.workspace.job_lease(job_id)?.is_some();
+    let run = ctx.workspace.job_runs(job_id, 1)?.into_iter().next().filter(|r| r.status == "running");
+    let step_going =
+        |r: &databrain_workspace::JobRun| r.nodes.iter().any(|n| n.node_id == node_id && matches!(n.summary.status.as_str(), "running" | "waiting"));
+    match (held, run) {
+        (true, Some(r)) if step_going(&r) => {
+            ctx.workspace.request_job_step_stop(job_id, r.id, node_id, by)?;
             Ok(StopAsked::Asked(r.id))
         }
         _ => Ok(StopAsked::NotRunning),
