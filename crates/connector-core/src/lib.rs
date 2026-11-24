@@ -29,7 +29,7 @@ use databrain_auth::{AuthContext, CredentialSource};
 pub use arrow;
 pub use catalog::*;
 pub use conn_state::ConnState;
-pub use error::{ConnectorError, ErrorKind, Result};
+pub use error::{ConnectorError, ErrorKind, Result, SESSION_ENDED};
 pub use quote::*;
 pub use sql::{Checked, Statement};
 pub use sqlparser;

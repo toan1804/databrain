@@ -245,6 +245,10 @@ pub(crate) fn thin_execute(a: Arc<agent::Agent>, sql: &str, opts: ExecOptions) -
     stream
 }
 
+/// How long a stopped statement may take to end on the thin driver before
+/// its helper is ended (the helper itself gives up after 5 s).
+const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 300 } else { 10_000 });
+
 pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
     use agent::Frame;
     let batch = opts.batch_size.clamp(1, 10_000);
@@ -266,14 +270,28 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
     let mut cancelled = false;
     // Stop asked (Stop button / row cap / consumer gone): tell the helper,
     // then keep reading until it ends the request. Dropping a read in
-    // progress for it is safe: the reader keeps a part-read frame.
+    // progress for it is safe: the reader keeps a part-read frame. A stop
+    // that isn't answered (the helper gives up after 5 s and exits) ends
+    // the helper here: nothing else would free the session, and every
+    // later statement on it would wait behind this one.
+    let mut stopped_at: Option<tokio::time::Instant> = None;
     loop {
+        let deadline = stopped_at.map(|t| t + CANCEL_WAIT);
         let frame = tokio::select! {
-            f = agent::Agent::next(&mut r, id) => f?,
+            f = agent::Agent::next(&mut r, id) => match f {
+                // The helper exited (it gave up on a stop): stopped, not failed.
+                Err(_) if cancelled => return Err(ConnectorError::cancelled_session_ended()),
+                f => f?,
+            },
             _ = opts.cancel.cancelled(), if !cancelled => {
                 cancelled = true;
+                stopped_at = Some(tokio::time::Instant::now());
                 a.cancel(id).await;
                 continue;
+            }
+            _ = async { tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)).await }, if deadline.is_some() => {
+                a.kill();
+                return Err(ConnectorError::cancelled_session_ended());
             }
         };
         match frame {
@@ -301,6 +319,7 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
                     let b = BatchBuilder::new(&cols, batch);
                     if !cancelled && !tx.send(StreamEvent::Schema(b.schema())).await {
                         cancelled = true;
+                        stopped_at = Some(tokio::time::Instant::now());
                         a.cancel(id).await;
                     }
                     builder = Some((b, cols.len()));
@@ -341,6 +360,7 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
                 agent::decode_rows(&data, ncols, nrows, |row| b.push_row(row))?;
                 if b.is_full() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
                     cancelled = true;
+                    stopped_at = Some(tokio::time::Instant::now());
                     a.cancel(id).await;
                 }
             }
@@ -404,5 +424,48 @@ mod tests {
         assert!(reads_output("call p()"));
         assert!(!reads_output("select 1 from dual"));
         assert!(!reads_output("insert into t values (1)"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stop_tests {
+    use super::*;
+
+    /// A helper that never answers a stop (a read waiting for bytes that
+    /// never come) is ended after CANCEL_WAIT: the statement ends as
+    /// stopped with the session ended (the engine opens a new one), and the
+    /// process, with its connection to Oracle, is gone.
+    #[tokio::test]
+    async fn an_unanswered_stop_ends_the_helper() {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "cat > /dev/null"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let a = agent::Agent::from_child(child);
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let opts = ExecOptions { cancel: cancel.clone(), ..ExecOptions::default() };
+        let (tx, _stream) = databrain_connector_core::QueryStream::channel(4);
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            c.cancel();
+        });
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), thin_run(&a, "select doc from t", true, &opts, &tx))
+            .await
+            .expect("the stop was waited on forever");
+        let e = r.unwrap_err();
+        assert!(e.is_cancelled() && e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED), "{e:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        for _ in 0..50 {
+            if a.exited() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the helper process is still running");
     }
 }

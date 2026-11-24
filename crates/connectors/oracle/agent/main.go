@@ -191,6 +191,9 @@ type session struct {
 	// (e.g. current_schema, which unqualified names depend on), in the
 	// order they last ran; see remember.
 	setup []setupStmt
+	// plans: each query's columns of an object type, converted before it
+	// runs (see readableFirst), by its text.
+	plans map[string]plan
 }
 
 // setupStmt is a remembered ALTER SESSION statement and what it sets.
@@ -380,7 +383,7 @@ func (s *session) reconnect(ctx context.Context) error {
 		return errors.New("not connected")
 	}
 	s.close()
-	s.db, s.conn, s.tx = nil, nil, nil
+	s.db, s.conn, s.tx, s.plans = nil, nil, nil, nil
 	if err := s.connect(ctx, s.req); err != nil {
 		return err
 	}
@@ -1142,7 +1145,11 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		w.mu.Lock()
 		before := w.frames
 		w.mu.Unlock()
-		err := s.withReconnect(ctx, w, r, func() error { return s.query(ctx, w, r) })
+		r, err := s.readableFirst(ctx, r)
+		if err != nil {
+			return err
+		}
+		err = s.withReconnect(ctx, w, r, func() error { return s.query(ctx, w, r) })
 		if !undecodable(err) || ctx.Err() != nil {
 			return err
 		}
@@ -1153,6 +1160,8 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 	case "text":
 		return s.withReconnect(ctx, w, r, func() error { return s.textQuery(ctx, w, r) })
 	case "exec":
+		// DDL may change a table's columns: queries are described again.
+		s.plans = nil
 		return s.withReconnect(ctx, w, r, func() error { return s.exec(ctx, w, r) })
 	case "execmany":
 		return s.execMany(ctx, w, r)
@@ -1186,6 +1195,14 @@ func main() {
 // away before the helper exits anyway (a variable for tests).
 var gracePeriod = 10 * time.Second
 
+// cancelGrace is how long a cancelled statement may take to stop before the
+// helper exits anyway: go-ora sends a break, but a read that lost its place
+// in the server's reply (an object column misread as a length) waits for
+// bytes that never come, and nothing else would end it. The connection
+// closes with the process, which ends the session on the server; DataBrain
+// starts a new helper for the next statement. A variable for tests.
+var cancelGrace = 5 * time.Second
+
 // serve reads requests from `stdin` and runs them one at a time with
 // `handle`, answering on `stdout`. When stdin closes (DataBrain quit or
 // died), the running statement is cancelled, queued requests are dropped,
@@ -1199,6 +1216,7 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 	var mu sync.Mutex
 	var running uint64
 	var cancel context.CancelFunc
+	var runDone chan struct{} // closed when the running request returns
 	var gone bool
 	finished := make(chan struct{})
 	defer close(finished)
@@ -1246,6 +1264,16 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 				mu.Lock()
 				if cancel != nil && (r.Target == 0 || r.Target == running) {
 					cancel()
+					// A cancel that isn't answered: leave (see cancelGrace).
+					done := runDone
+					go func() {
+						select {
+						case <-done:
+						case <-finished:
+						case <-time.After(cancelGrace):
+							stuck()
+						}
+					}()
 				}
 				mu.Unlock()
 				continue
@@ -1266,11 +1294,13 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 			c()
 			continue
 		}
-		running, cancel = r.ID, c
+		done := make(chan struct{})
+		running, cancel, runDone = r.ID, c, done
 		mu.Unlock()
 		err := handle(ctx, w, r)
+		close(done)
 		mu.Lock()
-		running, cancel = 0, nil
+		running, cancel, runDone = 0, nil, nil
 		mu.Unlock()
 		cancelled := ctx.Err() != nil
 		c()

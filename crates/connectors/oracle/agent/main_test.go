@@ -251,6 +251,68 @@ func TestAStatementThatDoesNotStopMakesTheHelperExit(t *testing.T) {
 	close(release)
 }
 
+// A cancel that isn't answered (a read that lost its place in the reply
+// waits forever) makes the helper exit: its connection closes, which frees
+// the session; DataBrain starts a new helper.
+func TestACancelThatIsNotAnsweredMakesTheHelperExit(t *testing.T) {
+	old := cancelGrace
+	cancelGrace = 100 * time.Millisecond
+	defer func() { cancelGrace = old }()
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	started, release, exited := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+		close(started)
+		<-release // ignores the cancel
+		return nil
+	}, func() { close(exited) })
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "query"})) }()
+	<-started
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 2, "op": "cancel", "target": 1})) }()
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unanswered cancel kept the helper waiting")
+	}
+	close(release)
+}
+
+// A cancel answered in time doesn't: the next request runs.
+func TestACancelThatIsAnsweredKeepsTheHelper(t *testing.T) {
+	old := cancelGrace
+	cancelGrace = 200 * time.Millisecond
+	defer func() { cancelGrace = old }()
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	var mu sync.Mutex
+	var handled []uint64
+	exited := make(chan struct{})
+	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+		mu.Lock()
+		handled = append(handled, r.ID)
+		mu.Unlock()
+		if r.ID == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}, func() { close(exited) })
+	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "query"}))
+	time.Sleep(20 * time.Millisecond)
+	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 2, "op": "cancel", "target": 1}))
+	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 3, "op": "query"}))
+	select {
+	case <-exited:
+		t.Fatal("the helper exited after a cancel that was answered")
+	case <-time.After(500 * time.Millisecond):
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(handled) != "[1 3]" {
+		t.Fatalf("the request after the cancel didn't run: %v", handled)
+	}
+}
+
 // A request larger than the helper takes is answered with an error and the
 // next one runs: the helper doesn't take it for stdin closing and exit.
 func TestAnOversizedRequestIsRefusedAndTheHelperGoesOn(t *testing.T) {

@@ -33,7 +33,7 @@ pub const PROTOCOL: &str = "1";
 ///        tables of VARCHAR2(4000) columns: about 1,000 rows/s over a network).
 /// 0.1.7: an XMLTYPE table column (go-ora: "invalid size for GetInt64")
 ///        is read as text, as other object types are.
-pub const RELEASE: &str = "0.1.7";
+pub const RELEASE: &str = "0.1.8";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].
@@ -369,7 +369,7 @@ pub struct Agent {
     /// Held for the whole of a request (one request at a time).
     stdout: tokio::sync::Mutex<Reader>,
     next: AtomicU64,
-    _child: std::sync::Mutex<Child>,
+    child: std::sync::Mutex<Child>,
 }
 
 /// The helper's output, read a frame at a time.
@@ -483,7 +483,7 @@ impl Agent {
             stdin: tokio::sync::Mutex::new(stdin),
             stdout: tokio::sync::Mutex::new(FrameReader::new(BufReader::with_capacity(1 << 20, stdout))),
             next: AtomicU64::new(1),
-            _child: std::sync::Mutex::new(child),
+            child: std::sync::Mutex::new(child),
         });
         let hello = a.call(json!({"op": "hello"})).await?;
         if hello["version"].as_str() != Some(PROTOCOL) {
@@ -557,6 +557,32 @@ impl Agent {
 
     pub async fn cancel(&self, id: u64) {
         let _ = self.send(&json!({"id": 0, "op": "cancel", "target": id})).await;
+    }
+
+    /// A helper of a process already started (tests: a stand-in).
+    #[cfg(test)]
+    pub(crate) fn from_child(mut child: Child) -> Arc<Agent> {
+        Arc::new(Agent {
+            stdin: tokio::sync::Mutex::new(child.stdin.take().expect("stdin")),
+            stdout: tokio::sync::Mutex::new(FrameReader::new(BufReader::new(child.stdout.take().expect("stdout")))),
+            next: AtomicU64::new(1),
+            child: std::sync::Mutex::new(child),
+        })
+    }
+
+    /// Whether the helper process has ended (tests).
+    #[cfg(test)]
+    pub(crate) fn exited(&self) -> bool {
+        self.child.lock().is_ok_and(|mut c| c.try_wait().is_ok_and(|s| s.is_some()))
+    }
+
+    /// End the helper process: its connection to Oracle closes, which ends
+    /// the session on the server. Every later call fails as a lost
+    /// connection, so the session is opened again (a new helper).
+    pub fn kill(&self) {
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.start_kill();
+        }
     }
 
     /// Catalog query: every cell as text.
@@ -719,7 +745,7 @@ mod tests {
             stdin: tokio::sync::Mutex::new(child.stdin.take().unwrap()),
             stdout: tokio::sync::Mutex::new(FrameReader::new(BufReader::new(child.stdout.take().unwrap()))),
             next: AtomicU64::new(1),
-            _child: std::sync::Mutex::new(child),
+            child: std::sync::Mutex::new(child),
         });
         // Another request holds the helper; this one is stopped meanwhile.
         let held = a.stdout.lock().await;

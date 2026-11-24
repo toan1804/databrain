@@ -654,6 +654,84 @@ mod tests {
         check_driver("thin").await;
     }
 
+    /// Live, thin driver: a table's XMLTYPE values (small, a few KB, large
+    /// enough for a LOB) are read as text every time, never leaving the
+    /// helper waiting for bytes that don't come (each read has a time limit,
+    /// so a hang fails the test); a stop of a long statement ends it within
+    /// the stop's time limit, and the tab's next statement runs.
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST and DATABRAIN_ORACLE_AGENT (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_thin_xmltype_and_stop() {
+        use std::time::Duration;
+        let s = live_session("thin", false).await.expect("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
+        if let Ok(q) = s.execute(databrain_connector_core::Statement::internal("drop table db_xml purge"), ExecOptions::default()).await {
+            let _ = q.collect().await;
+        }
+        run(&s, "create table db_xml (id number primary key, doc xmltype)").await;
+        for (id, len) in [(1, 10), (2, 3_000), (3, 40_000), (4, 100_000)] {
+            // A CLOB built in PL/SQL: past 4000 characters a string can't be concatenated.
+            run(
+                &s,
+                &format!(
+                    "declare c clob; begin dbms_lob.createtemporary(c, true); dbms_lob.append(c, '<r><v>'); \
+                     for i in 1..{} loop dbms_lob.append(c, rpad('x', 1000, 'x')); end loop; \
+                     dbms_lob.append(c, rpad('x', {}, 'x') || '</v></r>'); insert into db_xml values ({id}, xmltype(c)); end;",
+                    len / 1000,
+                    (len % 1000).max(1)
+                ),
+            )
+            .await;
+        }
+        run(&s, "commit").await;
+        let read = |sql: &'static str| {
+            let s = &s;
+            async move {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await?.collect().await
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{sql}: no answer in 30 s (the helper waits for bytes that never come)"))
+            }
+        };
+        for round in 0..30 {
+            let c = read("select id, doc from db_xml order by id").await.unwrap_or_else(|e| panic!("round {round}: {e}"));
+            let rows: usize = c.batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 4, "round {round}");
+            let docs = c.batches[0].column(1).as_any().downcast_ref::<databrain_connector_core::arrow::array::StringArray>().expect("XML as text").clone();
+            for (i, len) in [10usize, 3_000, 40_000, 100_000].into_iter().enumerate() {
+                let len = len / 1000 * 1000 + (len % 1000).max(1);
+                let d = docs.value(i);
+                assert!(d.contains("<v>") && d.matches('x').count() == len, "round {round}, row {}: {} chars", i + 1, d.len());
+            }
+        }
+        // A value made in the query reads too.
+        read("select xmltype('<a>1</a>') x from dual").await.unwrap();
+        // One that can't be converted (two columns of a name, FOR UPDATE) is
+        // refused at once, saying why, instead of read (go-ora could wait forever).
+        for sql in ["select doc, doc from db_xml", "select doc from db_xml for update"] {
+            let e = read(sql).await.unwrap_err();
+            assert!(e.message.contains("thin Oracle driver can't read"), "{sql}: {e:?}");
+        }
+        // Not a statement the helper describes with DBMS_SQL (that would run DDL): runs as it is.
+        read("select count(*) from db_xml").await.unwrap();
+
+        // Stop a long statement: it ends within the stop's limit, the next one runs.
+        let token = databrain_connector_core::CancellationToken::new();
+        let opts = ExecOptions { cancel: token.clone(), ..ExecOptions::default() };
+        let slow = s.execute(databrain_connector_core::Statement::internal("select count(*) from all_objects a, all_objects b, all_objects c"), opts);
+        let t = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            t.cancel();
+        });
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(25), async { slow.await?.collect().await }).await.expect("the stop wasn't answered in 25 s");
+        assert!(matches!(&r, Err(e) if e.is_cancelled()), "stopped: {r:?}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        read("select 1 from dual").await.unwrap();
+        run(&s, "drop table db_xml purge").await;
+    }
+
     /// Live, Instant Client driver: same checks (DATABRAIN_ORACLE_LIB_DIR).
     #[ignore = "live: needs DATABRAIN_ORACLE_HOST and DATABRAIN_ORACLE_LIB_DIR (cargo test -- --ignored)"]
     #[tokio::test]
