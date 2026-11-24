@@ -87,19 +87,16 @@ impl Connector for MysqlConnector {
     }
 
     /// Signed in with the expired password (the server allows a session for
-    /// changing it once the client says it can), `ALTER USER CURRENT_USER()
-    /// IDENTIFIED BY …` sets the new one, with `REPLACE` the current one
-    /// where the server takes it. That session takes no SET or SELECT, so
-    /// `sql_mode` (whether a backslash escapes) can't be read or set: a
-    /// quote is doubled, which reads the same either way, and a backslash
-    /// in the new password is refused (the current one: no `REPLACE`).
+    /// changing it once the client says it can), the new one is set: MySQL's
+    /// `ALTER USER CURRENT_USER() IDENTIFIED BY …` (with `REPLACE` the
+    /// current one where the server takes it), else MariaDB's `SET PASSWORD
+    /// = PASSWORD(…)` (its session refuses ALTER USER, 1820). Quotes are
+    /// doubled, which reads the same whatever `sql_mode` says; a backslash
+    /// is safe only once `sql_mode` is set to NO_BACKSLASH_ESCAPES, which
+    /// MariaDB's session allows and MySQL's doesn't: there one in the new
+    /// password is refused (in the current one: no `REPLACE`).
     async fn connect_changing_password(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>, new: &str) -> Result<()> {
         use mysql_async::prelude::Queryable;
-        if new.contains('\\') {
-            return Err(databrain_connector_core::ConnectorError::config(
-                "A new password with a backslash (\\) can't be set while the old one has expired: set one without, then change it again",
-            ));
-        }
         let (user, password) = credentials(&*creds).await?;
         let ssl = ssl_opts(cfg)?;
         let mut conn = match connect_raw(expired_opts(cfg, user.clone(), password.clone(), ssl)).await {
@@ -108,14 +105,28 @@ impl Connector for MysqlConnector {
             Err(e) => return Err(e.into_error()),
         };
         let q = databrain_connector_core::quote_literal;
+        let code = |e: &databrain_connector_core::ConnectorError, n: &str| e.code.as_deref().is_some_and(|c| c.split_whitespace().next() == Some(n));
         let result = async {
-            let syntax = |e: &databrain_connector_core::ConnectorError| e.code.as_deref().is_some_and(|c| c.starts_with("1064 "));
-            let plain = format!("ALTER USER CURRENT_USER() IDENTIFIED BY {}", q(new));
-            if password.contains('\\') {
-                return conn.query_drop(plain).await.map_err(error::map_err);
+            // MariaDB: allowed, and then a backslash is itself. MySQL: refused (1820).
+            let plain = conn.query_drop("SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'").await.is_ok();
+            if !plain && new.contains('\\') {
+                return Err(databrain_connector_core::ConnectorError::config(
+                    "A new password with a backslash (\\) can't be set while the old one has expired: set one without, then change it again",
+                ));
             }
-            match conn.query_drop(format!("{plain} REPLACE {}", q(&password))).await.map_err(error::map_err) {
-                Err(e) if syntax(&e) => conn.query_drop(plain).await.map_err(error::map_err),
+            let alter = format!("ALTER USER CURRENT_USER() IDENTIFIED BY {}", q(new));
+            let first = if plain || !password.contains('\\') {
+                conn.query_drop(format!("{alter} REPLACE {}", q(&password))).await.map_err(error::map_err)
+            } else {
+                conn.query_drop(alter.clone()).await.map_err(error::map_err)
+            };
+            let r = match first {
+                Err(e) if code(&e, "1064") => conn.query_drop(alter).await.map_err(error::map_err),
+                r => r,
+            };
+            match r {
+                // MariaDB's session for an expired password takes only SET.
+                Err(e) if code(&e, "1820") => conn.query_drop(format!("SET PASSWORD = PASSWORD({})", q(new))).await.map_err(error::map_err),
                 r => r,
             }
         }
@@ -125,7 +136,7 @@ impl Connector for MysqlConnector {
         result.map_err(|e| {
             if e.code.as_deref().is_some_and(|c| c.starts_with("1064 ")) {
                 databrain_connector_core::ConnectorError::query(
-                    "This server doesn't take ALTER USER … IDENTIFIED BY (MySQL 5.7.6 or MariaDB 10.4 and later do)",
+                    "This server doesn't take ALTER USER … IDENTIFIED BY or SET PASSWORD (MySQL 5.7.6 or MariaDB 10.4 and later do)",
                 )
             } else {
                 e
@@ -140,54 +151,102 @@ mod expired_password_tests {
     use databrain_auth::{AuthMethod, InlineCredentialSource};
     use databrain_connector_core::ExecOptions;
 
-    fn cfg(user: &str) -> ConnectionConfig {
-        let mut c = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.into() });
-        c.host = Some(std::env::var("DATABRAIN_MYSQL_HOST").expect("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)"));
-        c.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
-        c
+    /// A server from the environment: `DATABRAIN_MYSQL_*` or `DATABRAIN_MARIADB_*`.
+    struct Server(&'static str);
+
+    impl Server {
+        fn var(&self, k: &str) -> Option<String> {
+            std::env::var(format!("DATABRAIN_{}_{k}", self.0)).ok()
+        }
+        fn cfg(&self, user: &str) -> ConnectionConfig {
+            let mut c = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.into() });
+            c.host = Some(self.var("HOST").unwrap_or_else(|| panic!("live test: DATABRAIN_{}_HOST not set (run with --ignored)", self.0)));
+            c.port = self.var("PORT").and_then(|p| p.parse().ok());
+            c
+        }
     }
 
     fn creds(user: &str, password: &str) -> Arc<dyn CredentialSource> {
         Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: user.into() }, Some(secrecy::SecretString::from(password.to_string()))))
     }
 
-    /// Live: an expired password is refused at sign-in and told apart
-    /// (1862); signing in with it to change it works, the new password then
-    /// signs in as usual, and one with a backslash and a quote is kept as
-    /// typed.
-    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
-    #[tokio::test]
-    async fn live_expired_password_is_changed_at_sign_in() {
-        let root = std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into());
-        let admin = MysqlConnector.connect(&cfg(&root), creds(&root, &std::env::var("DATABRAIN_MYSQL_PASSWORD").unwrap_or_default())).await.unwrap();
+    /// The options for the expired sign-in run nothing the session would
+    /// refuse: no database, no init statements, the settings the driver
+    /// would otherwise SELECT given, and the capability sent.
+    #[test]
+    fn expired_sign_in_runs_nothing_else() {
+        let mut c = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: "u".into() });
+        c.database = Some("app".into());
+        c.read_only = true;
+        let o = expired_opts(&c, "u".into(), "p".into(), None);
+        assert!(o.can_handle_expired_passwords());
+        assert_eq!(o.db_name(), None);
+        assert!(o.init().is_empty());
+        assert!(o.max_allowed_packet().is_some() && o.wait_timeout().is_some());
+        assert!(!o.prefer_socket());
+        assert!(!build_opts(&c, "u".into(), "p".into(), None).can_handle_expired_passwords(), "only the expired sign-in sends it");
+    }
+
+    /// Live: an expired password is refused (or kept to the change) and
+    /// told apart; signing in with it to change it works, the new password
+    /// then signs in as usual and the old one doesn't; a quote is kept as
+    /// typed; a backslash too where the session allows SET (MariaDB), else
+    /// refused before anything is changed (MySQL); a wrong current password
+    /// is refused.
+    async fn expired_password_is_changed_at_sign_in(srv: Server, user: &str, backslash_allowed: bool) {
+        let root = srv.var("USER").unwrap_or_else(|| "root".into());
+        let admin = MysqlConnector.connect(&srv.cfg(&root), creds(&root, &srv.var("PASSWORD").unwrap_or_default())).await.unwrap();
         let run = |sql: String| {
             let s = &admin;
             async move { s.execute(databrain_connector_core::Statement::internal(&sql), ExecOptions::default()).await.unwrap().collect().await.unwrap() }
         };
-        run("DROP USER IF EXISTS 'db_expired'@'%'".into()).await;
-        run("CREATE USER 'db_expired'@'%' IDENTIFIED BY 'Old_pw_1'".into()).await;
-        run("ALTER USER 'db_expired'@'%' PASSWORD EXPIRE".into()).await;
+        run(format!("DROP USER IF EXISTS '{user}'@'%'")).await;
+        run(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'Old_pw_1'")).await;
+        run(format!("ALTER USER '{user}'@'%' PASSWORD EXPIRE")).await;
 
-        let e = MysqlConnector.connect(&cfg("db_expired"), creds("db_expired", "Old_pw_1")).await.err().expect("refused while expired");
+        // MySQL refuses the sign-in (1862); MariaDB signs in to a session
+        // that refuses every statement (1820): either is told apart.
+        let e = match MysqlConnector.connect(&srv.cfg(user), creds(user, "Old_pw_1")).await {
+            Err(e) => e,
+            Ok(s) => s.server_version().await.err().expect("refused while expired"),
+        };
         assert!(e.is_password_expired(), "{e:?}");
-        MysqlConnector.connect_changing_password(&cfg("db_expired"), creds("db_expired", "Old_pw_1"), "New_pw_2").await.unwrap();
-        let s = MysqlConnector.connect(&cfg("db_expired"), creds("db_expired", "New_pw_2")).await.unwrap();
+        MysqlConnector.connect_changing_password(&srv.cfg(user), creds(user, "Old_pw_1"), "New_pw_2").await.unwrap();
+        let s = MysqlConnector.connect(&srv.cfg(user), creds(user, "New_pw_2")).await.unwrap();
         assert!(s.server_version().await.is_ok());
-        assert!(MysqlConnector.connect(&cfg("db_expired"), creds("db_expired", "Old_pw_1")).await.is_err(), "the old one no longer signs in");
+        assert!(MysqlConnector.connect(&srv.cfg(user), creds(user, "Old_pw_1")).await.is_err(), "the old one no longer signs in");
 
-        // A quote is kept as typed; a backslash is refused before anything
-        // signs in (whether it escapes depends on a sql_mode that session
-        // can't read), the password unchanged.
-        run("ALTER USER 'db_expired'@'%' PASSWORD EXPIRE".into()).await;
-        let e = MysqlConnector.connect_changing_password(&cfg("db_expired"), creds("db_expired", "New_pw_2"), r"N\ew_pw").await.unwrap_err();
-        assert!(e.message.contains("backslash"), "{e:?}");
+        run(format!("ALTER USER '{user}'@'%' PASSWORD EXPIRE")).await;
         let odd = "N'e\"w_pw_3";
-        MysqlConnector.connect_changing_password(&cfg("db_expired"), creds("db_expired", "New_pw_2"), odd).await.unwrap();
-        assert!(MysqlConnector.connect(&cfg("db_expired"), creds("db_expired", odd)).await.is_ok());
+        MysqlConnector.connect_changing_password(&srv.cfg(user), creds(user, "New_pw_2"), odd).await.unwrap();
+        assert!(MysqlConnector.connect(&srv.cfg(user), creds(user, odd)).await.is_ok());
 
-        // A wrong current password is refused, nothing changed.
-        run("ALTER USER 'db_expired'@'%' PASSWORD EXPIRE".into()).await;
-        assert!(MysqlConnector.connect_changing_password(&cfg("db_expired"), creds("db_expired", "wrong"), "Other_pw_4").await.is_err());
-        run("DROP USER 'db_expired'@'%'".into()).await;
+        run(format!("ALTER USER '{user}'@'%' PASSWORD EXPIRE")).await;
+        let slash = r"N\e\w_pw_4";
+        let r = MysqlConnector.connect_changing_password(&srv.cfg(user), creds(user, odd), slash).await;
+        if backslash_allowed {
+            r.unwrap();
+            let s = MysqlConnector.connect(&srv.cfg(user), creds(user, slash)).await.expect("kept as typed");
+            assert!(s.server_version().await.is_ok());
+            run(format!("ALTER USER '{user}'@'%' PASSWORD EXPIRE")).await;
+        } else {
+            assert!(r.unwrap_err().message.contains("backslash"));
+        }
+        let current = if backslash_allowed { slash } else { odd };
+        assert!(MysqlConnector.connect_changing_password(&srv.cfg(user), creds(user, "wrong"), "Other_pw_5").await.is_err());
+        assert!(MysqlConnector.connect_changing_password(&srv.cfg(user), creds(user, current), "Other_pw_5").await.is_ok(), "still the current one");
+        run(format!("DROP USER '{user}'@'%'")).await;
+    }
+
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_expired_password_is_changed_at_sign_in() {
+        expired_password_is_changed_at_sign_in(Server("MYSQL"), "db_expired", false).await;
+    }
+
+    #[ignore = "live: needs DATABRAIN_MARIADB_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_mariadb_expired_password_is_changed_at_sign_in() {
+        expired_password_is_changed_at_sign_in(Server("MARIADB"), "db_expired_m", true).await;
     }
 }

@@ -660,8 +660,9 @@ pub(crate) struct MysqlOpts {
 
     /// Enables `CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS` (defaults to `false`;
     /// DataBrain's addition). With it, the server lets an expired password
-    /// sign in to a session that takes only `ALTER USER` / `SET PASSWORD`
-    /// (it refuses the sign-in with error 1862 without it). Set
+    /// sign in to a session that takes only the password change (without
+    /// it, a server with `disconnect_on_expired_password` on refuses the
+    /// sign-in with error 1862). Set
     /// `max_allowed_packet`, `wait_timeout` and `prefer_socket(false)` too:
     /// the queries the connection would run to read them fail there (1820).
     can_handle_expired_passwords: bool,

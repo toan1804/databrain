@@ -39,10 +39,11 @@ pub(crate) fn build_opts(cfg: &ConnectionConfig, user: String, password: String,
 }
 
 /// Options for signing in with an expired password, to change it: the
-/// server then allows a session that takes only `ALTER USER`, `SET
-/// PASSWORD` and `SET` (anything else fails with 1820), so nothing runs at
-/// sign-in (no init statements, no database chosen) and the settings the
-/// driver would read with a query are given.
+/// server then allows a session that takes only the change (MySQL: ALTER
+/// USER and SET PASSWORD; MariaDB: SET and SET PASSWORD; anything else
+/// fails with 1820), so nothing runs at sign-in (no init statements, no
+/// database chosen) and the settings the driver would read with a query
+/// are given.
 pub(crate) fn expired_opts(cfg: &ConnectionConfig, user: String, password: String, ssl: Option<SslOpts>) -> Opts {
     OptsBuilder::default()
         .ip_or_hostname(cfg.host_or_default())
