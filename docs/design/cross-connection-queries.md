@@ -1,6 +1,6 @@
 # Design: one query over several connections
 
-Status: proposal (2026-11-25). Nothing is implemented. Open questions are in §12.
+Status: proposal (2026-11-25). Nothing is implemented. Decisions so far and what is still open are in §12.
 
 ## 1. Problem
 
@@ -64,8 +64,15 @@ connection := identifier | "quoted name"         -- a saved connection's name (a
 - **Parameters** (`:name`) are one set for the whole statement: the same value
   wherever the name is used, in parts and in the outer query.
 - **Where it runs:** on any tab. The tab's own connection plays no part; a tab
-  with no connection works. (§12, Q1: whether a bare `@` may mean the tab's
-  connection.)
+  with no connection works. Every part names its connection: there is no bare
+  `@` for "this tab's connection" (the statement would mean something else
+  pasted into another tab).
+- **By id too:** `@id:<connection id>` names a connection that keeps working
+  after a rename (the name is in the text of saved queries).
+- **SQL connections only in phase 1.** A part on MongoDB or Neo4j is refused
+  with a message saying so (phase 2: their bodies need their own lexers to find
+  the part's end, their own read check, and rules for nested documents as
+  columns).
 - A part may not read another part: parts are independent (that is what lets
   them run together). The outer query reads them by name.
 - Statements around it (a script with several statements) behave as today: a
@@ -104,7 +111,7 @@ and per keystroke for highlighting, so it gets a `crates/bench` path.
   others; the error names the part and its connection.
 - **Sessions:** a part never runs in the tab's manual-commit transaction (it has
   its own session); a combined query is refused while the tab has a transaction
-  open only if the tab's connection is one of its parts (Q2).
+  open only if the tab's connection is one of its parts (§12, open 1).
 - **Cost preview** (BigQuery, Snowflake, Databricks): `estimate_cost` per part,
   shown per part and summed.
 - **History:** one entry for the combined statement (on Results), plus one per
@@ -118,8 +125,12 @@ A join over a truncated part is a wrong answer that looks right. So:
 - Parts are read **whole**. The tab's row limit applies to the outer query's
   result only.
 - A per-part cap (setting `combined_part_rows`, default 5,000,000 rows) **fails**
-  the statement when a part passes it ("part `orders` has more than 5,000,000
-  rows: filter it in the part, or raise the limit"), instead of cutting it.
+  the statement when a part passes it, instead of cutting it. The user always
+  knows: the error names the part and the cap ("part `orders` has more than
+  5,000,000 rows: filter it in the part, or run again without the limit") and
+  has a "Run again without the limit" action (for that tab; the setting changes
+  the default). `dbr` takes `--part-rows N` (0: no limit); a job step has the
+  same as a setting of the step.
 - Large parts go to disk as results already do (the outputs budget); the outer
   query reads their Parquet files.
 - Progress shows each part's rows as they arrive, so a part that is reading far
@@ -220,32 +231,35 @@ masks exist. App size: unchanged apart from the code.
 1. **Run it:** `parse_combined`, §3, §4, §6 for the user's own runs, part result
    tabs, exact error positions, `dbr`. The editor highlights parts as plain SQL.
 2. **Write it comfortably:** mixed-dialect highlighting and completion, §5,
-   connection chips, hints for unbounded parts, notebooks, jobs.
+   connection chips, hints for unbounded parts, notebooks, jobs, MongoDB and
+   Neo4j parts.
 3. **Around it:** the AI and MCP, lineage across parts, history grouping in the
    UI.
 4. **Maybe:** pushdown of simple filters; `@conn.schema.table` as a shorthand
-   for a whole-table part (Q4).
+   for a whole-table part (§12, open 2).
 
 Each phase is its own PR or several, reviewed as usual.
 
-## 12. Open questions
+## 12. Decisions and open questions
 
-1. **A bare `@`** for the tab's own connection (`AS (@ SELECT …)`)? Handy in a
-   tab that already has a connection; but the statement then means something
-   else when pasted into another tab. Proposed: no, always name it.
-2. **A part on the tab's connection while the tab has a transaction open:** run
+Decided (2026-11-25):
+
+1. **No bare `@`:** a part always names its connection.
+2. **Renamed connections:** `@id:<connection id>` is accepted from phase 1;
+   Rename offering to update saved queries comes later.
+3. **The cap is never silent** (§4): a part past it fails the statement with a
+   message and a way to run without it.
+4. **MongoDB and Neo4j parts:** phase 2, refused with a clear message before.
+
+Open:
+
+1. **A part on the tab's connection while the tab has a transaction open:** run
    the part in its own session (it won't see uncommitted changes) or refuse?
    Proposed: refuse, saying why.
-3. **Renamed connections** break saved combined queries (the name is in the
-   text). Accept `@id:<connection id>` too, and have Rename offer to update
-   saved queries? Proposed: support the id form in phase 1, the offer later.
-4. **Shorthand for a whole table** (`FROM @sales.public.orders`): tempting, and
+2. **Shorthand for a whole table** (`FROM @sales.public.orders`): tempting, and
    an easy way to read 40 M rows by accident. Proposed: not before pushdown.
-5. **The default per-part cap** (5,000,000 rows) and whether it is per part or
-   in bytes like the outputs budget.
-6. **Non-SQL connections** (MongoDB, Neo4j) as parts: their bodies aren't SQL,
-   but they return rows. Proposed: allowed from phase 1 if `parse_combined` can
-   find the body's end with their lexer; otherwise phase 2.
+3. **The default cap** (5,000,000 rows): the right number, and whether it should
+   be in bytes like the outputs budget.
 
 ## 13. Alternatives considered
 
