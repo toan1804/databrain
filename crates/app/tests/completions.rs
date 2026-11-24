@@ -9,9 +9,17 @@ fn fake_dbr() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("dbr");
-    std::fs::write(&bin, "#!/bin/sh\n[ \"$1\" = --connections ] && printf 'Archive PG\\nSales MySQL\\nSales PG\\nWarehouse\\n'\n").unwrap();
+    // Names with spaces, glob characters, a quote and a `$`.
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\n[ \"$1\" = --connections ] && cat <<'EOF'\nArchive PG\nO'Brien\nQ[1]\nSales MySQL\nSales PG\nSales*\nWarehouse\ncost $x\nEOF\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(dir.path().join("orders.csv"), "a\n1\n").unwrap();
+    // Files a glob in a name would match.
+    for f in ["orders.csv", "Sales1.csv", "Q1", "jobs.sql"] {
+        std::fs::write(dir.path().join(f), "a\n1\n").unwrap();
+    }
     dir
 }
 
@@ -45,8 +53,10 @@ fn scripts_for_zsh_and_bash_only() {
     }
 }
 
-/// bash (3.2 on macOS too): connection names after -c in any case, quoted
-/// for the shell; options after `-`; nothing for an option's value.
+/// bash (3.2 on macOS too): connection names after -c in any case, as they
+/// are (readline quotes them, `-o filenames`, after an opening quote too),
+/// never expanded as patterns; options after `-`; the shell's own settings
+/// left as they were.
 #[test]
 fn bash_completes_connections_and_options() {
     if !has("bash") {
@@ -62,11 +72,19 @@ t dbr -c ""
 t dbr -c sa
 t dbr -c "Sales\\ P"
 t dbr -c '"sales m'
+t dbr -c "'sales p"
 t dbr --conn WARE
+t dbr -c "Sales\\*"
+t dbr -c q
+t dbr -c co
+t dbr -c o
 t dbr -c zz
 t dbr -i --ex
+t dbr -V
 t dbr -c Sales --limit ""
 t dbr j
+echo "noglob=$(set -o | grep -c 'noglob.*on') nocasematch=$(shopt -q nocasematch && echo on || echo off)"
+complete -p dbr
 "#;
     let out = std::process::Command::new("bash")
         .arg("-c")
@@ -79,15 +97,23 @@ t dbr j
         .unwrap();
     let got = String::from_utf8(out.stdout).unwrap();
     let want = [
-        r"dbr -c =[Archive\ PG][Sales\ MySQL][Sales\ PG][Warehouse]",
-        r"dbr -c sa=[Sales\ MySQL][Sales\ PG]",
-        r"dbr -c Sales\ P=[Sales\ PG]",
-        r#"dbr -c "sales m=[Sales\ MySQL]"#,
-        r"dbr --conn WARE=[Warehouse]",
-        r"dbr -c zz=[]",
-        r"dbr -i --ex=[--execute][--expanded]",
-        r"dbr -c Sales --limit =[]",
-        r"dbr j=[jobs]",
+        "dbr -c =[Archive PG][O'Brien][Q[1]][Sales MySQL][Sales PG][Sales*][Warehouse][cost $x]",
+        "dbr -c sa=[Sales MySQL][Sales PG][Sales*]",
+        r"dbr -c Sales\ P=[Sales PG]",
+        r#"dbr -c "sales m=[Sales MySQL]"#,
+        "dbr -c 'sales p=[Sales PG]",
+        "dbr --conn WARE=[Warehouse]",
+        r"dbr -c Sales\*=[Sales*]",
+        "dbr -c q=[Q[1]]",
+        "dbr -c co=[cost $x]",
+        "dbr -c o=[O'Brien]",
+        "dbr -c zz=[]",
+        "dbr -i --ex=[--execute][--expanded]",
+        "dbr -V=[-V]",
+        "dbr -c Sales --limit =[]",
+        "dbr j=[jobs][jobs.sql]",
+        "noglob=0 nocasematch=off",
+        "complete -o default -o filenames -F _dbr dbr",
     ];
     assert_eq!(got.lines().collect::<Vec<_>>(), want, "{}", String::from_utf8_lossy(&out.stderr));
 }

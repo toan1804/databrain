@@ -21,7 +21,8 @@ _dbr() {
   if (( CURRENT == 2 )) && [[ $words[2] == j* ]]; then
     compadd jobs
   fi
-  _arguments -s -S \
+  # Each option its own word (dbr takes no -ic), and no `--`.
+  _arguments \
     '(-c --conn)'{-c,--conn}'[a saved connection]:connection:_dbr_connections' \
     '(-i --inline)'{-i,--inline}'[print the rows here, not in the app]' \
     '--run[run the .sql files the app opens]' \
@@ -33,12 +34,16 @@ _dbr() {
     '--limit[at most n rows]:rows: ' \
     '*'{-p,--param}'[a value for :name]:name=value: ' \
     '(-y --yes)'{-y,--yes}'[run on a production connection without asking]' \
-    '--connections[the saved connections'"'"' names]' \
+    '(- *)--connections[the saved connections'"'"' names]' \
     '(- *)'{-h,--help}'[help]' \
-    '(- *)'{-v,--version}'[the version]' \
+    '(- *)'{-v,-V,--version}'[the version]' \
     '*:SQL, a .sql file or a data file:_files'
 }
-(( $+functions[compdef] )) && compdef _dbr dbr
+if (( $+functions[compdef] )); then
+  compdef _dbr dbr
+else
+  print -u2 "dbr completions: load compinit first (autoload -U compinit && compinit), then this line"
+fi
 "#;
 
 /// bash: `eval "$(dbr completions bash)"` in `~/.bashrc` (or
@@ -52,31 +57,40 @@ _dbr() {
     COMPREPLY=()
     case "$prev" in
         -c|--conn)
-            # What was typed, unquoted (Sales\ P, "Sales P, 'Sales P).
-            local typed="${cur//\\/}" n names restore
+            # What was typed, unquoted (Sales\ P, "Sales P, 'Sales P). The
+            # names go back as they are: readline quotes them (-o filenames)
+            # as the word was begun, after a quote too.
+            local typed="${cur//\\/}" n names restore glob
             typed="${typed#[\"\']}"
             names=$(command dbr --connections 2>/dev/null)
             restore=$(shopt -p nocasematch)
             shopt -s nocasematch
+            # A name with * or [ in it is a name, not a pattern for files here.
+            case $- in *f*) glob= ;; *) glob=1; set -f ;; esac
             local IFS=$'\n'
             for n in $names; do
-                [[ "$n" == "$typed"* ]] && COMPREPLY+=("$(printf '%q' "$n")")
+                [[ "$n" == "$typed"* ]] && COMPREPLY+=("$n")
             done
+            [[ -n $glob ]] && set +f
             eval "$restore"
             return 0 ;;
         -e|--execute|--limit|-p|--param)
             return 0 ;;
     esac
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=($(compgen -W "-c --conn -i --inline --run -e --execute --csv --json --tsv -x --expanded --limit -p --param -y --yes --connections -h --help -v --version" -- "$cur"))
+        COMPREPLY=($(compgen -W "-c --conn -i --inline --run -e --execute --csv --json --tsv -x --expanded --limit -p --param -y --yes --connections -h --help -v -V --version" -- "$cur"))
         return 0
     fi
-    if (( COMP_CWORD == 1 )) && [[ "jobs" == "$cur"* && -n "$cur" ]]; then
-        COMPREPLY=(jobs)
+    if (( COMP_CWORD == 1 )) && [[ -n "$cur" && "jobs" == "$cur"* ]]; then
+        # `jobs`, and the files that begin so too.
+        local IFS=$'\n'
+        COMPREPLY=(jobs $(compgen -f -- "$cur"))
     fi
-    # Anything else: files and folders (complete -o default).
+    # Anything else: files and folders (complete -o default). bash 3.2 can't
+    # turn that off for one word, so a value nothing matches (an unknown
+    # name after -c, or --limit's) lists files too.
 }
-complete -o default -F _dbr dbr
+complete -o default -o filenames -F _dbr dbr
 "#;
 
 const USAGE: &str = "usage: dbr completions zsh|bash
