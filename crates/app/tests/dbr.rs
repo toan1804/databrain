@@ -239,6 +239,25 @@ async fn dbr_reads_every_data_format() {
     }
 }
 
+/// `-x`: each row as a record with its values whole, even piped; a table
+/// cuts them at 40 characters.
+#[tokio::test(flavor = "multi_thread")]
+async fn expanded_rows_show_long_values_whole() {
+    let st = state();
+    let long = "x".repeat(300);
+    let sql = format!("select 1 as id, '{long}' as body, null as note");
+    let (code, table) = dbr(&st, &["-i", &sql], true).await;
+    assert_eq!(code, 0);
+    assert!(table.contains('…') && !table.contains(&long), "{table}");
+    for tty in [true, false] {
+        let (code, out) = dbr(&st, &["-i", "-x", &sql], tty).await;
+        assert_eq!(code, 0, "{out}");
+        let body: String = out.lines().filter(|l| l.starts_with("body") || l.starts_with("     ")).map(|l| l.split_once("│ ").unwrap().1).collect();
+        assert_eq!(body, long, "{out}");
+        assert!(out.starts_with("── row 1 ──\nid   │ 1\n") && out.contains("note │ NULL\n") && out.contains("1 row · "), "{out}");
+    }
+}
+
 /// `p` relative to the current directory when it can be (as a user types it).
 fn pathdiff(p: &std::path::Path) -> String {
     let cwd = std::env::current_dir().unwrap();

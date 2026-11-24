@@ -35,7 +35,7 @@ use crate::api::AppState;
 use crate::background;
 
 const USAGE: &str = "usage: dbr [-c <connection>] [--run] [-p name=value]… <sql | file.sql | data file>…   (opens them in DataBrain)
-       dbr [-c <connection>] -i [--csv|--json|--tsv] [--limit N] [-p name=value]… [--yes] <sql | file.sql | data file>…
+       dbr [-c <connection>] -i [--csv|--json|--tsv|-x] [--limit N] [-p name=value]… [--yes] <sql | file.sql | data file>…
        dbr jobs list | run <job> | runs <job> | stop <job>   (dbr jobs --help)
        dbr --help | --version";
 
@@ -61,6 +61,9 @@ options:
   -e, --execute <sql>  this text is SQL (when it could be read as a file name)
   --csv, --json, --tsv with -i: every row in that format (CSV by default
                        when piped)
+  -x, --expanded       with -i: each row as a record, a line per column,
+                       long values whole (a table cuts them at 40
+                       characters); rows as for a table
   --limit <n>          with -i: at most n rows: a table shows 100 by default
                        and at most 1,000; CSV, JSON and TSV every row unless
                        given
@@ -79,6 +82,7 @@ examples:
   dbr -c sales report.sql --run                (opens and runs it there)
   dbr -c \"Sales PG\" -i \"select * from orders limit 10\"
   dbr -c sales -i report.sql -p day=2026-11-20
+  dbr -c sales -i -x \"select * from orders where id = 42\"
   dbr -c sales -i --csv \"select * from orders\" > orders.csv
   dbr -i data.parquet orders.xlsx events/      (CSV, Parquet, JSON, Excel,
                                                Delta/Iceberg folders)
@@ -102,6 +106,8 @@ const CELL_MAX: usize = 40;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Table,
+    /// `-x`: each row as a record, a line per column, values whole.
+    Expanded,
     Csv,
     Json,
     Tsv,
@@ -238,9 +244,18 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
             "--run" => o.run = true,
             "-c" | "--conn" => o.conn = Some(value(&mut it, a)?),
             "-e" | "--execute" => o.sources.push(Source::Sql(value(&mut it, a)?)),
-            "--csv" => o.format = Some(Format::Csv),
-            "--json" => o.format = Some(Format::Json),
-            "--tsv" => o.format = Some(Format::Tsv),
+            "--csv" | "--json" | "--tsv" | "-x" | "--expanded" => {
+                let f = match a.as_str() {
+                    "--csv" => Format::Csv,
+                    "--json" => Format::Json,
+                    "--tsv" => Format::Tsv,
+                    _ => Format::Expanded,
+                };
+                if o.format.is_some_and(|g| g != f) {
+                    return Err("give one of --csv, --json, --tsv and -x".into());
+                }
+                o.format = Some(f);
+            }
             "--limit" => {
                 let v = value(&mut it, a)?;
                 o.limit = Some(v.parse().map_err(|_| format!("--limit takes a number of rows, not {v:?}"))?);
@@ -273,6 +288,13 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
     Ok(o)
 }
 
+impl Format {
+    /// A table or `-x`: read up to 1,000 rows, then printed shaped to the terminal.
+    pub fn is_table(self) -> bool {
+        matches!(self, Format::Table | Format::Expanded)
+    }
+}
+
 /// The format to print in: the one asked for, else a table on a terminal
 /// and CSV in a pipe or file.
 pub fn format_for(asked: Option<Format>, terminal: bool) -> Format {
@@ -283,7 +305,7 @@ pub fn format_for(asked: Option<Format>, terminal: bool) -> Format {
 /// a format's `--limit` or every row.
 pub fn row_limit(format: Format, limit: Option<usize>) -> Result<Option<usize>, String> {
     match format {
-        Format::Table => match limit.unwrap_or(TABLE_DEFAULT) {
+        Format::Table | Format::Expanded => match limit.unwrap_or(TABLE_DEFAULT) {
             0 => Err(format!("a table shows at most {TABLE_MAX} rows: use --csv, --json or --tsv for every row")),
             n if n > TABLE_MAX => Err(format!("a table shows at most {TABLE_MAX} rows (more is unreadable here): use --csv, --json or --tsv for {n}")),
             n => Ok(Some(n)),
@@ -377,6 +399,55 @@ pub fn render_table(columns: &[ColumnMeta], rows: &[Vec<Option<String>>], width:
     out
 }
 
+/// Each row as a record: a `── row n ──` line, then a line per column
+/// (`name │ value`), names padded to the longest, values whole (never
+/// cut): a long one wraps under the value column within `width`, its line
+/// breaks kept, NULL as `NULL`.
+pub fn render_expanded(columns: &[ColumnMeta], rows: &[Vec<Option<String>>], width: usize) -> String {
+    let names: Vec<String> = columns.iter().map(|c| flat(&c.name)).collect();
+    let name_w = names.iter().map(|n| cols(n)).max().unwrap_or(0);
+    // Room left for a value; too little and the terminal wraps it instead.
+    let room = width.saturating_sub(name_w + 3);
+    let room = if room >= 20 { Some(room) } else { None };
+    let mut out = String::new();
+    for (n, r) in rows.iter().enumerate() {
+        out.push_str(&format!("── row {} ──\n", n + 1));
+        for (i, name) in names.iter().enumerate() {
+            let v = r.get(i).cloned().flatten().unwrap_or_else(|| "NULL".into());
+            let v = v.replace("\r\n", "\n").replace(['\r', '\t'], " ");
+            let lines: Vec<String> = v.split('\n').flat_map(|l| wrap(l, room)).collect();
+            for (k, l) in lines.iter().enumerate() {
+                let label = if k == 0 { fit(name, name_w, false) } else { " ".repeat(name_w) };
+                // The value as it is (a space at a wrap is part of it).
+                if l.is_empty() {
+                    out.push_str(&format!("{label} │"))
+                } else {
+                    out.push_str(&format!("{label} │ {l}"))
+                }
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// `line` in pieces of at most `room` screen columns (whole without a room).
+fn wrap(line: &str, room: Option<usize>) -> Vec<String> {
+    let Some(room) = room else { return vec![line.to_string()] };
+    let mut pieces = vec![String::new()];
+    let mut used = 0;
+    for c in line.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > room && used > 0 {
+            pieces.push(String::new());
+            used = 0;
+        }
+        pieces.last_mut().expect("one piece").push(c);
+        used += cw;
+    }
+    pieces
+}
+
 /// A CSV field (RFC 4180: quoted when it holds a comma, quote or line break); NULL is empty.
 fn csv_field(v: Option<&str>) -> String {
     match v {
@@ -462,7 +533,7 @@ pub fn render_rows(format: Format, columns: &[ColumnMeta], keys: &[String], rows
                 out.push('\n');
             }
         }
-        Format::Table => unreachable!("tables go through render_table"),
+        Format::Table | Format::Expanded => unreachable!("tables go through render_table and render_expanded"),
     }
     out
 }
@@ -513,7 +584,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
 pub fn open_request(opts: &Opts) -> Result<crate::handoff::OpenRequest, String> {
     use crate::handoff::{OpenItem, OpenRequest};
     if opts.format.is_some() || opts.limit.is_some() {
-        return Err("--csv, --json, --tsv and --limit are for rows printed here: add -i".into());
+        return Err("--csv, --json, --tsv, -x and --limit are for rows printed here: add -i".into());
     }
     if opts.yes {
         return Err("--yes is for runs here (-i): the app asks itself before running on a production connection".into());
@@ -759,7 +830,7 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
         // CSV, JSON and TSV are printed as the rows are read (a pipe gets the
         // first ones while the query still runs): the tab's rows are tapped.
         let tab_id = format!("cli:{}", uuid::Uuid::new_v4().simple());
-        let (_tap, mut rows_rx) = if format == Format::Table {
+        let (_tap, mut rows_rx) = if format.is_table() {
             (None, None)
         } else {
             let (tap, rx) = state.engine.tap_rows(&tab_id);
@@ -829,7 +900,7 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
         };
         let n = outcomes.len();
         for o in &outcomes {
-            if n > 1 && format == Format::Table {
+            if n > 1 && format.is_table() {
                 let _ = writeln!(out, "-- statement {} of {n}", o.index + 1);
             }
             if let Some(e) = &o.error {
@@ -840,19 +911,24 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
             let Some(r) = &o.result else {
                 // Said apart from the rows, so a pipe gets only data.
                 let affected = o.rows_affected.map(|r| format!("{r} rows affected")).unwrap_or_else(|| "done".into());
-                if format == Format::Table {
+                if format.is_table() {
                     let _ = writeln!(out, "{affected} · {} · {} ms", conn.name, o.duration_ms);
                 } else {
                     say!("{affected}");
                 }
                 continue;
             };
-            let read = if format == Format::Table {
+            let read = if format.is_table() {
                 // Up to 1,000 rows: read, then fitted to the terminal.
                 let mut rows = Vec::new();
                 let r2 = for_each_page(state, &r.id, r.total_rows, &cancel, |page| rows.extend_from_slice(page)).await;
                 if r2.is_ok() {
-                    let _ = out.write_all(render_table(&r.columns, &rows, terminal.width).as_bytes());
+                    let shown = if format == Format::Expanded {
+                        render_expanded(&r.columns, &rows, terminal.width)
+                    } else {
+                        render_table(&r.columns, &rows, terminal.width)
+                    };
+                    let _ = out.write_all(shown.as_bytes());
                     let more = if r.truncated { format!(" (more not read: --limit up to {TABLE_MAX}, or --csv for every row)") } else { String::new() };
                     let _ = writeln!(out, "{} row{}{more} · {} · {} ms", rows.len(), if rows.len() == 1 { "" } else { "s" }, conn.name, o.duration_ms);
                 }
@@ -1084,7 +1160,16 @@ mod tests {
         assert!(parse(&args(&["-i"]), files).unwrap_err().contains("nothing to run"));
         assert!(parse(&args(&["-i", "--limit", "many", "x"]), files).unwrap_err().contains("--limit takes"));
         assert!(parse(&args(&["-i", "-p", "day", "x"]), files).unwrap_err().contains("name=value"));
-        assert!(parse(&args(&["-x", "x"]), files).unwrap_err().contains("unknown option"));
+        assert!(parse(&args(&["-z", "x"]), files).unwrap_err().contains("unknown option"));
+        // -x: records; one format only (the same one twice is fine).
+        assert_eq!(parse(&args(&["-i", "-x", "select 1"]), files).unwrap().format, Some(Format::Expanded));
+        assert_eq!(parse(&args(&["-i", "--expanded", "-x", "select 1"]), files).unwrap().format, Some(Format::Expanded));
+        for a in [&["-x", "--csv"][..], &["--json", "-x"], &["--csv", "--tsv"]] {
+            let a: Vec<&str> = ["-i"].iter().chain(a).chain(&["select 1"]).copied().collect();
+            assert!(parse(&args(&a), files).unwrap_err().contains("one of"), "{a:?}");
+        }
+        assert_eq!(row_limit(Format::Expanded, None), Ok(Some(TABLE_DEFAULT)));
+        assert!(row_limit(Format::Expanded, Some(TABLE_MAX + 1)).is_err());
         // A file that isn't there is said so, with and without -i: never run as SQL.
         let none = |_: &Path| false;
         for f in [
@@ -1233,7 +1318,7 @@ mod tests {
             assert_eq!(matches!(item, OpenItem::SqlFile { .. }), n.to_lowercase().ends_with(".sql"), "{n}: {item:?}");
         }
         // Printing options are for -i; --yes too (the app asks itself).
-        for a in [&["--csv", "x"][..], &["--limit", "5", "x"], &["-y", "x"]] {
+        for a in [&["--csv", "x"][..], &["-x", "x"], &["--limit", "5", "x"], &["-y", "x"]] {
             let e = open_request(&parse(&args(a), |_| false).unwrap()).unwrap_err();
             assert!(e.contains("-i"), "{a:?}: {e}");
         }
@@ -1333,6 +1418,37 @@ mod tests {
         );
         let bars: Vec<usize> = cjk.lines().filter(|l| l.contains('│')).map(|l| super::cols(l.split('│').next().unwrap())).collect();
         assert!(bars.windows(2).all(|w| w[0] == w[1]), "{cjk}");
+    }
+
+    #[test]
+    fn expanded_rows_show_whole_values() {
+        let cols = [col("id", TypeFamily::Number), col("comment", TypeFamily::Text), col("note", TypeFamily::Text)];
+        let long = "word ".repeat(30).trim_end().to_string(); // 149 characters
+        let rows =
+            vec![vec![Some("1".into()), Some(long.clone()), None], vec![Some("2".into()), Some("first line\nsecond\tline".into()), Some("日本語".into())]];
+        let x = render_expanded(&cols, &rows, 60);
+        let lines: Vec<&str> = x.lines().collect();
+        assert_eq!(lines[0], "── row 1 ──");
+        assert_eq!(lines[1], "id      │ 1");
+        // Wrapped under the value column, nothing cut, nothing lost.
+        let comment: Vec<&str> = lines.iter().skip(2).take_while(|l| !l.starts_with("note")).copied().collect();
+        assert!(comment.len() > 1 && comment[0].starts_with("comment │ ") && comment[1..].iter().all(|l| l.starts_with("        │ ")), "{x}");
+        assert!(comment.iter().all(|l| cols_of(l) <= 60), "{x}");
+        let joined: String = comment.iter().map(|l| &l[l.find('│').unwrap() + "│ ".len()..]).collect();
+        assert_eq!(joined, long);
+        assert!(!x.contains('…'));
+        assert!(lines.contains(&"note    │ NULL"));
+        // Line breaks kept (a tab shown as a space), wide characters whole.
+        let i = lines.iter().position(|l| *l == "── row 2 ──").unwrap();
+        assert_eq!(&lines[i + 1..], ["id      │ 2", "comment │ first line", "        │ second line", "note    │ 日本語"]);
+        // Too narrow to wrap well: the value is left for the terminal to wrap.
+        let narrow = render_expanded(&cols, &rows[..1], 20);
+        assert!(narrow.contains(&format!("comment │ {long}")), "{narrow}");
+        assert_eq!(render_expanded(&cols, &[], 80), "");
+    }
+
+    fn cols_of(s: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(s)
     }
 
     #[test]

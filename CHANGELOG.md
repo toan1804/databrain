@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **`dbr -i -x` shows long values whole:** each row as a record, a line per column, with long values wrapped to the terminal instead of cut at 40 characters (as `psql`'s `\x`); `--expanded` is the same.
+
 ### Fixed
 
 - **`dbr` says when a file isn't there:** `dbr orders.csv` (or with `-i`) for a file not in the current folder ran `orders.csv` as SQL, a syntax error in the app or the terminal; it now says the file isn't there and in which folder, for names with spaces too (`dbr "my file.csv"`); a URL is told to be read with SQL, and `-e` still runs such a word as SQL.
