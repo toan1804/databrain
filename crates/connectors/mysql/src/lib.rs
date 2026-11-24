@@ -208,7 +208,7 @@ mod expired_password_tests {
         // that refuses every statement (1820): either is told apart.
         let e = match MysqlConnector.connect(&srv.cfg(user), creds(user, "Old_pw_1")).await {
             Err(e) => e,
-            Ok(s) => s.server_version().await.err().expect("refused while expired"),
+            Ok(s) => s.server_version().await.expect_err("refused while expired"),
         };
         assert!(e.is_password_expired(), "{e:?}");
         MysqlConnector.connect_changing_password(&srv.cfg(user), creds(user, "Old_pw_1"), "New_pw_2").await.unwrap();
