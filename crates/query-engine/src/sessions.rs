@@ -253,6 +253,13 @@ impl QueryEngine {
 
     /// A session on a separate tab, for tests that set up data.
     #[doc(hidden)]
+    /// Open (sign in) the session a run on `tab_id` will use, before the
+    /// run: its error is the connection's (unreachable, refused sign-in),
+    /// never a statement's, and the run then reuses the session.
+    pub async fn open_session(&self, connection_id: &str, tab_id: &str, origin: Origin) -> Result<()> {
+        self.session_for(connection_id, tab_id, origin).await.map(|_| ())
+    }
+
     pub async fn session_for_tests(&self, connection_id: &str) -> Result<Arc<dyn Session>> {
         self.session(connection_id, &SessionRole::Tests.key()).await
     }

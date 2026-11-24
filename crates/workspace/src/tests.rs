@@ -101,6 +101,30 @@ fn connections_crud() {
     assert!(ws.save_connection(profile("  ")).is_err());
 }
 
+/// `dbr` reads the saved connections without writing to the workspace
+/// (the app may have it open): this version's file is read (no WAL or
+/// schema change made), another version's isn't.
+#[test]
+fn connections_are_read_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspace.db");
+    assert!(Workspace::read_connections(&path).is_none(), "no file");
+    {
+        let ws = Workspace::open(&path).unwrap();
+        ws.save_connection(profile("Prod DB")).unwrap();
+        ws.save_connection(profile("Archive")).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let all = Workspace::read_connections(&path).unwrap();
+    assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Archive", "Prod DB"]);
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    // A newer DataBrain's workspace: not read (nor changed) here.
+    Connection::open(&path).unwrap().pragma_update(None, "user_version", (MIGRATIONS.len() + 1) as i64).unwrap();
+    assert!(Workspace::read_connections(&path).is_none());
+    let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(v as usize, MIGRATIONS.len() + 1);
+}
+
 /// Deleting a connection leaves nothing of what only belonged to it: every
 /// table with a `connection_id` but those kept on purpose (their
 /// connection becomes unset), and its settings. A table added later is

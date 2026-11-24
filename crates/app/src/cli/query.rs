@@ -4,11 +4,11 @@
 //!
 //! ```text
 //! dbr orders.csv                                   the file's rows in a tab of the app
-//! dbr -c sales --run report.sql                    the file in a tab, run on "sales"
-//! dbr -c "Sales PG" -i "select * from orders"      a table of the first rows (100; --limit up to 1,000)
-//! dbr -c sales -i --csv "select …" > out.csv       every row as CSV (also --json, --tsv)
+//! dbr -c Sales --run report.sql                    the file in a tab, run on "Sales"
+//! dbr -c Sales -i "select * from orders"           a table of the first rows (100; --limit up to 1,000)
+//! dbr -c Sales -i --csv "select …" > out.csv       every row as CSV (also --json, --tsv)
 //! dbr -i data.parquet orders.xlsx                  data files, read by the local DuckDB
-//! dbr -c "Sales PG" -i report.sql -p day=2026-11-18
+//! dbr -c Sales -i report.sql -p day=2026-11-18
 //! ```
 //!
 //! A table in the terminal shows up to 1,000 rows (more is unreadable and
@@ -53,8 +53,8 @@ connection when given; run too with --run); SQL run on the connection (the
 local DuckDB without -c). They run as the editor runs them.
 
 options:
-  -c, --conn <name>    a saved connection: its name (any case), a part of it
-                       when only one matches, or its id; default: the local
+  -c, --conn <name>    a saved connection: its name (any case) or its id;
+                       checked before anything runs; default: the local
                        DuckDB
   -i, --inline         print the rows here instead of opening them in the app
   --run                without -i: run the .sql files the app opens
@@ -69,6 +69,7 @@ options:
                        given
   -p, --param <n=v>    a value for :n in the SQL (repeatable)
   -y, --yes            with -i: run on a production connection without asking
+  --connections        the saved connections' names, one a line
   -h, --help           this help
   -v, --version        the version
 
@@ -79,11 +80,11 @@ app's query history as \"Terminal\".
 
 examples:
   dbr orders.csv                               (opens it in DataBrain)
-  dbr -c sales report.sql --run                (opens and runs it there)
-  dbr -c \"Sales PG\" -i \"select * from orders limit 10\"
-  dbr -c sales -i report.sql -p day=2026-11-20
-  dbr -c sales -i -x \"select * from orders where id = 42\"
-  dbr -c sales -i --csv \"select * from orders\" > orders.csv
+  dbr -c Sales report.sql --run                (opens and runs it there)
+  dbr -c Sales -i \"select * from orders limit 10\"
+  dbr -c Sales -i report.sql -p day=2026-11-20
+  dbr -c Sales -i -x \"select * from orders where id = 42\"
+  dbr -c Sales -i --csv \"select * from orders\" > orders.csv
   dbr -i data.parquet orders.xlsx events/      (CSV, Parquet, JSON, Excel,
                                                Delta/Iceberg folders)
   dbr jobs run \"Daily load\"
@@ -129,6 +130,9 @@ pub struct Opts {
     pub run: bool,
     pub help: bool,
     pub version: bool,
+    /// `--connections`: print the saved connections' names (for `-c` and
+    /// tab completion).
+    pub connections: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +243,7 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
         match a.as_str() {
             "-h" | "--help" => o.help = true,
             "-v" | "-V" | "--version" => o.version = true,
+            "--connections" => o.connections = true,
             "-i" | "--inline" => o.inline = true,
             "-y" | "--yes" => o.yes = true,
             "--run" => o.run = true,
@@ -276,7 +281,7 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
             s => o.sources.push(Source::Sql(s.to_string())),
         }
     }
-    if o.help || o.version {
+    if o.help || o.version || o.connections {
         return Ok(o);
     }
     if let Some(e) = missing {
@@ -314,22 +319,83 @@ pub fn row_limit(format: Format, limit: Option<usize>) -> Result<Option<usize>, 
     }
 }
 
-/// The saved connection `name` names: the same name (any case), else the
-/// only one whose name contains it; else why not, with the close ones.
+/// The saved connection `name` names: its name in any case (spaces around
+/// it ignored) or its id, nothing else. A part of a name or a typo picks
+/// none, so a command never runs on a connection that wasn't meant: the
+/// error offers the names close to it (`dbr --connections` lists them all).
 pub fn find_connection<'a>(all: &'a [ConnectionProfile], name: &str) -> Result<&'a ConnectionProfile, String> {
-    let low = name.trim().to_lowercase();
-    if let Some(c) = all.iter().find(|c| c.name.to_lowercase() == low || c.id == name) {
+    let typed = name.trim();
+    let low = typed.to_lowercase();
+    // The id first (what can't be two), then the name as spelled, then in any case.
+    if let Some(c) = all.iter().find(|c| c.id == typed) {
         return Ok(c);
     }
-    let close: Vec<&ConnectionProfile> = all.iter().filter(|c| c.name.to_lowercase().contains(&low)).collect();
-    match close.as_slice() {
-        [one] => Ok(one),
-        [] => Err(format!(
-            "no connection named {name:?}; the saved ones: {}",
-            if all.is_empty() { "none".to_string() } else { all.iter().map(|c| format!("{:?}", c.name)).collect::<Vec<_>>().join(", ") }
-        )),
-        many => Err(format!("{name:?} names several connections: {}", many.iter().map(|c| format!("{:?}", c.name)).collect::<Vec<_>>().join(", "))),
+    for same in
+        [all.iter().filter(|c| c.name.trim() == typed).collect::<Vec<_>>(), all.iter().filter(|c| c.name.trim().to_lowercase() == low).collect::<Vec<_>>()]
+    {
+        match same.as_slice() {
+            [] => {}
+            [one] => return Ok(one),
+            many => {
+                return Err(format!(
+                    "several connections are named {name:?}: give one's id ({})",
+                    many.iter().map(|c| format!("{:?} is {}", c.name, c.id)).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
     }
+    if all.is_empty() {
+        return Err(format!("no connection named {name:?}: none is saved (add one in DataBrain)"));
+    }
+    let close = close_names(all.iter().map(|c| c.name.as_str()), &low);
+    let hint = match close.as_slice() {
+        [] => String::new(),
+        [one] => format!("; did you mean {one:?}?"),
+        many => format!("; did you mean one of {}?", many.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(", ")),
+    };
+    Err(format!("no connection named {name:?}{hint} (dbr --connections lists them)"))
+}
+
+/// Up to 5 of `names` close to `typed` (lower case): holding it or held in
+/// it, or a few letters off; the closest first.
+fn close_names<'a>(names: impl Iterator<Item = &'a str>, typed: &str) -> Vec<&'a str> {
+    let mut scored: Vec<(usize, &str)> = names
+        .filter_map(|n| {
+            let low = n.trim().to_lowercase();
+            let d = edit_distance(&low, typed);
+            // Held in what was typed only when not a letter or two (`a` is in most words).
+            let part = !typed.is_empty() && (low.contains(typed) || (low.chars().count() >= 3 && typed.contains(&low)));
+            (part || d <= (typed.chars().count() / 3).max(1)).then_some((if part { 0 } else { d }, n))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().take(5).map(|(_, n)| n).collect()
+}
+
+/// Letters to add, remove, change or swap with the next to turn `a` into
+/// `b` (Damerau-Levenshtein, optimal string alignment: `saels` is one from
+/// `sales`).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    // d[i][j]: the distance between a[..i] and b[..j].
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, v) in d[0].iter_mut().enumerate() {
+        *v = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
+        }
+    }
+    d[a.len()][b.len()]
 }
 
 /// Columns `s` takes on screen (East Asian wide characters take two).
@@ -564,6 +630,26 @@ pub fn main(args: Vec<String>) -> ExitCode {
         println!("dbr {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    if opts.connections {
+        // One a line (a line break in a name shown as a space); nothing
+        // when the workspace can't be read here.
+        let mut names: Vec<String> = saved_connections(&background::data_dir()).unwrap_or_default().iter().map(|c| flat(&c.name)).collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup();
+        for n in names {
+            println!("{n}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    // -c's connection checked first, before anything connects or the app
+    // starts: only that one is looked up.
+    if let Some(name) = opts.conn.as_deref()
+        && let Some(all) = saved_connections(&background::data_dir())
+        && let Err(e) = find_connection(&all, name)
+    {
+        eprintln!("dbr: {e}");
+        return ExitCode::from(2);
+    }
     if !opts.inline {
         return open_in_app(&opts);
     }
@@ -604,6 +690,18 @@ pub fn open_request(opts: &Opts) -> Result<crate::handoff::OpenRequest, String> 
         });
     }
     Ok(OpenRequest { connection: opts.conn.clone(), items, params: opts.params.clone(), run: opts.run })
+}
+
+/// The saved connections, read without connecting to any and without
+/// writing to the workspace (the app may have it open): `Some(empty)`
+/// before DataBrain first ran, `None` when this dbr can't read it so (a
+/// workspace of another DataBrain version): the app (or the run) decides.
+fn saved_connections(dir: &Path) -> Option<Vec<ConnectionProfile>> {
+    let db = dir.join("workspace.db");
+    if !db.is_file() {
+        return Some(Vec::new());
+    }
+    databrain_workspace::Workspace::read_connections(&db)
 }
 
 /// Longest wait for a DataBrain started here to answer.
@@ -801,6 +899,7 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
         }
     };
     let mut failed = false;
+    let (mut opened, mut conn_down) = (false, false);
     for job in &jobs {
         let conn = match (&named, job.local) {
             (Some(c), false) => c.clone(),
@@ -836,6 +935,31 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
             let (tap, rx) = state.engine.tap_rows(&tab_id);
             (Some(tap), Some(rx))
         };
+        // The named connection is opened (signed in) before its first
+        // statement, so an error there is the connection's; the run reuses
+        // the session. Once it can't be reached, the rest on it is skipped
+        // (said once); data files go on, on the local DuckDB.
+        if !job.local && named.is_some() {
+            if conn_down {
+                continue;
+            }
+            if !opened {
+                let open = tokio::select! {
+                    r = state.engine.open_session(&conn.id, &tab_id, Origin::Cli) => r,
+                    _ = cancel.cancelled() => {
+                        say!("dbr: stopped");
+                        return STOPPED;
+                    }
+                };
+                if let Err(e) = open {
+                    say!("dbr: couldn't connect to \"{}\": {}", conn.name, e.message);
+                    conn_down = true;
+                    failed = true;
+                    continue;
+                }
+                opened = true;
+            }
+        }
         let mut printer = Printer { format, index: None, columns: Vec::new(), keys: Vec::new(), header: true, broken: false };
         let req = |confirmed: bool| RunRequest {
             connection_id: conn.id.clone(),
@@ -1236,6 +1360,7 @@ mod tests {
         assert_eq!(parse(&args(&["-e", "a.csv"]), none).unwrap().sources, [Source::Sql("a.csv".into())]);
         // SQL that starts with a `--` comment is SQL, not an option.
         assert_eq!(parse(&args(&["-i", "--x\nselect\n1"]), files).unwrap().sources, [Source::Sql("--x\nselect\n1".into())]);
+        assert!(parse(&args(&["--connections"]), files).unwrap().connections);
         assert!(parse(&args(&["--help"]), files).unwrap().help);
         assert!(parse(&args(&["-h"]), files).unwrap().help);
         assert!(parse(&args(&["--version"]), files).unwrap().version);
@@ -1344,7 +1469,7 @@ mod tests {
         let full = dir.path().to_string_lossy().into_owned();
         let req =
             |conn: Option<&str>, items: Vec<OpenItem>| OpenRequest { connection: conn.map(str::to_string), items, params: Default::default(), run: false };
-        let ok = resolve(&all, req(Some("sales"), vec![OpenItem::Data { path: full.clone() }, OpenItem::Sql { text: "select 1".into() }])).unwrap();
+        let ok = resolve(&all, req(Some("sales pg"), vec![OpenItem::Data { path: full.clone() }, OpenItem::Sql { text: "select 1".into() }])).unwrap();
         assert_eq!(ok.connection_id.as_deref(), Some("c1"));
         assert_eq!(resolve(&all, req(None, vec![OpenItem::Sql { text: "select 1".into() }])).unwrap().connection_id, None);
         assert!(resolve(&all, req(Some("nope"), vec![OpenItem::Sql { text: "x".into() }])).unwrap_err().contains("no connection named"));
@@ -1383,11 +1508,50 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let all = vec![p("Sales PG"), p("Sales MySQL"), p("Warehouse")];
+        let all = vec![p("Sales PG"), p("Sales MySQL"), p("Warehouse"), p("Archive PG")];
+        // The name in any case, spaces around it ignored, or the id.
         assert_eq!(find_connection(&all, "sales pg").unwrap().name, "Sales PG");
-        assert_eq!(find_connection(&all, "ware").unwrap().name, "Warehouse");
-        assert!(find_connection(&all, "sales").unwrap_err().contains("several"));
-        assert!(find_connection(&all, "crm").unwrap_err().contains("\"Warehouse\""));
+        assert_eq!(find_connection(&all, " SALES PG ").unwrap().name, "Sales PG");
+        assert_eq!(find_connection(&all, "id-Warehouse").unwrap().name, "Warehouse");
+        // A part of a name or a typo picks nothing (it once picked the only
+        // connection holding it): the close names are offered instead.
+        assert_eq!(find_connection(&all, "ware").unwrap_err(), "no connection named \"ware\"; did you mean \"Warehouse\"? (dbr --connections lists them)");
+        assert_eq!(
+            find_connection(&all, "warehose").unwrap_err(),
+            "no connection named \"warehose\"; did you mean \"Warehouse\"? (dbr --connections lists them)"
+        );
+        let e = find_connection(&all, "sales").unwrap_err();
+        assert!(e.contains("one of \"Sales MySQL\", \"Sales PG\"") && !e.contains("Archive"), "{e}");
+        let e = find_connection(&all, "pg").unwrap_err();
+        assert!(e.contains("\"Archive PG\", \"Sales PG\""), "{e}");
+        assert_eq!(find_connection(&all, "crm").unwrap_err(), "no connection named \"crm\" (dbr --connections lists them)");
+        assert!(find_connection(&[], "x").unwrap_err().contains("none is saved"));
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "ab"), 2);
+        assert_eq!(edit_distance("saels", "sales"), 1);
+        // The same name in two spellings: the exact one wins, any other is
+        // refused with their ids (never one picked by the list's order).
+        let mut two = vec![p("Prod"), p("prod"), p("Prod2")];
+        two[2].id = "prod".into(); // an id that is another's name: the id wins
+        assert_eq!(find_connection(&two, "prod").unwrap().name, "Prod2");
+        two[2].id = "id-other".into();
+        assert_eq!(find_connection(&two, "prod").unwrap().id, "id-prod");
+        assert_eq!(find_connection(&two, "Prod").unwrap().id, "id-Prod");
+        let e = find_connection(&two, "PROD").unwrap_err();
+        assert!(e.contains("several connections are named \"PROD\"") && e.contains("id-Prod") && e.contains("id-prod"), "{e}");
+        let same = vec![p("Prod"), ConnectionProfile { id: "id-2".into(), ..p("Prod") }];
+        assert!(find_connection(&same, "Prod").unwrap_err().contains("id-2"));
+        assert_eq!(find_connection(&same, " id-2 ").unwrap().id, "id-2");
+        // A one-letter name isn't offered for everything holding the letter.
+        let short = vec![p("a"), p("Analytics")];
+        assert_eq!(
+            find_connection(&short, "analytic").unwrap_err(),
+            "no connection named \"analytic\"; did you mean \"Analytics\"? (dbr --connections lists them)"
+        );
+        assert_eq!(
+            find_connection(&all, "Wraehouse").unwrap_err(),
+            "no connection named \"Wraehouse\"; did you mean \"Warehouse\"? (dbr --connections lists them)"
+        );
     }
 
     #[test]

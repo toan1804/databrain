@@ -239,6 +239,59 @@ async fn dbr_reads_every_data_format() {
     }
 }
 
+/// `-c` takes the exact name: a part of one or a typo runs nothing (it once
+/// ran on the only connection holding it); a connection that can't be
+/// reached is named, and the run stops there.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connection_is_the_one_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    sqlite(&st, "Sales", &dir.path().join("sales.db"), EnvTag::None, false);
+    // A server nothing listens on.
+    let mut c = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::None);
+    c.host = Some("127.0.0.1".into());
+    c.port = Some(1);
+    c.database = Some("x".into());
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "Unreachable PG".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    api::save_connection(&st, SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+
+    for typed in ["sale", "Saels", "pg"] {
+        let (code, out, err) = dbr_full(&st, &["-c", typed, "-i", "select 1"], false, Answer::No, Default::default()).await;
+        assert_eq!((code, out.as_str()), (2, ""), "{typed}: {err}");
+        assert!(err.contains(&format!("no connection named \"{typed}\"")) && err.contains("did you mean"), "{typed}: {err}");
+    }
+    assert!(st.workspace.list_history(&Default::default()).unwrap().is_empty(), "nothing ran");
+
+    // Checked before the first statement (a script's header isn't printed);
+    // said once, the rest on it skipped, data files read all the same.
+    let csv = dir.path().join("d.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let csv = pathdiff(&csv);
+    for tty in [true, false] {
+        let (code, out, err) =
+            dbr_full(&st, &["-c", "unreachable pg", "-i", "select 1; select 2", "select 3", &csv], tty, Answer::No, Default::default()).await;
+        assert_eq!(code, 1, "{err}");
+        assert!(err.starts_with("dbr: couldn't connect to \"Unreachable PG\": "), "{err}");
+        assert_eq!(err.matches("couldn't connect").count(), 1, "said once: {err}");
+        assert!(!out.contains("statement") && out.contains('1'), "only the CSV's rows: {out}");
+    }
+    // A statement failing on a connection that opened is that statement's error.
+    let (code, _, err) = dbr_full(&st, &["-c", "Sales", "-i", "select * from no_such_table"], false, Answer::No, Default::default()).await;
+    assert_eq!(code, 1);
+    assert!(err.contains("statement 1") && !err.contains("couldn't connect"), "{err}");
+}
+
 /// `-x`: each row as a record with its values whole, even piped; a table
 /// cuts them at 40 characters.
 #[tokio::test(flavor = "multi_thread")]

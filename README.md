@@ -60,16 +60,16 @@ See [docs/FEATURES.md](docs/FEATURES.md) for the full reference.
 
 ```sh
 dbr orders.csv                                           # the file's rows in a tab of the running app
-dbr -c sales --run report.sql                            # the file in its tab, run on "sales"
-dbr -c "Sales PG" -i "select * from orders limit 10"     # a table as wide as the terminal
-dbr -c sales -i report.sql -p day=2026-11-20             # a .sql file, :day filled in
-dbr -c sales -i --csv "select * from orders" > out.csv   # every row (also --json, --tsv)
+dbr -c Sales --run report.sql                            # the file in its tab, run on "Sales"
+dbr -c Sales -i "select * from orders limit 10"          # a table as wide as the terminal
+dbr -c Sales -i report.sql -p day=2026-11-20             # a .sql file, :day filled in
+dbr -c Sales -i --csv "select * from orders" > out.csv   # every row (also --json, --tsv)
 dbr -i data.parquet orders.xlsx events/                  # local files, read with DuckDB
 dbr jobs list                                            # jobs: list, run, runs, stop
 dbr --help                                               # every option; dbr --version
 ```
 
-Without `-i`, the running DataBrain (started when it isn't) opens each file or SQL in its own tab: a data file's rows as a result, a `.sql` file in its file tab (run too with `--run`), SQL run on the connection as the editor runs it. `-c` takes the connection's name (any case, or a part of it when only one matches); without it, `dbr` uses the local DuckDB. `--limit n` caps the rows (a table shows 100 by default). It runs as the app's editor does: a read-only connection refuses writes, what the app would confirm on a production connection is asked as `[y/N]` (refused without a terminal unless `--yes`), and every run is in the query history as "Terminal". Settings → Terminal → "Install the dbr command" puts it on your PATH (a link `/usr/local/bin/dbr` on macOS, the install folder on your PATH on Windows, a script in `~/.local/bin` for the AppImage; the Linux `.deb` and `.rpm` install `/usr/bin/dbr` themselves). It is `DataBrain.app/Contents/MacOS/dbr` on macOS and in the install folder on Windows. Exit codes: 0 done (or opened in the app), 1 a statement failed, 2 bad arguments, a question answered no or the app not reached, 130 stopped. More in [docs/FEATURES.md](docs/FEATURES.md) (`dbr` (terminal)).
+Without `-i`, the running DataBrain (started when it isn't) opens each file or SQL in its own tab: a data file's rows as a result, a `.sql` file in its file tab (run too with `--run`), SQL run on the connection as the editor runs it. `-c` takes the connection's name (in any case) or its id, checked before anything runs; a typo or a part of a name is refused with the close names offered (`dbr --connections` lists them); without it, `dbr` uses the local DuckDB. `--limit n` caps the rows (a table shows 100 by default). It runs as the app's editor does: a read-only connection refuses writes, what the app would confirm on a production connection is asked as `[y/N]` (refused without a terminal unless `--yes`), and every run is in the query history as "Terminal". Settings → Terminal → "Install the dbr command" puts it on your PATH (a link `/usr/local/bin/dbr` on macOS, the install folder on your PATH on Windows, a script in `~/.local/bin` for the AppImage; the Linux `.deb` and `.rpm` install `/usr/bin/dbr` themselves). It is `DataBrain.app/Contents/MacOS/dbr` on macOS and in the install folder on Windows. Exit codes: 0 done (or opened in the app), 1 a statement failed, 2 bad arguments, a question answered no or the app not reached, 130 stopped. More in [docs/FEATURES.md](docs/FEATURES.md) (`dbr` (terminal)).
 
 ## Build from source
 
