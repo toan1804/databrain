@@ -157,6 +157,8 @@ pub async fn refresh_schema(state: &AppState, id: &str, schema: &str) -> Result<
 /// didn't change, for its row estimates (in the fingerprint, not in
 /// object versions).
 async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint: Option<&str>, asked: bool) -> Result<SchemaRefresh> {
+    // The schema changed (or Refresh was asked): its tables are described again.
+    state.engine.forget_descriptions(id);
     // Compare against the listings saved so far, not ones still queued.
     state.meta.flush().await;
     let ws = state.engine.workspace();
@@ -360,8 +362,15 @@ pub async fn complete_routines(state: &AppState, id: &str, schema: Option<&str>,
 }
 
 /// DDL of an object for the explorer's "Show DDL".
-pub async fn object_ddl(state: &AppState, id: &str, schema: &str, name: &str, kind: databrain_connector_core::ObjectKind) -> Result<Option<String>> {
-    state.engine.object_ddl(id, schema, name, kind).await
+pub async fn object_ddl(
+    state: &AppState,
+    id: &str,
+    schema: &str,
+    name: &str,
+    kind: databrain_connector_core::ObjectKind,
+    fresh: bool,
+) -> Result<Option<String>> {
+    state.engine.object_ddl_with(id, schema, name, kind, fresh).await
 }
 
 /// Functions/procedures of an Oracle package (`pkg.` completion).
@@ -374,8 +383,16 @@ pub fn complete_columns_local(state: &AppState, id: &str, schema: &str, name: &s
     Ok(state.engine.workspace().kn_column_names(id, schema, name)?)
 }
 
+/// A table's description: one made in the last half minute (or still being
+/// made) is reused, as opening a table describes it twice
+/// (`databrain_query_engine::DESCRIBE_KEEP`).
 pub async fn describe(state: &AppState, id: &str, schema: &str, name: &str) -> Result<ObjectDetail> {
-    let d = state.engine.describe(id, schema, name).await?;
+    describe_with(state, id, schema, name, false).await
+}
+
+/// [`describe`]; `fresh`: asked of the server now (Refresh).
+pub async fn describe_with(state: &AppState, id: &str, schema: &str, name: &str, fresh: bool) -> Result<ObjectDetail> {
+    let d = if fresh { state.engine.describe_fresh(id, schema, name).await? } else { state.engine.describe(id, schema, name).await? };
     if !d.columns.is_empty() {
         let (ws, id2, s2, n2, cols, fks) =
             (state.workspace.clone(), id.to_string(), schema.to_string(), name.to_string(), d.columns.clone(), d.foreign_keys.clone());

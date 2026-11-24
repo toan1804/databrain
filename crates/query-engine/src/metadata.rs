@@ -162,13 +162,37 @@ impl QueryEngine {
 
     /// Full DDL of an object (`None`: not available for this engine/kind).
     pub async fn object_ddl(&self, connection_id: &str, schema: &str, name: &str, kind: databrain_connector_core::ObjectKind) -> Result<Option<String>> {
+        self.object_ddl_with(connection_id, schema, name, kind, false).await
+    }
+
+    /// [`Self::object_ddl`]; `fresh`: asked of the server now (the DDL tab's
+    /// Reload), not taken from a description of the last half minute.
+    pub async fn object_ddl_with(
+        &self,
+        connection_id: &str,
+        schema: &str,
+        name: &str,
+        kind: databrain_connector_core::ObjectKind,
+        fresh: bool,
+    ) -> Result<Option<String>> {
         let (schema_s, name_s) = (schema.to_string(), name.to_string());
-        let ddl = self
-            .with_meta(connection_id, |s| {
+        // A table's or view's DDL comes with its description where the two
+        // are the same: the one the table tab just read is used (or shared),
+        // not asked for again.
+        let from_describe = kind.is_relation() && self.with_meta(connection_id, |s| async move { Ok(s.describe_ddl_is_object_ddl()) }).await?;
+        let view = matches!(kind, databrain_connector_core::ObjectKind::View | databrain_connector_core::ObjectKind::MaterializedView);
+        // A view is read fresh: its definition is kept for PII masking with
+        // the view's version as known now, and one described before a
+        // redefinition must never be kept as the new one.
+        let ddl = if from_describe {
+            self.describe_reused(connection_id, schema, name, fresh || view).await?.0.ddl
+        } else {
+            self.with_meta(connection_id, |s| {
                 let (schema, name) = (schema_s.clone(), name_s.clone());
                 async move { s.object_ddl(&schema, &name, kind).await }
             })
-            .await?;
+            .await?
+        };
         // A view's definition is kept: PII masking traces a view to the
         // tables it reads through it.
         if matches!(kind, databrain_connector_core::ObjectKind::View | databrain_connector_core::ObjectKind::MaterializedView)
@@ -221,15 +245,6 @@ impl QueryEngine {
         self.with_meta(connection_id, |s| {
             let schema = schema.clone();
             async move { Ok((s.schema_columns(&schema).await?, s.schema_columns_read_keys())) }
-        })
-        .await
-    }
-
-    pub async fn describe(&self, connection_id: &str, schema: &str, name: &str) -> Result<ObjectDetail> {
-        let (schema, name) = (schema.to_string(), name.to_string());
-        self.with_meta(connection_id, |s| {
-            let (schema, name) = (schema.clone(), name.clone());
-            async move { s.describe(&schema, &name).await }
         })
         .await
     }

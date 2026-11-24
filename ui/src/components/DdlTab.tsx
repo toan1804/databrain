@@ -27,12 +27,12 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
   const [state, setState] = useState<State>({ status: "loading" });
   const seq = useRef(0);
 
-  const load = useEvent(async () => {
+  const load = useEvent(async (fresh: boolean = false) => {
     const my = ++seq.current;
     setState({ status: "loading" });
     if (!conn) return setState({ status: "error", message: "The connection of this tab no longer exists." });
     try {
-      const ddl = await api.objectDdl(conn.id, reference.schema, reference.name, reference.kind);
+      const ddl = await api.objectDdl(conn.id, reference.schema, reference.name, reference.kind, fresh);
       if (my !== seq.current) return;
       setState(ddl?.trim() ? { status: "ready", ddl: ddl.endsWith("\n") ? ddl : `${ddl}\n` } : { status: "empty" });
     } catch (e) {
@@ -107,7 +107,7 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
           <button className="btn-ghost py-1" onClick={openInEditor} disabled={!ddl} title="Open a copy in an editable query tab" aria-label="Open in editor">
             <FileCode2 size={13} /> {!iconOnly && "Open in editor"}
           </button>
-          <button className="btn-ghost py-1" onClick={() => void load()} disabled={state.status === "loading"} title="Load the DDL again from the server" aria-label="Reload">
+          <button className="btn-ghost py-1" onClick={() => void load(true)} disabled={state.status === "loading"} title="Load the DDL again from the server" aria-label="Reload">
             <RefreshCw size={13} className={state.status === "loading" ? "animate-spin" : ""} /> {!iconOnly && "Reload"}
           </button>
         </div>
@@ -127,7 +127,7 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
               <AlertCircle size={14} /> Could not load the DDL
             </span>
             <span className="max-w-xl break-words text-muted">{state.message}</span>
-            <button className="btn-ghost border border-line py-1" onClick={() => void load()}>
+            <button className="btn-ghost border border-line py-1" onClick={() => void load(true)}>
               <RefreshCw size={12} /> Try again
             </button>
           </div>

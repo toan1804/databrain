@@ -363,6 +363,11 @@ impl Session for PgSession {
         Ok(objs)
     }
 
+    /// Its table DDL is fuller than describe's (constraints, indexes): never answered from a description.
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
     /// Tables: columns, every constraint (pg_get_constraintdef), partition
     /// key, other indexes and comments. Views as before. Functions and
     /// procedures: pg_get_functiondef (all overloads).

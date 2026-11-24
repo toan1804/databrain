@@ -675,6 +675,11 @@ impl QueryEngine {
             Ok::<(u64, u64), EngineError>(n)
         }
         .await;
+        // The target created or replaced, or the user's SQL run (whatever it
+        // did): its kept descriptions go, even after an error.
+        if p.plan.iter().any(|a| matches!(a, Act::Sql { kind: ActKind::Ddl, .. } | Act::User { .. })) {
+            self.forget_descriptions(connection_id);
+        }
         match result {
             Ok((n, deleted)) => {
                 let mut notices = p.notices.clone();

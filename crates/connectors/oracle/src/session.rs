@@ -425,6 +425,11 @@ impl Session for OracleSession {
         Ok(l)
     }
 
+    /// Oracle's describe reads no DDL; object_ddl builds it from the dictionary: never answered from a description.
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
     /// Built from the ALL_* views (see [`ddl`]): works for every object the
     /// user can see, with a few small queries. DBMS_METADATA only when
     /// that gives nothing (e.g. a wrapped or invisible source).
