@@ -4,11 +4,11 @@
 //!
 //! ```text
 //! dbr orders.csv                                   the file's rows in a tab of the app
-//! dbr -c sales --run report.sql                    the file in a tab, run on "sales"
-//! dbr -c "Sales PG" -i "select * from orders"      a table of the first rows (100; --limit up to 1,000)
-//! dbr -c sales -i --csv "select …" > out.csv       every row as CSV (also --json, --tsv)
+//! dbr -c Sales --run report.sql                    the file in a tab, run on "Sales"
+//! dbr -c Sales -i "select * from orders"           a table of the first rows (100; --limit up to 1,000)
+//! dbr -c Sales -i --csv "select …" > out.csv       every row as CSV (also --json, --tsv)
 //! dbr -i data.parquet orders.xlsx                  data files, read by the local DuckDB
-//! dbr -c "Sales PG" -i report.sql -p day=2026-11-18
+//! dbr -c Sales -i report.sql -p day=2026-11-18
 //! ```
 //!
 //! A table in the terminal shows up to 1,000 rows (more is unreadable and
@@ -80,11 +80,11 @@ app's query history as \"Terminal\".
 
 examples:
   dbr orders.csv                               (opens it in DataBrain)
-  dbr -c sales report.sql --run                (opens and runs it there)
-  dbr -c \"Sales PG\" -i \"select * from orders limit 10\"
-  dbr -c sales -i report.sql -p day=2026-11-20
-  dbr -c sales -i -x \"select * from orders where id = 42\"
-  dbr -c sales -i --csv \"select * from orders\" > orders.csv
+  dbr -c Sales report.sql --run                (opens and runs it there)
+  dbr -c Sales -i \"select * from orders limit 10\"
+  dbr -c Sales -i report.sql -p day=2026-11-20
+  dbr -c Sales -i -x \"select * from orders where id = 42\"
+  dbr -c Sales -i --csv \"select * from orders\" > orders.csv
   dbr -i data.parquet orders.xlsx events/      (CSV, Parquet, JSON, Excel,
                                                Delta/Iceberg folders)
   dbr jobs run \"Daily load\"
@@ -324,9 +324,25 @@ pub fn row_limit(format: Format, limit: Option<usize>) -> Result<Option<usize>, 
 /// none, so a command never runs on a connection that wasn't meant: the
 /// error offers the names close to it (`dbr --connections` lists them all).
 pub fn find_connection<'a>(all: &'a [ConnectionProfile], name: &str) -> Result<&'a ConnectionProfile, String> {
-    let low = name.trim().to_lowercase();
-    if let Some(c) = all.iter().find(|c| c.name.trim().to_lowercase() == low || c.id == name) {
+    let typed = name.trim();
+    let low = typed.to_lowercase();
+    // The id first (what can't be two), then the name as spelled, then in any case.
+    if let Some(c) = all.iter().find(|c| c.id == typed) {
         return Ok(c);
+    }
+    for same in
+        [all.iter().filter(|c| c.name.trim() == typed).collect::<Vec<_>>(), all.iter().filter(|c| c.name.trim().to_lowercase() == low).collect::<Vec<_>>()]
+    {
+        match same.as_slice() {
+            [] => {}
+            [one] => return Ok(one),
+            many => {
+                return Err(format!(
+                    "several connections are named {name:?}: give one's id ({})",
+                    many.iter().map(|c| format!("{:?} is {}", c.name, c.id)).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
     }
     if all.is_empty() {
         return Err(format!("no connection named {name:?}: none is saved (add one in DataBrain)"));
@@ -347,7 +363,8 @@ fn close_names<'a>(names: impl Iterator<Item = &'a str>, typed: &str) -> Vec<&'a
         .filter_map(|n| {
             let low = n.trim().to_lowercase();
             let d = edit_distance(&low, typed);
-            let part = !typed.is_empty() && (low.contains(typed) || typed.contains(&low));
+            // Held in what was typed only when not a letter or two (`a` is in most words).
+            let part = !typed.is_empty() && (low.contains(typed) || (low.chars().count() >= 3 && typed.contains(&low)));
             (part || d <= (typed.chars().count() / 3).max(1)).then_some((if part { 0 } else { d }, n))
         })
         .collect();
@@ -379,12 +396,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     d[a.len()][b.len()]
-}
-
-/// Whether `e` is the connection failing to open (unreachable, refused
-/// sign-in), not a statement failing on it.
-fn connect_failed(e: &EngineError) -> bool {
-    matches!(e.kind.as_str(), "connection" | "auth")
 }
 
 /// Columns `s` takes on screen (East Asian wide characters take two).
@@ -620,36 +631,24 @@ pub fn main(args: Vec<String>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if opts.connections {
-        return match saved_connections(&background::data_dir()) {
-            Ok(all) => {
-                let mut names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
-                names.sort_by_key(|n| n.to_lowercase());
-                for n in names {
-                    println!("{n}");
-                }
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("dbr: {e}");
-                ExitCode::from(2)
-            }
-        };
+        // One a line (a line break in a name shown as a space); nothing
+        // when the workspace can't be read here.
+        let mut names: Vec<String> = saved_connections(&background::data_dir()).unwrap_or_default().iter().map(|c| flat(&c.name)).collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup();
+        for n in names {
+            println!("{n}");
+        }
+        return ExitCode::SUCCESS;
     }
     // -c's connection checked first, before anything connects or the app
     // starts: only that one is looked up.
-    if let Some(name) = opts.conn.as_deref() {
-        match saved_connections(&background::data_dir()) {
-            Ok(all) => {
-                if let Err(e) = find_connection(&all, name) {
-                    eprintln!("dbr: {e}");
-                    return ExitCode::from(2);
-                }
-            }
-            Err(e) => {
-                eprintln!("dbr: {e}");
-                return ExitCode::from(2);
-            }
-        }
+    if let Some(name) = opts.conn.as_deref()
+        && let Some(all) = saved_connections(&background::data_dir())
+        && let Err(e) = find_connection(&all, name)
+    {
+        eprintln!("dbr: {e}");
+        return ExitCode::from(2);
     }
     if !opts.inline {
         return open_in_app(&opts);
@@ -693,15 +692,16 @@ pub fn open_request(opts: &Opts) -> Result<crate::handoff::OpenRequest, String> 
     Ok(OpenRequest { connection: opts.conn.clone(), items, params: opts.params.clone(), run: opts.run })
 }
 
-/// The saved connections (none before DataBrain first ran: the workspace
-/// isn't made here), read without connecting to any.
-fn saved_connections(dir: &Path) -> Result<Vec<ConnectionProfile>, String> {
+/// The saved connections, read without connecting to any and without
+/// writing to the workspace (the app may have it open): `Some(empty)`
+/// before DataBrain first ran, `None` when this dbr can't read it so (a
+/// workspace of another DataBrain version): the app (or the run) decides.
+fn saved_connections(dir: &Path) -> Option<Vec<ConnectionProfile>> {
     let db = dir.join("workspace.db");
     if !db.is_file() {
-        return Ok(Vec::new());
+        return Some(Vec::new());
     }
-    let ws = databrain_workspace::Workspace::open(&db).map_err(|e| format!("cannot open the workspace in {}: {e}", dir.display()))?;
-    ws.list_connections().map_err(|e| e.to_string())
+    databrain_workspace::Workspace::read_connections(&db)
 }
 
 /// Longest wait for a DataBrain started here to answer.
@@ -899,6 +899,7 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
         }
     };
     let mut failed = false;
+    let (mut opened, mut conn_down) = (false, false);
     for job in &jobs {
         let conn = match (&named, job.local) {
             (Some(c), false) => c.clone(),
@@ -934,6 +935,31 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
             let (tap, rx) = state.engine.tap_rows(&tab_id);
             (Some(tap), Some(rx))
         };
+        // The named connection is opened (signed in) before its first
+        // statement, so an error there is the connection's; the run reuses
+        // the session. Once it can't be reached, the rest on it is skipped
+        // (said once); data files go on, on the local DuckDB.
+        if !job.local && named.is_some() {
+            if conn_down {
+                continue;
+            }
+            if !opened {
+                let open = tokio::select! {
+                    r = state.engine.open_session(&conn.id, &tab_id, Origin::Cli) => r,
+                    _ = cancel.cancelled() => {
+                        say!("dbr: stopped");
+                        return STOPPED;
+                    }
+                };
+                if let Err(e) = open {
+                    say!("dbr: couldn't connect to \"{}\": {}", conn.name, e.message);
+                    conn_down = true;
+                    failed = true;
+                    continue;
+                }
+                opened = true;
+            }
+        }
         let mut printer = Printer { format, index: None, columns: Vec::new(), keys: Vec::new(), header: true, broken: false };
         let req = |confirmed: bool| RunRequest {
             connection_id: conn.id.clone(),
@@ -990,10 +1016,6 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
         }
         let outcomes = match res {
             Ok(o) => o,
-            Err(e) if connect_failed(&e) => {
-                say!("dbr: couldn't connect to \"{}\": {}", conn.name, e.message);
-                return FAILED;
-            }
             Err(e) => {
                 say!("dbr: {}: {}", job.label, e.message);
                 failed = true;
@@ -1004,15 +1026,6 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
         for o in &outcomes {
             if n > 1 && format.is_table() {
                 let _ = writeln!(out, "-- statement {} of {n}", o.index + 1);
-            }
-            // The first statement: the connection never opened (a later one
-            // losing it is that statement's error).
-            if let Some(e) = &o.error
-                && o.index == 0
-                && connect_failed(e)
-            {
-                say!("dbr: couldn't connect to \"{}\": {}", conn.name, e.message);
-                return FAILED;
             }
             if let Some(e) = &o.error {
                 say!("dbr: {}statement {}: {}", if jobs.len() > 1 { format!("{}: ", job.label) } else { String::new() }, o.index + 1, e.message);
@@ -1516,6 +1529,25 @@ mod tests {
         assert_eq!(edit_distance("kitten", "sitting"), 3);
         assert_eq!(edit_distance("", "ab"), 2);
         assert_eq!(edit_distance("saels", "sales"), 1);
+        // The same name in two spellings: the exact one wins, any other is
+        // refused with their ids (never one picked by the list's order).
+        let mut two = vec![p("Prod"), p("prod"), p("Prod2")];
+        two[2].id = "prod".into(); // an id that is another's name: the id wins
+        assert_eq!(find_connection(&two, "prod").unwrap().name, "Prod2");
+        two[2].id = "id-other".into();
+        assert_eq!(find_connection(&two, "prod").unwrap().id, "id-prod");
+        assert_eq!(find_connection(&two, "Prod").unwrap().id, "id-Prod");
+        let e = find_connection(&two, "PROD").unwrap_err();
+        assert!(e.contains("several connections are named \"PROD\"") && e.contains("id-Prod") && e.contains("id-prod"), "{e}");
+        let same = vec![p("Prod"), ConnectionProfile { id: "id-2".into(), ..p("Prod") }];
+        assert!(find_connection(&same, "Prod").unwrap_err().contains("id-2"));
+        assert_eq!(find_connection(&same, " id-2 ").unwrap().id, "id-2");
+        // A one-letter name isn't offered for everything holding the letter.
+        let short = vec![p("a"), p("Analytics")];
+        assert_eq!(
+            find_connection(&short, "analytic").unwrap_err(),
+            "no connection named \"analytic\"; did you mean \"Analytics\"? (dbr --connections lists them)"
+        );
         assert_eq!(
             find_connection(&all, "Wraehouse").unwrap_err(),
             "no connection named \"Wraehouse\"; did you mean \"Warehouse\"? (dbr --connections lists them)"

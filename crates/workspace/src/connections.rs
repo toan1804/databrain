@@ -151,6 +151,29 @@ impl Workspace {
         rows.into_iter().collect()
     }
 
+    /// The saved connections of the workspace file at `path`, read without
+    /// opening it for writing: no migration, no maintenance, nothing written
+    /// (`dbr` checking a name while the app may have it open). `None` when
+    /// it can't be read so (another DataBrain version's schema, a file being
+    /// set up): the caller leaves the check to the app.
+    pub fn read_connections(path: &std::path::Path) -> Option<Vec<ConnectionProfile>> {
+        use rusqlite::{Connection, OpenFlags};
+        let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+        c.busy_timeout(std::time::Duration::from_secs(5)).ok()?;
+        let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0)).ok()?;
+        if usize::try_from(version).ok()? != Self::SCHEMA_VERSION {
+            return None;
+        }
+        let mut stmt = c
+            .prepare(
+                "SELECT id, name, config_json, color, env, folder_id, has_secret, created_at, updated_at, ai_policy_json \
+                 FROM connections ORDER BY sort_order, name COLLATE NOCASE",
+            )
+            .ok()?;
+        let rows = stmt.query_map([], connection_row).ok()?.collect::<rusqlite::Result<Vec<_>>>().ok()?;
+        rows.into_iter().collect::<Result<Vec<_>>>().ok()
+    }
+
     pub fn get_connection(&self, id: &str) -> Result<ConnectionProfile> {
         let c = self.conn.lock();
         c.query_row(
