@@ -2201,9 +2201,31 @@ async fn other_connections_with_the_same_login() {
     let ms = profile("ms", ConnectorKind::Mssql, "sql", None, "Sa", true, &[("instance", "PROD")]);
     assert!(same_login(&ms, &profile("ms2", ConnectorKind::Mssql, "sql", Some(1433), "sa", true, &[("instance", "prod")])));
     assert!(!same_login(&ms, &profile("ms3", ConnectorKind::Mssql, "sql", None, "sa", true, &[("instance", "TEST")])));
+    // Not through another SSH tunnel (the same host and port, another machine).
+    let mut tunnelled = profile("pg3", ConnectorKind::Postgres, "db.example.com", Some(5432), "me", true, &[]);
+    tunnelled.config.ssh = Some(databrain_connector_core::SshConfig {
+        host: "bastion".into(),
+        port: 22,
+        user: "ops".into(),
+        auth: databrain_connector_core::SshAuth::Agent,
+        host_key_fingerprint: None,
+    });
+    assert!(!same_login(&pg, &tunnelled));
     let ora = profile("ora", ConnectorKind::Oracle, "o", None, "APP", true, &[("service_name", "pdb1")]);
     assert!(same_login(&ora, &profile("ora2", ConnectorKind::Oracle, "o", None, "app", true, &[("service_name", "PDB1")])));
     assert!(!same_login(&ora, &profile("ora3", ConnectorKind::Oracle, "o", None, "app", true, &[("service_name", "pdb2")])));
+    // The service may be the database field instead; a connect string picks its own.
+    let by_db = |name: &str, db: &str| {
+        let mut p = profile(name, ConnectorKind::Oracle, "o", None, "app", true, &[]);
+        p.config.database = Some(db.into());
+        p
+    };
+    assert!(same_login(&ora, &by_db("ora4", "PDB1")));
+    assert!(!same_login(&by_db("ora5", "PDB1"), &by_db("ora6", "PDB2")));
+    assert!(!same_login(
+        &ora,
+        &profile("ora7", ConnectorKind::Oracle, "o", None, "app", true, &[("service_name", "pdb1"), ("connect_string", "other:1521/pdb1")])
+    ));
 
     // Updating: one that isn't the same login is refused; one where the new
     // password can't be checked (no server here) keeps its own.
@@ -2229,7 +2251,10 @@ async fn other_connections_with_the_same_login() {
     // A wrong password, as each database says it.
     let err = |code: Option<&str>, message: &str| EngineError { code: code.map(str::to_string), ..EngineError::new("connection", message) };
     assert!(password_refused(&err(None, "password authentication failed for user \"me\"")));
-    assert!(password_refused(&err(Some("1045"), "Access denied for user 'me'@'%' (using password: YES)")));
+    assert!(password_refused(&err(Some("1045 (28000)"), "Zugriff verweigert")), "the code, whatever the language");
+    assert!(password_refused(&err(Some("18456 (line 1)"), "Échec de l'ouverture de session")));
+    assert!(password_refused(&err(None, "Access denied for user 'me'@'%' (using password: YES)")));
+    assert!(!password_refused(&err(Some("28000"), "no pg_hba.conf entry for host")), "not a wrong password");
     assert!(password_refused(&err(None, "Login failed for user 'me'.")));
     assert!(password_refused(&err(None, "ORA-01017: invalid username/password; logon denied")));
     assert!(!password_refused(&err(None, "Connection refused (os error 61)")));

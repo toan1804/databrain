@@ -50,7 +50,10 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
     try {
       const done = await api.updateSavedPasswords(conn.id, [...picked], next);
       const failed = done.filter((d) => d.error);
-      if (!failed.length) {
+      if (!done.length) {
+        useStore.getState().toast("Those connections are no longer saved", "info");
+        onClose();
+      } else if (!failed.length) {
         useStore.getState().toast(`New password saved for ${done.length} other connection${done.length === 1 ? "" : "s"}`, "success");
         onClose();
       } else setResults(done);
@@ -85,8 +88,8 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
       >
         <div className="space-y-3 text-[12.5px]">
           <p className="text-muted">
-            {others.length === 1 ? "This connection also signs" : "These connections also sign"} in as {user} on the same server, with the old password saved. Each is
-            updated once the new password signs in there.
+            {others.length === 1 ? "This connection also signs" : "These connections also sign"} in as {user} on the same server (through the same SSH tunnel), with a password
+            saved. Each is updated once the new password signs in there; the others keep theirs.
           </p>
           <ul className="space-y-1">
             {others.map((o) => {
