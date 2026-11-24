@@ -172,6 +172,11 @@ const SECRET_SAFE_OPTIONS: &[&str] = &[
     "excel_sheets",
     "connect_timeout_secs",
     "idle_disconnect_minutes",
+    // Oracle's driver (thin or Instant Client): the same server, user and
+    // connect string either way, and the password is never sent as it is
+    // (O5LOGON). Not `client_lib_dir`: another folder is other code that
+    // sees the password.
+    "driver",
 ];
 
 impl ConnectionConfig {
@@ -857,5 +862,26 @@ mod secret_destination_tests {
         c.options.insert("schema".into(), "sales".into());
         c.options.insert("connect_timeout_secs".into(), "30".into());
         assert_eq!(c.secret_destination(), base);
+    }
+
+    /// Oracle: switching the driver (thin, Instant Client) keeps the saved
+    /// password; another Instant Client folder or connect string doesn't.
+    #[test]
+    fn the_oracle_driver_is_the_same_destination() {
+        let ora = |driver: Option<&str>| {
+            let mut c = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: "app".into() });
+            c.host = Some("ora.example.com".into());
+            c.options.insert("service_name".into(), "PDB1".into());
+            if let Some(d) = driver {
+                c.options.insert("driver".into(), d.into());
+            }
+            c
+        };
+        let base = ora(None).secret_destination();
+        assert_eq!(ora(Some("instant_client")).secret_destination(), base);
+        assert_eq!(ora(Some("thin")).secret_destination(), base);
+        let mut lib = ora(Some("instant_client"));
+        lib.options.insert("client_lib_dir".into(), "/tmp/other".into());
+        assert_ne!(lib.secret_destination(), base);
     }
 }

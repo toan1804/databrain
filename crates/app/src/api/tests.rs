@@ -2335,3 +2335,28 @@ async fn live_password_change_updates_the_other_connections() {
     st.engine.disconnect(&two.id);
     let _ = st.engine.run_and_wait(&st.hub, run("drop role kb_pw2"), None).await;
 }
+
+/// Oracle: switching the driver (thin ↔ Instant Client) in the connection's
+/// settings keeps its saved password (the same server and user); a new
+/// server still drops it (it is only sent where it was saved for).
+#[test]
+fn switching_the_oracle_driver_keeps_the_saved_password() {
+    use secrecy::ExposeSecret;
+    let (st, _sink, _dir) = state();
+    let mut cfg = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: "app".into() });
+    cfg.host = Some("ora.example.com".into());
+    cfg.options.insert("service_name".into(), "PDB1".into());
+    let saved = save_profile(&st, "Ora", cfg, Some("hunter2"));
+    let secret = || st.secrets.get(&SecretRef::for_connection(&saved.id)).unwrap().map(|s| s.expose_secret().to_string());
+    for driver in ["instant_client", "thin", ""] {
+        let mut p = st.workspace.get_connection(&saved.id).unwrap();
+        p.config.options.insert("driver".into(), driver.into());
+        let kept = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+        assert!(kept.has_secret, "driver {driver:?}");
+        assert_eq!(secret().as_deref(), Some("hunter2"), "driver {driver:?}");
+    }
+    let mut p = st.workspace.get_connection(&saved.id).unwrap();
+    p.config.host = Some("other.example.com".into());
+    let moved = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+    assert!(!moved.has_secret && secret().is_none(), "another server: typed again");
+}
