@@ -246,13 +246,15 @@ export const api = {
   completeRoutines: (id: string, schema: string | null, query: string, limit: number) =>
     call<DbObject[]>("complete_routines", { id, schema, query, limit }),
   /** Full DDL of a table, view or routine (null when the engine can't produce it). */
-  objectDdl: (id: string, schema: string, name: string, kind: ObjectKind) => call<string | null>("object_ddl", { id, schema, name, kind }),
+  /** `fresh`: asked of the server now (Reload); otherwise a table's DDL may come with its description of the last half minute. */
+  objectDdl: (id: string, schema: string, name: string, kind: ObjectKind, fresh = false) => call<string | null>("object_ddl", { id, schema, name, kind, fresh }),
   /** Functions/procedures of an Oracle package. */
   packageMembers: (id: string, schema: string, pkg: string) => call<DbObject[]>("package_members", { id, schema, package: pkg }),
   completeColumnsLocal: (id: string, schema: string, name: string) =>
     call<string[] | null>("complete_columns_local", { id, schema, name }),
-  describeObject: (id: string, schema: string, name: string) =>
-    call<ObjectDetail>("describe_object", { id, schema, name }),
+  /** `fresh`: asked of the server now (Refresh); otherwise one made in the last half minute is reused. */
+  describeObject: (id: string, schema: string, name: string, fresh = false) =>
+    call<ObjectDetail>("describe_object", { id, schema, name, fresh }),
   /** A schema's tables for the ER diagram: live, or the explorer cache's when the server can't be read (`offline` says why). */
   schemaTables: (id: string, schema: string) => call<SchemaTables>("schema_tables", { id, schema }),
   tableLayout: (id: string, schema: string, name: string) => call<TableLayout>("table_layout", { id, schema, name }),

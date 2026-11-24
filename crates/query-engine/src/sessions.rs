@@ -224,6 +224,7 @@ impl QueryEngine {
     /// Running statements on it are stopped: a script's next statement
     /// would otherwise reconnect and run outside the transaction it began.
     pub fn disconnect(&self, connection_id: &str) {
+        self.forget_descriptions(connection_id);
         for j in self.jobs.lock().values().filter(|j| j.connection_id == connection_id) {
             j.cancel.cancel();
         }
@@ -238,6 +239,7 @@ impl QueryEngine {
     /// only, such as Oracle roles granted since the login. Returns how many
     /// sessions were closed.
     pub fn reconnect(&self, connection_id: &str) -> usize {
+        self.forget_descriptions(connection_id);
         let busy: Vec<String> = self.jobs.lock().values().map(|j| j.session_key.clone()).collect();
         self.drop_sessions(|(c, key), live| {
             if c != connection_id {

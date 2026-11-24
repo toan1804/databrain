@@ -428,6 +428,11 @@ impl Session for OracleSession {
     /// Built from the ALL_* views (see [`ddl`]): works for every object the
     /// user can see, with a few small queries. DBMS_METADATA only when
     /// that gives nothing (e.g. a wrapped or invisible source).
+    /// Its table DDL is fuller than describe's (constraints, indexes; Oracle's describe has none).
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
     async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
         let kind = self.object_kind(schema, name).await.unwrap_or(None).unwrap_or(kind);
         let built = self.dictionary_ddl(schema, name, kind).await;

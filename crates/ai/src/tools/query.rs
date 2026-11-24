@@ -317,7 +317,9 @@ impl ToolContext {
             }
             for v in missing {
                 let Some((schema, name)) = ws.meta_get(&o.connection_id, &v).ok().flatten() else { continue };
-                let read = self.engine.object_ddl(&o.connection_id, &schema, &name, databrain_connector_core::ObjectKind::View);
+                // Fresh: masking follows the view as it is now, never a
+                // description kept from before it was redefined.
+                let read = self.engine.object_ddl_with(&o.connection_id, &schema, &name, databrain_connector_core::ObjectKind::View, true);
                 if tokio::time::timeout_at(deadline, read).await.is_err() {
                     return;
                 }

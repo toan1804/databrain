@@ -306,6 +306,12 @@ impl QueryEngine {
                 Err(e) => Err(e),
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
+            // What may have changed a table (DDL; a call or block we can't
+            // tell): its kept descriptions go, even after an error (part of
+            // a script may have run).
+            if matches!(stmt.classification().kind, StatementKind::Ddl | StatementKind::Other | StatementKind::Unknown) {
+                self.forget_descriptions(&req.connection_id);
+            }
 
             let output = match &outcome {
                 Ok(StatementOutcome { result: Some(r), .. }) => Some(Box::new(self.outputs.add(NewOutput {

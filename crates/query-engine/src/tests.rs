@@ -1528,3 +1528,148 @@ async fn a_load_of_a_result_on_disk_knows_its_total() {
     assert!(seen.len() > 2 && seen.iter().all(|(_, total)| *total == 300_000), "{:?}", &seen[..seen.len().min(5)]);
     assert_eq!(seen.last().unwrap().0, 300_000);
 }
+
+/// A Databricks stand-in counting its table descriptions (each slow, so two
+/// at once overlap); `fail` makes them fail.
+struct DescribeCounting(Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>);
+struct DescribeCountingSession(Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>);
+
+#[async_trait::async_trait]
+impl databrain_connector_core::Connector for DescribeCounting {
+    fn info(&self) -> databrain_connector_core::ConnectorInfo {
+        databrain_connector_core::ConnectorInfo {
+            kind: ConnectorKind::Databricks,
+            traits: ConnectorKind::Databricks.traits(),
+            display_name: "Databricks (test)",
+            default_port: None,
+            uses_file: false,
+            auth_methods: vec![],
+            capabilities: databrain_connector_core::Capabilities { ssh: false },
+            fields: vec![],
+            note: None,
+        }
+    }
+    async fn connect(&self, _: &ConnectionConfig, _: Arc<dyn CredentialSource>) -> databrain_connector_core::Result<Box<dyn Session>> {
+        Ok(Box::new(DescribeCountingSession(self.0.clone(), self.1.clone())))
+    }
+}
+
+#[async_trait::async_trait]
+impl Session for DescribeCountingSession {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind::Databricks
+    }
+    async fn server_version(&self) -> databrain_connector_core::Result<String> {
+        Ok("test".into())
+    }
+    async fn ping(&self) -> databrain_connector_core::Result<()> {
+        Ok(())
+    }
+    async fn execute(
+        &self,
+        _: databrain_connector_core::Statement<'_>,
+        _: ExecOptions,
+    ) -> databrain_connector_core::Result<databrain_connector_core::QueryStream> {
+        let (tx, stream) = databrain_connector_core::QueryStream::channel(1);
+        tokio::spawn(async move {
+            tx.send(databrain_connector_core::StreamEvent::Done(Default::default())).await;
+        });
+        Ok(stream)
+    }
+    async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<SchemaInfo>> {
+        Ok(vec![])
+    }
+    async fn list_objects(&self, _: &str) -> databrain_connector_core::Result<Vec<DbObject>> {
+        Ok(vec![])
+    }
+    async fn describe(&self, schema: &str, name: &str) -> databrain_connector_core::Result<ObjectDetail> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConnectorError::query("no such table"));
+        }
+        Ok(ObjectDetail {
+            object: DbObject { schema: schema.into(), name: name.into(), kind: databrain_connector_core::ObjectKind::Table, comment: None, row_estimate: None },
+            columns: vec![],
+            ddl: Some(format!("CREATE TABLE {name} (id INT)")),
+            foreign_keys: vec![],
+        })
+    }
+}
+
+/// Opening a table describes it twice (the explorer's click, the tab):
+/// the server is asked once; again after Refresh (`fresh`), DDL run on the
+/// connection or a reconnect; an error isn't kept.
+#[tokio::test]
+async fn a_table_is_described_once_for_callers_together() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (calls, fail) = (Arc::new(std::sync::atomic::AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(DescribeCounting(calls.clone(), fail.clone())));
+    let ws = Arc::new(Workspace::open_in_memory().unwrap());
+    let p = ws
+        .save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "DBX".into(),
+            config: ConnectionConfig::new(ConnectorKind::Databricks, AuthMethod::None),
+            color: None,
+            env: EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    let engine = QueryEngine::new(reg, ws, Arc::new(MemoryStore::default()), Arc::new(ResultStore::new()), Arc::new(CollectingSink::default()));
+    let id = p.id.clone();
+    // Two at once (the tree and the tab), then a third a moment later.
+    let (a, b) = tokio::join!(engine.describe(&id, "main.sales", "orders"), engine.describe(&id, "main.sales", "orders"));
+    assert_eq!(a.unwrap().ddl, b.unwrap().ddl);
+    engine.describe(&id, "main.sales", "orders").await.unwrap();
+    assert_eq!(calls.load(SeqCst), 1, "described once");
+    // The DDL tab: its DDL comes with the description (no query); Reload asks.
+    let ddl = engine.object_ddl(&id, "main.sales", "orders", databrain_connector_core::ObjectKind::Table).await.unwrap();
+    assert_eq!(ddl.as_deref(), Some("CREATE TABLE orders (id INT)"));
+    assert_eq!(calls.load(SeqCst), 1, "the DDL from the description");
+    engine.object_ddl_with(&id, "main.sales", "orders", databrain_connector_core::ObjectKind::Table, true).await.unwrap();
+    assert_eq!(calls.load(SeqCst), 2, "Reload asks again");
+    calls.store(1, SeqCst);
+    // Another table is its own.
+    engine.describe(&id, "main.sales", "customers").await.unwrap();
+    assert_eq!(calls.load(SeqCst), 2);
+    // Refresh asks again, and what it read is reused after.
+    engine.describe_fresh(&id, "main.sales", "orders").await.unwrap();
+    engine.describe(&id, "main.sales", "orders").await.unwrap();
+    assert_eq!(calls.load(SeqCst), 3);
+    // DDL run on the connection forgets them; a read doesn't.
+    let r = |sql: &str| RunRequest {
+        connection_id: id.clone(),
+        tab_id: "t".into(),
+        sql: sql.into(),
+        base_offset: 0,
+        row_limit: Some(10),
+        confirmed: true,
+        origin: Origin::User,
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+    };
+    let hub = crate::EventHub::new(Arc::new(CollectingSink::default()));
+    let _ = engine.run_and_wait(&hub, r("select 1"), None).await;
+    engine.describe(&id, "main.sales", "orders").await.unwrap();
+    assert_eq!(calls.load(SeqCst), 3, "a read keeps them");
+    let _ = engine.run_and_wait(&hub, r("alter table main.sales.orders add column note string"), None).await;
+    engine.describe(&id, "main.sales", "orders").await.unwrap();
+    assert_eq!(calls.load(SeqCst), 4, "DDL forgets them");
+    engine.reconnect(&id);
+    engine.describe(&id, "main.sales", "orders").await.unwrap();
+    assert_eq!(calls.load(SeqCst), 5, "a reconnect forgets them");
+    // An error isn't kept.
+    fail.store(true, SeqCst);
+    assert!(engine.describe(&id, "main.sales", "new_t").await.is_err());
+    fail.store(false, SeqCst);
+    engine.describe(&id, "main.sales", "new_t").await.unwrap();
+    assert_eq!(calls.load(SeqCst), 7);
+}

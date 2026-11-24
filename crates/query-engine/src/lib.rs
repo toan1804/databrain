@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 pub mod compare;
 mod connect;
+mod describe_cache;
+pub use describe_cache::DESCRIBE_KEEP;
 pub mod edit;
 mod error;
 mod events;
@@ -225,6 +227,8 @@ pub struct QueryEngine {
     /// Session keys (tabs) in manual-commit mode: writes open a transaction
     /// the user ends with Commit or Rollback.
     manual_commit: Mutex<std::collections::HashSet<String>>,
+    /// Table descriptions in progress or recent ([`describe_cache`]).
+    describes: describe_cache::DescribeCache,
 }
 
 impl QueryEngine {
@@ -251,6 +255,7 @@ impl QueryEngine {
             exported: Mutex::new(std::collections::VecDeque::new()),
             outputs: OutputRegistry::new(results.clone(), workspace.clone()),
             manual_commit: Mutex::new(Default::default()),
+            describes: Default::default(),
             results,
         })
     }

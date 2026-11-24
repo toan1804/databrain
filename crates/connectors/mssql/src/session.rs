@@ -582,6 +582,11 @@ impl Session for MssqlSession {
 
     /// Tables: columns plus keys, foreign keys, checks and indexes. Views,
     /// procedures and functions: their definition.
+    /// Its table DDL is fuller than describe's (constraints, indexes; Oracle's describe has none).
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
     async fn object_ddl(&self, schema: &str, name: &str, _kind: ObjectKind) -> Result<Option<String>> {
         let (d, fills) = self.describe_with_fills(schema, name).await?;
         if d.object.kind != ObjectKind::Table {
