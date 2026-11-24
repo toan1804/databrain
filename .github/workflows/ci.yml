@@ -78,6 +78,19 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --no-fail-fast
 
+      # The thin Oracle driver's helper (Go): its own tests (the stop
+      # watchdog, the request loop), on Linux only.
+      - uses: actions/setup-go@v6
+        if: runner.os == 'Linux'
+        with:
+          go-version-file: crates/connectors/oracle/agent/go.mod
+          cache-dependency-path: crates/connectors/oracle/agent/go.sum
+
+      - name: Oracle helper tests (Go)
+        if: runner.os == 'Linux'
+        working-directory: crates/connectors/oracle/agent
+        run: go vet ./... && go test ./...
+
       # `cargo test` writes the TypeScript bindings of the Rust types (ts-rs):
       # they must be the ones committed.
       - name: TypeScript bindings up to date

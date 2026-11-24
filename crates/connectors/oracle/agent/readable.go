@@ -1,9 +1,13 @@
 // Columns go-ora can't decode (Oracle object types: SDO_GEOMETRY, XMLTYPE,
 // user-defined objects and collections, REFs, native JSON / VECTOR): go-ora
-// stops with "TTC error: received code … during response reading" (or, for
-// an XMLTYPE table column, "invalid size for GetInt64") and the
-// connection's protocol stream may be out of step. The query is then run again,
-// on a new connection, with those columns converted to text on the server.
+// loses its place in the server's reply. Sometimes it stops with an error
+// ("TTC error: received code … during response reading", "invalid size for
+// GetInt64"); but when the bytes it misreads look like a valid length, it
+// waits for that many more, which never come, and both sides wait forever.
+// So a query is described first (no row is read) and its columns of an
+// object type are converted to text on the server before it runs
+// (readableFirst). The run-again-after-an-error path stays for a query that
+// can't be described that way.
 package main
 
 import (
@@ -11,6 +15,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	go_ora "github.com/sijms/go-ora/v2"
 )
 
 // undecodable: go-ora failed to decode a value of the result.
@@ -156,4 +162,96 @@ func (s *session) retryReadable(ctx context.Context, w *writer, r *request, caus
 		return unreadableHint(cause, err)
 	}
 	return err
+}
+
+// maxPlain bounds the remembered query texts (a session running ever new SQL).
+const maxPlain = 512
+
+// readableFirst describes the query (DBMS_SQL: nothing runs or is read) and,
+// when a column is of a type go-ora can't decode, returns it with that
+// column converted to text before anything is read. A query found to have
+// none is remembered by its text (until the session reconnects, as after a
+// stop the helper gave up on, or runs an exec): it isn't described again.
+// One with such a column is described each time (a column list kept could
+// miss one another session added). A query that can't be described or
+// converted (a parse error, two columns of a name, FOR UPDATE, WITH
+// FUNCTION) runs as it is, as before; should go-ora then wait on it, Stop
+// ends it (cancelGrace).
+func (s *session) readableFirst(ctx context.Context, r *request) *request {
+	if len(r.labels) > 0 || !isSelect(r.SQL) || s.plain[r.SQL] {
+		return r
+	}
+	found, err := s.hasObjectColumn(ctx, r.SQL)
+	if err != nil || !found {
+		// Answered (no such column, or the server's own error, which the
+		// query will give): remembered. Not answered: not.
+		if err == nil || !(ctx.Err() != nil || lostConn(err)) {
+			if s.plain == nil || len(s.plain) >= maxPlain {
+				s.plain = map[string]bool{}
+			}
+			s.plain[r.SQL] = true
+		}
+		return r
+	}
+	query, labels, err := s.readablePlan(ctx, r)
+	if err != nil {
+		return r
+	}
+	out := *r
+	out.SQL, out.labels = query, labels
+	return &out
+}
+
+// describeSQL parses :1 (a SELECT; parse runs nothing) and returns its
+// columns' type codes, each followed by a comma.
+const describeSQL = "declare c integer; n integer; d dbms_sql.desc_tab2; r varchar2(32767); " +
+	"begin c := dbms_sql.open_cursor; " +
+	"begin dbms_sql.parse(c, :1, dbms_sql.native); dbms_sql.describe_columns2(c, n, d); " +
+	"exception when others then dbms_sql.close_cursor(c); raise; end; " +
+	"for i in 1 .. n loop r := r || d(i).col_type || ','; end loop; " +
+	"dbms_sql.close_cursor(c); :2 := r; end;"
+
+// objectTypeCodes: DBMS_SQL's codes of the types go-ora may not decode
+// (named types: objects, collections, XMLTYPE, SDO_GEOMETRY; REF; opaque;
+// VECTOR). Not native JSON (119): go-ora reads it, as a BLOB.
+var objectTypeCodes = map[string]bool{"58": true, "109": true, "111": true, "127": true}
+
+// isSelect: the statement starts with SELECT or WITH (past comments, in any
+// case, `select*from` and `select/**/` too) or a parenthesis: only those are
+// parsed with DBMS_SQL, which would run DDL at parse.
+func isSelect(sql string) bool {
+	t := strings.ToUpper(stripComments(sql))
+	if strings.HasPrefix(t, "(") {
+		return true
+	}
+	end := strings.IndexFunc(t, func(c rune) bool { return c < 'A' || c > 'Z' })
+	if end < 0 {
+		end = len(t)
+	}
+	return t[:end] == "SELECT" || t[:end] == "WITH"
+}
+
+// hasObjectColumn: whether the query returns a column of an object type,
+// asked of the server without running it (DBMS_SQL describes any SELECT,
+// one with two columns of a name too). The text is bound as a VARCHAR2
+// (fewer round trips than a CLOB), as a CLOB past 32 KB.
+func (s *session) hasObjectColumn(ctx context.Context, query string) (bool, error) {
+	t, err := s.target(ctx)
+	if err != nil {
+		return false, err
+	}
+	var text any = query
+	if len(query) > 32000 {
+		text = go_ora.Clob{String: query, Valid: true}
+	}
+	var codes string
+	if _, err := t.ExecContext(ctx, describeSQL, text, go_ora.Out{Dest: &codes, Size: 32767}); err != nil {
+		return false, err
+	}
+	for _, c := range strings.Split(codes, ",") {
+		if objectTypeCodes[strings.TrimSpace(c)] {
+			return true, nil
+		}
+	}
+	return false, nil
 }

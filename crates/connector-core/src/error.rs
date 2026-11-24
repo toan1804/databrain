@@ -46,6 +46,11 @@ impl ConnectorError {
     pub fn cancelled() -> Self {
         Self::new(ErrorKind::Cancelled, "Query cancelled")
     }
+    /// Stopped by ending the session (its driver didn't stop the statement):
+    /// the engine drops the session, so the next statement opens a new one.
+    pub fn cancelled_session_ended() -> Self {
+        Self::cancelled().with_code(SESSION_ENDED)
+    }
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Unsupported, message)
     }
@@ -72,6 +77,9 @@ impl ConnectorError {
         password_expired(self.code.as_deref(), &self.message)
     }
 }
+
+/// [`ConnectorError::code`] of a stop that ended the session.
+pub const SESSION_ENDED: &str = "session_ended";
 
 /// Whether a driver's `code` and `message` say the password expired:
 /// Oracle ORA-28001; MySQL 1862 (refused at sign-in) and 1820 (signed in,
