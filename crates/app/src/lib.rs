@@ -6,6 +6,7 @@ pub mod background;
 pub mod cli;
 mod commands;
 pub mod conn_io;
+pub mod dbr_install;
 pub mod handoff;
 pub mod jobs;
 pub mod logging;
@@ -421,6 +422,8 @@ pub fn run() {
             commands::ai::ai_provider_sign_in,
             commands::ai::ai_provider_status,
             commands::system::terminal_options,
+            commands::system::dbr_command_status,
+            commands::system::install_dbr_command,
             commands::system::duckdb_engine_status,
             commands::drivers::duckdb_engine_load,
             commands::ai::ai_provider_usage,

@@ -157,6 +157,16 @@ impl QueryEngine {
         Ok(RunResponse::Started { job_id, statements: plan })
     }
 
+    /// Hand the rows of the statements run for tab `tab_id` to the returned
+    /// receiver as they are read, until the [`RowTap`] is dropped: what the
+    /// result keeps after the row limit, batch by batch. The run waits for
+    /// the receiver when it falls behind (at most a few batches queue).
+    pub fn tap_rows(self: &Arc<Self>, tab_id: &str) -> (RowTap, tokio::sync::mpsc::Receiver<TappedBatch>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        self.taps.lock().insert(tab_id.to_string(), tx);
+        (RowTap { engine: self.clone(), tab_id: tab_id.to_string() }, rx)
+    }
+
     /// Run and wait for completion (for the AI agent / MCP and job steps);
     /// `confirmed` skips the interactive safety prompt because the caller
     /// has already enforced its own policy.
@@ -606,6 +616,16 @@ impl QueryEngine {
                     if !on_disk {
                         bytes += databrain_connector_core::memory_size([&batch]);
                     }
+                    // Handed on as read, when the tab is tapped (`dbr --csv`):
+                    // the rows kept after the row limit and the cuts above (a
+                    // later failed write to disk can still drop some from the
+                    // result). A slow reader slows the query.
+                    let tap = self.taps.lock().get(&req.tab_id).cloned();
+                    if let Some(tap) = tap
+                        && batch.num_rows() > 0
+                    {
+                        let _ = tap.send(TappedBatch { index: stmt.index, batch: batch.clone() }).await;
+                    }
                     // On disk a file due is written outside the lock (the
                     // grid and the outputs list read the result meanwhile).
                     let job = rs.lock().push_deferred(batch);
@@ -832,5 +852,24 @@ fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
         _ => f(),
+    }
+}
+
+/// Rows of statement `index` as they were read ([`QueryEngine::tap_rows`]).
+#[derive(Debug, Clone)]
+pub struct TappedBatch {
+    pub index: usize,
+    pub batch: databrain_connector_core::arrow::record_batch::RecordBatch,
+}
+
+/// While held, the tab's rows are handed on ([`QueryEngine::tap_rows`]).
+pub struct RowTap {
+    engine: Arc<QueryEngine>,
+    tab_id: String,
+}
+
+impl Drop for RowTap {
+    fn drop(&mut self) {
+        self.engine.taps.lock().remove(&self.tab_id);
     }
 }

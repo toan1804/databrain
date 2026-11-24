@@ -130,6 +130,7 @@ import type {
   TerminalSetting,
 } from "./types";
 import type { RowChange } from "./gridEdits";
+import type { DbrCommand } from "./bindings/DbrCommand";
 import type { DbrOpen } from "./bindings/DbrOpen";
 
 export const isTauri = (): boolean =>
@@ -453,6 +454,10 @@ export const api = {
   /** Run scheduled jobs also when the app is closed (installs or removes the OS entry). */
   setBackgroundJobs: (on: boolean) => call<BackgroundStatus>("set_background_jobs", { on }),
   terminalOptions: () => call<TerminalOption[]>("terminal_options"),
+  /** Where the `dbr` command stands (on the PATH or not). */
+  dbrCommandStatus: () => call<DbrCommand>("dbr_command_status"),
+  /** Put `dbr` on the PATH; where it stands then. */
+  installDbrCommand: () => call<DbrCommand>("install_dbr_command"),
   appInDownloads: () => call<string | null>("app_in_downloads"),
   moveToApplications: (replace: boolean) => call<void>("move_to_applications", { replace }),
   terminalTest: (setting: TerminalSetting) => call<TerminalLaunch>("terminal_test", { setting }),
