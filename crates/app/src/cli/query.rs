@@ -37,6 +37,7 @@ use crate::background;
 const USAGE: &str = "usage: dbr [-c <connection>] [--run] [-p name=value]… <sql | file.sql | data file>…   (opens them in DataBrain)
        dbr [-c <connection>] -i [--csv|--json|--tsv|-x] [--limit N] [-p name=value]… [--yes] <sql | file.sql | data file>…
        dbr jobs list | run <job> | runs <job> | stop <job>   (dbr jobs --help)
+       dbr completions zsh|bash   (Tab completion, connection names too)
        dbr --help | --version";
 
 /// `dbr --help`: what it does, its options, examples and exit codes.
@@ -88,6 +89,10 @@ examples:
   dbr -i data.parquet orders.xlsx events/      (CSV, Parquet, JSON, Excel,
                                                Delta/Iceberg folders)
   dbr jobs run \"Daily load\"
+
+Tab completion (options, and the connections' names after -c): add
+  eval \"$(dbr completions zsh)\"    to ~/.zshrc (after compinit), or
+  eval \"$(dbr completions bash)\"   to ~/.bashrc (~/.bash_profile on macOS).
 
 exit codes: 0 done (opened in the app), 1 a statement failed, 2 bad
 arguments (an unknown connection too), a question answered no or the app
@@ -608,6 +613,10 @@ pub fn main(args: Vec<String>) -> ExitCode {
     // `dbr jobs …`: the jobs commands (list, run, runs, stop).
     if args.first().map(String::as_str) == Some("jobs") {
         return crate::cli::jobs::main(args[1..].to_vec());
+    }
+    // `dbr completions zsh|bash`: the shell's Tab completion.
+    if args.first().map(String::as_str) == Some("completions") {
+        return crate::cli::completions::main(&args[1..]);
     }
     // Nothing to run: what dbr does, rather than an error.
     if args.is_empty() {

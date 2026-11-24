@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- **Tab completion for `dbr`:** `eval "$(dbr completions zsh)"` in `~/.zshrc` (or `bash` in `~/.bashrc`) completes the options, files and, after `-c`, the saved connections' names in any case, read at each Tab.
 - **`dbr -i -x` shows long values whole:** each row as a record, a line per column, with long values wrapped to the terminal instead of cut at 40 characters (as `psql`'s `\x`); `--expanded` is the same.
 
 ### Fixed
