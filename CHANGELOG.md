@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Changed
+
+- **`dbr --csv`, `--json` and `--tsv` print rows as the query returns them:** the first lines come while it still runs (they waited for the whole result before), a slow reader holds the query up, and `| head` stops it.
+
 ### Added
 
 - **`dbr` opens files in the app:** without `-i`, `dbr orders.csv` opens the file's rows in a tab of the running DataBrain (started when it isn't), `dbr -c sales report.sql` opens the `.sql` file there on that connection (`--run` runs it too), and `dbr -c sales "select …"` opens the SQL in a new tab and runs it, as the editor runs it: the read-only setting and the production confirmation apply. `-i` still prints the rows in the terminal.

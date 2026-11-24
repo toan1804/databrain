@@ -194,3 +194,83 @@ fn pathdiff(p: &std::path::Path) -> String {
         }
     }
 }
+
+/// CSV, JSON and TSV are printed as the rows are read: the first rows come
+/// while the query still runs, and a reader that falls behind holds it up
+/// (a few batches queue, no more).
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_come_while_the_query_runs() {
+    let st = state();
+    let dir = tempfile::tempdir().unwrap();
+    sqlite(&st, "Big", &dir.path().join("big.db"), EnvTag::None, false);
+    let conn = st.workspace.list_connections().unwrap().into_iter().find(|c| c.name == "Big").unwrap();
+    let (tap, mut rx) = st.engine.tap_rows("cli:tapped");
+    let engine = st.engine.clone();
+    let hub = st.hub.clone();
+    let req = databrain_query_engine::RunRequest {
+        connection_id: conn.id.clone(),
+        tab_id: "cli:tapped".into(),
+        sql: "with recursive c(i) as (select 1 union all select i + 1 from c where i < 200000) select i from c".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: false,
+        origin: Origin::Cli,
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+    };
+    let run = tokio::spawn(async move { engine.run_and_wait(&hub, req, None).await });
+    let first = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
+    assert_eq!(first.index, 0);
+    assert!(first.batch.num_rows() > 0);
+    // Not read further: the query waits for the reader.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!run.is_finished(), "the query ran on without its reader");
+    // Read to the end: every row, in order, then the run ends.
+    let mut rows = first.batch.num_rows();
+    while let Some(b) = rx.recv().await {
+        rows += b.batch.num_rows();
+        if rows >= 200_000 {
+            break;
+        }
+    }
+    assert_eq!(rows, 200_000);
+    let out = run.await.unwrap().unwrap();
+    assert_eq!(out[0].result.as_ref().unwrap().total_rows, 200_000);
+    drop(tap);
+    assert!(st.engine.tap_rows("cli:other").1.try_recv().is_err());
+}
+
+/// A reader that goes away (`dbr --csv … | head`) stops the query, and
+/// dbr ends quietly (exit 0), as a pipe expects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_that_goes_away_stops_the_query() {
+    struct Head(usize);
+    impl std::io::Write for Head {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            self.0 -= 1;
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let st = state();
+    let dir = tempfile::tempdir().unwrap();
+    sqlite(&st, "Big", &dir.path().join("big.db"), EnvTag::None, false);
+    let args: Vec<String> = ["-c", "Big", "-i", "--csv", "with recursive c(i) as (select 1 union all select i + 1 from c where i < 100000000) select i from c"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let opts = parse(&args, |_| false).unwrap();
+    let (mut out, mut err) = (Head(1), Vec::new());
+    let ask = |_: &str| Answer::NoTerminal;
+    let started = std::time::Instant::now();
+    let code = run_with(&st, opts, Io { out: &mut out, err: &mut err, ask: &ask, cancel: Default::default() }, Terminal { out: false, width: 120 }).await;
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "the query wasn't stopped: {:?}", started.elapsed());
+}
