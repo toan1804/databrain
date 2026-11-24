@@ -415,8 +415,22 @@ impl Session for MongoSession {
 
     /// Fields found in a sample of documents, with their types.
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
-        let objects = self.list_objects(schema).await?;
-        let mut object = objects.into_iter().find(|o| o.name == name).ok_or_else(|| ConnectorError::query(format!("collection not found: {schema}.{name}")))?;
+        // This collection only (not the database's every collection), its
+        // options kept for the DDL below.
+        let info = self
+            .client
+            .database(schema)
+            .list_collections()
+            .filter(doc! {"name": name})
+            .await
+            .map_err(err)?
+            .next()
+            .await
+            .transpose()
+            .map_err(err)?
+            .ok_or_else(|| ConnectorError::query(format!("collection not found: {schema}.{name}")))?;
+        let kind = if matches!(info.collection_type, mongodb::results::CollectionType::View) { ObjectKind::View } else { ObjectKind::Table };
+        let mut object = DbObject { schema: schema.to_string(), name: name.to_string(), kind, comment: None, row_estimate: None };
         let coll = self.client.database(schema).collection::<Document>(name);
         object.row_estimate = coll.estimated_document_count().await.ok().map(|n| n as i64);
         let docs = self.sample(schema, name).await?;
@@ -448,8 +462,7 @@ impl Session for MongoSession {
             .collect();
         // DDL: the collection's options and indexes as shell commands.
         let mut ddl = String::new();
-        let info = self.client.database(schema).list_collections().filter(doc! {"name": name}).await.map_err(err)?.next().await;
-        let opts = info.and_then(|c| c.ok()).map(|c| mongodb::bson::to_document(&c.options).unwrap_or_default()).unwrap_or_default();
+        let opts = mongodb::bson::to_document(&info.options).unwrap_or_default();
         let opts: Document = opts.into_iter().filter(|(_, v)| !matches!(v, Bson::Null)).collect();
         let q = serde_json::to_string(name).unwrap_or_default();
         ddl.push_str(&format!(

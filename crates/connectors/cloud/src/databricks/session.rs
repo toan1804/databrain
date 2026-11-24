@@ -26,6 +26,32 @@ fn quote_literal(s: &str) -> String {
     databrain_connector_core::sql::quote_string(s, databrain_connector_core::ConnectorKind::Databricks)
 }
 
+impl DbxSession {
+    /// One table or view by name from its catalog's information schema;
+    /// `None` when Databricks answered that it can't be read (Hive
+    /// metastore) or has no such row. Not reaching it (network, sign-in,
+    /// a timeout) is the error, not a reason to list the schema instead.
+    async fn one_object(&self, schema: &str, name: &str) -> Result<Option<DbObject>> {
+        let (cat, sch) = split_schema(schema)?;
+        let sql = format!(
+            "SELECT table_name, table_type, comment FROM {}.information_schema.tables WHERE table_schema = {} AND table_name = {}",
+            quote_ident(ConnectorKind::Databricks, cat),
+            quote_literal(sch),
+            quote_literal(name)
+        );
+        let rows = match self.0.run_small(&sql).await {
+            Ok(r) => r,
+            Err(e) if statement_failed(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(r) = rows.first() else { return Ok(None) };
+        let t = cell(r, 1).unwrap_or_default();
+        let kind =
+            if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table };
+        Ok(Some(DbObject { schema: schema.to_string(), name: cell(r, 0).unwrap_or_else(|| name.to_string()), kind, comment: cell(r, 2), row_estimate: None }))
+    }
+}
+
 #[async_trait]
 impl Session for DbxSession {
     fn kind(&self) -> ConnectorKind {
@@ -299,19 +325,38 @@ impl Session for DbxSession {
         Ok(l)
     }
 
+    /// The object looked up by name (its catalog's information schema), then
+    /// its columns: two warehouse queries. Not the DDL (`object_ddl` reads it
+    /// when the DDL tab asks). Hive metastore (no information schema): the
+    /// schema's listing, as before.
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
-        let object = self
-            .list_objects(schema)
-            .await?
-            .into_iter()
-            .filter(|o| o.name == name)
-            .min_by_key(|o| !o.kind.is_relation())
-            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let object = match self.one_object(schema, name).await? {
+            Some(o) => o,
+            None => self
+                .list_objects(schema)
+                .await?
+                .into_iter()
+                .filter(|o| o.name == name)
+                .min_by_key(|o| !o.kind.is_relation())
+                .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?,
+        };
         let cols = self.0.schema_columns_filtered(schema, Some(name)).await?;
         let columns = cols.into_iter().next().map(|t| t.columns).unwrap_or_default();
+        Ok(ObjectDetail { object, columns, ddl: None, foreign_keys: vec![] })
+    }
+
+    /// The DDL is read here, not in `describe`.
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
+    /// `SHOW CREATE TABLE` (tables and views); nothing for other objects.
+    async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
+        if !kind.is_relation() {
+            return Ok(None);
+        }
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Databricks, schema), quote_ident(ConnectorKind::Databricks, name));
-        let ddl = self.0.run_small(&format!("SHOW CREATE TABLE {full}")).await.ok().and_then(|r| r.first().and_then(|r| cell(r, 0)));
-        Ok(ObjectDetail { object, columns, ddl, foreign_keys: vec![] })
+        Ok(self.0.run_small(&format!("SHOW CREATE TABLE {full}")).await?.first().and_then(|r| cell(r, 0)))
     }
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
@@ -521,5 +566,43 @@ mod literal_tests {
         assert_eq!(super::quote_literal("a'b"), r"'a\'b'");
         assert_eq!(super::quote_literal(r"x\' or 1=1 --"), r"'x\\\' or 1=1 --'");
         assert_eq!(super::quote_literal(r"ends\"), r"'ends\\'");
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::super::testutil::mock;
+    use databrain_connector_core::{ObjectKind, Session};
+
+    fn statements(log: &std::sync::Mutex<mock::Log>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(m, p, _, _)| m == "POST" && p == "/api/2.0/sql/statements")
+            .filter_map(|(_, _, _, b)| serde_json::from_str::<serde_json::Value>(b).ok()?["statement"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Describing a table asks for it by name and for its columns: two
+    /// statements, not the schema's tables and routines, nor its DDL, which
+    /// only the DDL tab asks for (one SHOW CREATE TABLE).
+    #[tokio::test]
+    async fn a_table_is_described_by_name_and_its_ddl_read_apart() {
+        let (origin, log) = mock::serve("ok").await;
+        let s = mock::session(&origin, true);
+        s.describe("main.sales", "orders").await.unwrap();
+        let sent = statements(&log);
+        assert_eq!(sent.len(), 2, "{sent:#?}");
+        assert!(sent[0].contains("information_schema.tables") && sent[0].contains("table_name = 'orders'"), "{}", sent[0]);
+        assert!(sent[1].contains("information_schema.columns") && sent[1].contains("table_name = 'orders'"), "{}", sent[1]);
+        assert!(sent.iter().all(|q| !q.contains("SHOW CREATE") && !q.contains("routines")), "{sent:#?}");
+        assert!(!s.describe_ddl_is_object_ddl());
+        log.lock().unwrap().requests.clear();
+        s.object_ddl("main.sales", "orders", ObjectKind::Table).await.unwrap();
+        assert_eq!(statements(&log), vec!["SHOW CREATE TABLE `main`.`sales`.`orders`".to_string()]);
+        log.lock().unwrap().requests.clear();
+        assert_eq!(s.object_ddl("main.sales", "f", ObjectKind::Function).await.unwrap(), None);
+        assert!(statements(&log).is_empty());
     }
 }

@@ -499,26 +499,41 @@ impl Session for DuckSession {
             let columns = self.output_columns().into_iter().find(|t| t.table == name).map(|t| t.columns).unwrap_or_default();
             return Ok(ObjectDetail { object, columns, ddl: None, foreign_keys: vec![] });
         }
-        let object = self
-            .list_objects(schema)
-            .await?
-            .into_iter()
-            .filter(|o| o.name == name)
-            .min_by_key(|o| !o.kind.is_relation())
-            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
-        let columns = self.columns(schema, Some(name)).await?.into_iter().next().map(|t| t.columns).unwrap_or_default();
+        // The table or view by name with its DDL, in one query (not the
+        // schema's every table, view, sequence and macro); another object
+        // (a sequence, a macro) from the listing.
         let (db, sch) = schema.split_once('.').unwrap_or((schema, "main"));
-        let ddl = self
+        let row = self
             .strings(
-                "select sql from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ? \
-                 union all select sql from duckdb_views() where database_name = ? and schema_name = ? and view_name = ?"
+                "select 'table', comment, estimated_size::varchar, sql from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ? \
+                 union all select 'view', comment, null, sql from duckdb_views() where database_name = ? and schema_name = ? and view_name = ? and not internal"
                     .into(),
                 vec![db.into(), sch.into(), name.into(), db.into(), sch.into(), name.into()],
             )
             .await?
             .into_iter()
-            .next()
-            .and_then(|r| r[0].clone());
+            .next();
+        let (object, ddl) = match row {
+            Some(r) => (
+                DbObject {
+                    schema: schema.to_string(),
+                    name: name.to_string(),
+                    kind: if r[0].as_deref() == Some("view") { ObjectKind::View } else { ObjectKind::Table },
+                    comment: r[1].clone().filter(|c| !c.is_empty()),
+                    row_estimate: r[2].as_deref().and_then(|n| n.parse().ok()),
+                },
+                r[3].clone(),
+            ),
+            None => (
+                self.list_objects(schema)
+                    .await?
+                    .into_iter()
+                    .find(|o| o.name == name)
+                    .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?,
+                None,
+            ),
+        };
+        let columns = self.columns(schema, Some(name)).await?.into_iter().next().map(|t| t.columns).unwrap_or_default();
         Ok(ObjectDetail { object, columns, ddl, foreign_keys: vec![] })
     }
 

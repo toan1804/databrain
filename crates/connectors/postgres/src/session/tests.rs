@@ -64,6 +64,12 @@ async fn live_object_ddl() {
         run(stmt.trim_end_matches(';').to_string()).await;
     }
     assert_eq!(s.object_ddl("kb_ddl", "orders", ObjectKind::Table).await.unwrap().unwrap(), ddl, "same DDL after recreating");
+    // Dropped since it was listed: "not found" (a statement's answer), never a
+    // lost connection (that would make the engine reconnect).
+    for k in [ObjectKind::Table, ObjectKind::View] {
+        let e = s.object_ddl("kb_ddl", "gone", k).await.unwrap_err();
+        assert!(e.kind == databrain_connector_core::ErrorKind::Query && e.message.contains("not found"), "{e:?}");
+    }
     let f = s.object_ddl("kb_ddl", "twice", ObjectKind::Function).await.unwrap().unwrap();
     assert!(f.contains("CREATE OR REPLACE FUNCTION kb_ddl.twice(x integer)"), "{f}");
     assert!(s.object_ddl("kb_ddl", "customers", ObjectKind::Table).await.unwrap().unwrap().contains("UNIQUE (email)"));

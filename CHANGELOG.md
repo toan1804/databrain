@@ -11,6 +11,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 - **Tab completion for `dbr`:** `eval "$(dbr completions zsh)"` in `~/.zshrc` (or `bash` in `~/.bashrc`) completes the options, files and, after `-c`, the saved connections' names in any case, read at each Tab.
 - **`dbr -i -x` shows long values whole:** each row as a record, a line per column, with long values wrapped to the terminal instead of cut at 40 characters (as `psql`'s `\x`); `--expanded` is the same.
 
+### Changed
+
+- **A table's description asks for that table only, and its DDL only when shown:** Databricks, Snowflake, SQL Server, DuckDB and MongoDB found a table by listing its whole schema (Snowflake: its tables, functions, procedures and sequences; SQL Server: every object with its row counts), and Databricks, Snowflake and MySQL read the DDL (`SHOW CREATE TABLE`, `GET_DDL`) for every description though only the DDL tab shows it. Now the table is looked up by name and the DDL read when the DDL tab opens (Databricks: two warehouse queries to open a table instead of four; Snowflake: four instead of about eight; MySQL: the DDL tab one `SHOW CREATE` instead of a whole description). Postgres builds a table's DDL without describing it first; Snowflake's table layout reads the columns only. Where the server can't give a table's DDL (a missing privilege), the DDL tab says why instead of "not available".
+
 ### Fixed
 
 - **Opening a table sends its catalog queries once, not twice:** the explorer's click (the tree's columns) and the table tab each described it, so `SHOW CREATE TABLE`, the columns' query and the rest went twice (on every database type; on Databricks and Snowflake, to the warehouse). A table's description in progress is shared, and one of the last 30 s reused; the DDL tab takes a table's DDL from it where it is the same, instead of asking again. Refresh, the DDL tab's Reload, DDL run on the connection, Reconnect and the explorer's refresh read it anew; PII masking always reads a view's definition fresh.
