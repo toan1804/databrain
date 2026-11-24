@@ -1529,7 +1529,7 @@ async fn a_load_of_a_result_on_disk_knows_its_total() {
     assert_eq!(seen.last().unwrap().0, 300_000);
 }
 
-/// A Databricks stand-in counting its table descriptions (each slow, so two
+/// A stand-in (the default object_ddl) counting its table descriptions (each slow, so two
 /// at once overlap); `fail` makes them fail.
 struct DescribeCounting(Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>);
 struct DescribeCountingSession(Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>);
@@ -1538,9 +1538,9 @@ struct DescribeCountingSession(Arc<std::sync::atomic::AtomicUsize>, Arc<std::syn
 impl databrain_connector_core::Connector for DescribeCounting {
     fn info(&self) -> databrain_connector_core::ConnectorInfo {
         databrain_connector_core::ConnectorInfo {
-            kind: ConnectorKind::Databricks,
-            traits: ConnectorKind::Databricks.traits(),
-            display_name: "Databricks (test)",
+            kind: ConnectorKind::Clickhouse,
+            traits: ConnectorKind::Clickhouse.traits(),
+            display_name: "ClickHouse (test)",
             default_port: None,
             uses_file: false,
             auth_methods: vec![],
@@ -1557,7 +1557,7 @@ impl databrain_connector_core::Connector for DescribeCounting {
 #[async_trait::async_trait]
 impl Session for DescribeCountingSession {
     fn kind(&self) -> ConnectorKind {
-        ConnectorKind::Databricks
+        ConnectorKind::Clickhouse
     }
     async fn server_version(&self) -> databrain_connector_core::Result<String> {
         Ok("test".into())
@@ -1611,7 +1611,7 @@ async fn a_table_is_described_once_for_callers_together() {
         .save_connection(ConnectionProfile {
             id: String::new(),
             name: "DBX".into(),
-            config: ConnectionConfig::new(ConnectorKind::Databricks, AuthMethod::None),
+            config: ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::None),
             color: None,
             env: EnvTag::None,
             folder_id: None,

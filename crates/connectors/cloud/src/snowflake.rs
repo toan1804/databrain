@@ -657,6 +657,40 @@ impl Inner {
     }
 }
 
+/// A row of `information_schema.tables` (name, type, comment, row count) as an object.
+fn table_row(schema: &str, r: &[Option<String>]) -> Option<DbObject> {
+    let g = |i: usize| r.get(i).cloned().flatten();
+    let t = g(1).unwrap_or_default();
+    Some(DbObject {
+        schema: schema.to_string(),
+        name: g(0)?,
+        kind: if t.contains("VIEW") {
+            if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+        } else if t.contains("EXTERNAL") {
+            ObjectKind::ForeignTable
+        } else {
+            ObjectKind::Table
+        },
+        comment: g(2),
+        row_estimate: g(3).and_then(|n| n.parse().ok()),
+    })
+}
+
+impl SfSession {
+    /// One table or view by name; `None` when the information schema can't
+    /// be read or has no such row (then the schema's listing is used).
+    async fn one_object(&self, schema: &str, name: &str) -> Option<DbObject> {
+        let (db, sch) = schema.split_once('.')?;
+        let sql = format!(
+            "select table_name, table_type, comment, row_count from {}.information_schema.tables where table_schema = {} and table_name = {}",
+            quote_ident(ConnectorKind::Snowflake, db),
+            quote_literal(sch),
+            quote_literal(name)
+        );
+        self.0.run_small(&sql).await.ok()?.into_iter().find_map(|r| table_row(schema, &r))
+    }
+}
+
 #[async_trait]
 impl Session for SfSession {
     fn kind(&self) -> ConnectorKind {
@@ -865,29 +899,7 @@ impl Session for SfSession {
             quote_ident(ConnectorKind::Snowflake, db),
             quote_literal(sch)
         );
-        let mut out: Vec<DbObject> = self
-            .0
-            .run_small(&sql)
-            .await?
-            .into_iter()
-            .filter_map(|r| {
-                let g = |i: usize| r.get(i).cloned().flatten();
-                let t = g(1).unwrap_or_default();
-                Some(DbObject {
-                    schema: schema.to_string(),
-                    name: g(0)?,
-                    kind: if t.contains("VIEW") {
-                        if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
-                    } else if t.contains("EXTERNAL") {
-                        ObjectKind::ForeignTable
-                    } else {
-                        ObjectKind::Table
-                    },
-                    comment: g(2),
-                    row_estimate: g(3).and_then(|n| n.parse().ok()),
-                })
-            })
-            .collect();
+        let mut out: Vec<DbObject> = self.0.run_small(&sql).await?.into_iter().filter_map(|r| table_row(schema, &r)).collect();
         // Routines and sequences (best effort: missing privileges just leave them out).
         let db_q = quote_ident(ConnectorKind::Snowflake, db);
         for (view, col, kind) in [
@@ -926,7 +938,12 @@ impl Session for SfSession {
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
         use databrain_connector_core::{TableLayout, parse_call_list, query_text};
         let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
-        let mut l = TableLayout::from_columns(&self.describe(schema, name).await?.columns);
+        // The columns only (their primary key), not a whole description.
+        let columns = self.columns(schema, Some(name)).await?.into_iter().next().map(|t| t.columns).unwrap_or_default();
+        if columns.is_empty() {
+            return Err(ConnectorError::query(format!("object not found: {schema}.{name}")));
+        }
+        let mut l = TableLayout::from_columns(&columns);
         if let Some(pk) = l.indexes.first_mut() {
             pk.method = Some("not enforced".into());
         }
@@ -953,25 +970,46 @@ impl Session for SfSession {
         Ok(l)
     }
 
+    /// The object by name (one row of the information schema), its columns
+    /// and primary key, its foreign keys: four statements, not the schema's
+    /// tables, functions, procedures and sequences. Not the DDL
+    /// (`object_ddl` reads it when the DDL tab asks).
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
-        let object = self
-            .list_objects(schema)
-            .await?
-            .into_iter()
-            .filter(|o| o.name == name)
-            .min_by_key(|o| !o.kind.is_relation())
-            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let object = match self.one_object(schema, name).await {
+            Some(o) => o,
+            None => self
+                .list_objects(schema)
+                .await?
+                .into_iter()
+                .filter(|o| o.name == name)
+                .min_by_key(|o| !o.kind.is_relation())
+                .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?,
+        };
         let columns = self.columns(schema, Some(name)).await?.into_iter().next().map(|t| t.columns).unwrap_or_default();
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Snowflake, schema), quote_ident(ConnectorKind::Snowflake, name));
-        let kind = if matches!(object.kind, ObjectKind::View | ObjectKind::MaterializedView) { "view" } else { "table" };
-        let ddl = self
-            .0
-            .run_small(&format!("select get_ddl('{kind}', {})", quote_literal(&full)))
-            .await
-            .ok()
-            .and_then(|r| r.into_iter().next().and_then(|r| r.into_iter().next().flatten()));
         let foreign_keys = self.fks(&full).await.unwrap_or_default();
-        Ok(ObjectDetail { object, columns, ddl, foreign_keys })
+        Ok(ObjectDetail { object, columns, ddl: None, foreign_keys })
+    }
+
+    /// The DDL is read here, not in `describe`.
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
+    /// GET_DDL of a table or view; nothing for other objects.
+    async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
+        if !kind.is_relation() {
+            return Ok(None);
+        }
+        let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Snowflake, schema), quote_ident(ConnectorKind::Snowflake, name));
+        let what = if matches!(kind, ObjectKind::View | ObjectKind::MaterializedView) { "view" } else { "table" };
+        Ok(self
+            .0
+            .run_small(&format!("select get_ddl('{what}', {})", quote_literal(&full)))
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next().flatten()))
     }
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
@@ -1341,6 +1379,55 @@ mod literal_tests {
             state: databrain_connector_core::conn_state::ConnState::new(),
             array_binds: false,
         }
+    }
+
+    fn statements(log: &crate::mock_http::Log) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p.starts_with("/queries/v1/query-request?"))
+            .filter_map(|(_, _, b)| serde_json::from_str::<serde_json::Value>(b).ok()?["sqlText"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Describing a table asks for it by name (not the schema's tables,
+    /// functions, procedures and sequences), its columns and keys: four
+    /// statements, no GET_DDL, which the DDL tab asks for alone; the table
+    /// layout reads the columns only.
+    #[tokio::test]
+    async fn a_table_is_described_by_name_and_its_ddl_read_apart() {
+        use databrain_connector_core::{ObjectKind, Session};
+        let (origin, log) = crate::mock_http::serve(move |m, p, body| {
+            if m == "POST" && p.starts_with("/queries/v1/query-request?") {
+                let rows = if body.contains("information_schema.tables") { json!([["ORDERS", "BASE TABLE", null, "10"]]) } else { json!([]) };
+                (
+                    200,
+                    json!({"success": true, "code": null, "data": {"rowtype": [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d"}], "rowset": rows}})
+                        .to_string(),
+                )
+            } else {
+                (404, "{}".into())
+            }
+        })
+        .await;
+        let s = SfSession(Arc::new(inner(&origin)));
+        let d = s.describe("DB.SALES", "ORDERS").await.unwrap();
+        assert_eq!((d.object.kind, d.object.row_estimate, d.ddl), (ObjectKind::Table, Some(10), None));
+        let sent = statements(&log);
+        assert!(sent[0].contains("information_schema.tables") && sent[0].contains("table_name = 'ORDERS'"), "{sent:#?}");
+        assert!(
+            sent.iter().all(|q| !q.contains("information_schema.functions") && !q.contains("procedures") && !q.contains("sequences") && !q.contains("get_ddl")),
+            "{sent:#?}"
+        );
+        assert!(sent.len() <= 4, "{sent:#?}");
+        assert!(!s.describe_ddl_is_object_ddl());
+        log.lock().unwrap().clear();
+        s.object_ddl("DB.SALES", "ORDERS", ObjectKind::Table).await.unwrap();
+        assert_eq!(statements(&log), vec![r#"select get_ddl('table', '"DB"."SALES"."ORDERS"')"#.to_string()]);
+        log.lock().unwrap().clear();
+        let _ = s.table_layout("DB.SALES", "ORDERS").await;
+        let sent = statements(&log);
+        assert!(sent.iter().all(|q| !q.contains("show imported keys") && !q.contains("table_type")), "the layout reads no description: {sent:#?}");
     }
 
     /// The query runs on: the submit answers "in progress", then each poll

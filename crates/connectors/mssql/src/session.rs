@@ -188,10 +188,44 @@ impl MssqlSession {
         self.rows_dyn(in_db(db, &sql, 0)).await
     }
 
+    /// The schema's tables, views, routines and sequences; `name`: only that
+    /// one (a description reads one row, not the schema with its row counts).
+    async fn objects_in(&self, schema: &str, name: Option<&str>) -> Result<Vec<DbObject>> {
+        let (db, sch) = self.split_id(schema).await;
+        let sql = format!(
+            "select o.name, rtrim(o.type), cast(ep.value as nvarchar(4000)), \
+               (select sum(p.rows) from sys.partitions p where p.object_id = o.object_id and p.index_id in (0,1)) \
+             from sys.objects o \
+             left join sys.extended_properties ep on ep.major_id = o.object_id and ep.minor_id = 0 and ep.name = 'MS_Description' \
+             where schema_name(o.schema_id) = @P1 and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0{} \
+             order by case rtrim(o.type) when 'U' then 0 when 'V' then 1 when 'SO' then 3 else 2 end, o.name",
+            if name.is_some() { " and o.name = @P2" } else { "" }
+        );
+        let mut params = vec![sch.to_string()];
+        params.extend(name.map(str::to_string));
+        let rows = self.rows_in(db, &sql, params).await?;
+        Ok(rows
+            .iter()
+            .map(|r| DbObject {
+                schema: schema.to_string(),
+                name: r.get::<&str, _>(0).unwrap_or_default().to_string(),
+                kind: match r.get::<&str, _>(1).unwrap_or_default() {
+                    "U" => ObjectKind::Table,
+                    "V" => ObjectKind::View,
+                    "P" => ObjectKind::Procedure,
+                    "SO" => ObjectKind::Sequence,
+                    _ => ObjectKind::Function,
+                },
+                comment: r.get::<&str, _>(2).map(str::to_string),
+                row_estimate: r.get::<i64, _>(3),
+            })
+            .collect())
+    }
+
     /// `describe`, plus how the database fills each column (identity,
     /// computed; see `column_fill`), in column order.
     async fn describe_with_fills(&self, schema: &str, name: &str) -> Result<(ObjectDetail, Vec<Option<String>>)> {
-        let objs = self.list_objects(schema).await?;
+        let objs = self.objects_in(schema, Some(name)).await?;
         let object = objs
             .into_iter()
             .filter(|o| o.name == name)
@@ -487,35 +521,7 @@ impl Session for MssqlSession {
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
-        let (db, sch) = self.split_id(schema).await;
-        let rows = self
-            .rows_in(
-                db,
-                "select o.name, rtrim(o.type), cast(ep.value as nvarchar(4000)), \
-                   (select sum(p.rows) from sys.partitions p where p.object_id = o.object_id and p.index_id in (0,1)) \
-                 from sys.objects o \
-                 left join sys.extended_properties ep on ep.major_id = o.object_id and ep.minor_id = 0 and ep.name = 'MS_Description' \
-                 where schema_name(o.schema_id) = @P1 and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0 \
-                 order by case rtrim(o.type) when 'U' then 0 when 'V' then 1 when 'SO' then 3 else 2 end, o.name",
-                vec![sch.into()],
-            )
-            .await?;
-        Ok(rows
-            .iter()
-            .map(|r| DbObject {
-                schema: schema.to_string(),
-                name: r.get::<&str, _>(0).unwrap_or_default().to_string(),
-                kind: match r.get::<&str, _>(1).unwrap_or_default() {
-                    "U" => ObjectKind::Table,
-                    "V" => ObjectKind::View,
-                    "P" => ObjectKind::Procedure,
-                    "SO" => ObjectKind::Sequence,
-                    _ => ObjectKind::Function,
-                },
-                comment: r.get::<&str, _>(2).map(str::to_string),
-                row_estimate: r.get::<i64, _>(3),
-            })
-            .collect())
+        self.objects_in(schema, None).await
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
