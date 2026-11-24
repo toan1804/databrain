@@ -156,8 +156,11 @@ pub fn cancel_job(state: &AppState, id: &str) -> bool {
     !matches!(crate::jobs::request_stop(&state.job_ctx(), id, "app"), Ok(crate::jobs::StopAsked::NotRunning) | Err(_))
 }
 
+/// Stop one step of a job's run: in this process at once; in another (the
+/// background runner, `databrain-jobs run`) by a request it reads within
+/// seconds. False when the job (or here, the step) isn't running.
 pub fn cancel_job_step(state: &AppState, id: &str, node_id: &str) -> bool {
-    state.jobs.cancel_step(id, node_id)
+    !matches!(crate::jobs::request_stop_step(&state.job_ctx(), id, node_id, "app"), Ok(crate::jobs::StopAsked::NotRunning) | Err(_))
 }
 
 /// Dry run of a load step of `job` as edited (nothing is kept).
