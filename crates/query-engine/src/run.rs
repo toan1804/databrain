@@ -299,6 +299,9 @@ impl QueryEngine {
                 break;
             }
             self.events.emit(JobEvent::StatementStarted { job_id: job_id.clone(), tab_id: req.tab_id.clone(), index: stmt.index, sql: stmt.sql().to_string() });
+            if changes_tables(stmt.classification().kind) {
+                self.forget_descriptions(&req.connection_id);
+            }
             let started_at = now_ms();
             let t0 = Instant::now();
             let outcome = match self.begin_if_manual(&req, conn_kind, stmt, &cancel).await {
@@ -307,9 +310,11 @@ impl QueryEngine {
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
             // What may have changed a table (DDL; a call or block we can't
-            // tell): its kept descriptions go, even after an error (part of
-            // a script may have run).
-            if matches!(stmt.classification().kind, StatementKind::Ddl | StatementKind::Other | StatementKind::Unknown) {
+            // tell; a COMMIT of DDL run in a transaction): its kept
+            // descriptions go, even after an error (part of a script may
+            // have run). Also before it (below), so one made while it ran
+            // isn't kept.
+            if changes_tables(stmt.classification().kind) {
                 self.forget_descriptions(&req.connection_id);
             }
 
@@ -878,4 +883,9 @@ impl Drop for RowTap {
     fn drop(&mut self) {
         self.engine.taps.lock().remove(&self.tab_id);
     }
+}
+
+/// Statements after which a table's kept description may be wrong.
+fn changes_tables(kind: StatementKind) -> bool {
+    matches!(kind, StatementKind::Ddl | StatementKind::Other | StatementKind::Unknown | StatementKind::Transaction)
 }

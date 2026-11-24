@@ -180,8 +180,12 @@ impl QueryEngine {
         // are the same: the one the table tab just read is used (or shared),
         // not asked for again.
         let from_describe = kind.is_relation() && self.with_meta(connection_id, |s| async move { Ok(s.describe_ddl_is_object_ddl()) }).await?;
+        let view = matches!(kind, databrain_connector_core::ObjectKind::View | databrain_connector_core::ObjectKind::MaterializedView);
+        // A view is read fresh: its definition is kept for PII masking with
+        // the view's version as known now, and one described before a
+        // redefinition must never be kept as the new one.
         let ddl = if from_describe {
-            if fresh { self.describe_fresh(connection_id, schema, name).await?.ddl } else { self.describe(connection_id, schema, name).await?.ddl }
+            self.describe_reused(connection_id, schema, name, fresh || view).await?.0.ddl
         } else {
             self.with_meta(connection_id, |s| {
                 let (schema, name) = (schema_s.clone(), name_s.clone());

@@ -1657,15 +1657,42 @@ async fn a_table_is_described_once_for_callers_together() {
         output_masks: None,
     };
     let hub = crate::EventHub::new(Arc::new(CollectingSink::default()));
-    let _ = engine.run_and_wait(&hub, r("select 1"), None).await;
+    assert!(engine.run_and_wait(&hub, r("select 1"), None).await.unwrap().iter().all(|o| o.error.is_none()));
     engine.describe(&id, "main.sales", "orders").await.unwrap();
     assert_eq!(calls.load(SeqCst), 3, "a read keeps them");
-    let _ = engine.run_and_wait(&hub, r("alter table main.sales.orders add column note string"), None).await;
+    assert!(engine.run_and_wait(&hub, r("alter table main.sales.orders add column note string"), None).await.unwrap().iter().all(|o| o.error.is_none()));
     engine.describe(&id, "main.sales", "orders").await.unwrap();
     assert_eq!(calls.load(SeqCst), 4, "DDL forgets them");
     engine.reconnect(&id);
     engine.describe(&id, "main.sales", "orders").await.unwrap();
     assert_eq!(calls.load(SeqCst), 5, "a reconnect forgets them");
+    // A table the explorer saw change (its cached columns stale) is asked
+    // anew, so the old description is never saved over the stale mark.
+    let ws = engine.workspace().clone();
+    engine.describe(&id, "main.sales", "orders").await.unwrap();
+    let before = calls.load(SeqCst);
+    let orders =
+        DbObject { schema: "main.sales".into(), name: "orders".into(), kind: databrain_connector_core::ObjectKind::Table, comment: None, row_estimate: None };
+    ws.meta_put_table(&id, "main.sales", "orders", &[], None).unwrap();
+    ws.meta_put_listing(&id, "main.sales", &[orders], None, None).unwrap();
+    assert!(ws.meta_table_is_stale(&id, "main.sales", "orders").unwrap());
+    engine.describe(&id, "main.sales", "orders").await.unwrap();
+    assert_eq!(calls.load(SeqCst), before + 1, "stale: described anew");
+    // DuckDB's query outputs change with runs elsewhere: never kept.
+    engine.describe(&id, "results.main", "out_1").await.unwrap();
+    engine.describe(&id, "results.main", "out_1").await.unwrap();
+    assert_eq!(calls.load(SeqCst), before + 3);
+    // A view's DDL is read anew (kept for masking with the view's version).
+    let n = calls.load(SeqCst);
+    engine.describe(&id, "main.sales", "v").await.unwrap();
+    engine.object_ddl(&id, "main.sales", "v", databrain_connector_core::ObjectKind::View).await.unwrap();
+    assert_eq!(calls.load(SeqCst), n + 2, "a view's DDL not from a kept description");
+    // An error reaches a caller waiting on it too, and isn't kept.
+    fail.store(true, SeqCst);
+    let (a, b) = tokio::join!(engine.describe(&id, "main.sales", "gone"), engine.describe(&id, "main.sales", "gone"));
+    assert!(a.is_err() && b.is_err());
+    fail.store(false, SeqCst);
+    calls.store(5, SeqCst);
     // An error isn't kept.
     fail.store(true, SeqCst);
     assert!(engine.describe(&id, "main.sales", "new_t").await.is_err());

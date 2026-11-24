@@ -363,14 +363,14 @@ impl Session for PgSession {
         Ok(objs)
     }
 
-    /// Tables: columns, every constraint (pg_get_constraintdef), partition
-    /// key, other indexes and comments. Views as before. Functions and
-    /// procedures: pg_get_functiondef (all overloads).
-    /// Its table DDL is fuller than describe's (constraints, indexes; Oracle's describe has none).
+    /// Its table DDL is fuller than describe's (constraints, indexes): never answered from a description.
     fn describe_ddl_is_object_ddl(&self) -> bool {
         false
     }
 
+    /// Tables: columns, every constraint (pg_get_constraintdef), partition
+    /// key, other indexes and comments. Views as before. Functions and
+    /// procedures: pg_get_functiondef (all overloads).
     async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
         if self.redshift {
             return self.rs_object_ddl(schema, name, kind).await;
