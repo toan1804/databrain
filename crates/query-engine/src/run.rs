@@ -159,7 +159,7 @@ impl QueryEngine {
 
     /// Hand the rows of the statements run for tab `tab_id` to the returned
     /// receiver as they are read, until the [`RowTap`] is dropped: what the
-    /// result keeps (after the row limit), batch by batch. The run waits for
+    /// result keeps after the row limit, batch by batch. The run waits for
     /// the receiver when it falls behind (at most a few batches queue).
     pub fn tap_rows(self: &Arc<Self>, tab_id: &str) -> (RowTap, tokio::sync::mpsc::Receiver<TappedBatch>) {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -617,7 +617,9 @@ impl QueryEngine {
                         bytes += databrain_connector_core::memory_size([&batch]);
                     }
                     // Handed on as read, when the tab is tapped (`dbr --csv`):
-                    // the rows the result keeps. A slow reader slows the query.
+                    // the rows kept after the row limit and the cuts above (a
+                    // later failed write to disk can still drop some from the
+                    // result). A slow reader slows the query.
                     let tap = self.taps.lock().get(&req.tab_id).cloned();
                     if let Some(tap) = tap
                         && batch.num_rows() > 0

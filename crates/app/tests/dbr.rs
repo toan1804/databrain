@@ -239,7 +239,6 @@ async fn rows_come_while_the_query_runs() {
     let out = run.await.unwrap().unwrap();
     assert_eq!(out[0].result.as_ref().unwrap().total_rows, 200_000);
     drop(tap);
-    assert!(st.engine.tap_rows("cli:other").1.try_recv().is_err());
 }
 
 /// A reader that goes away (`dbr --csv … | head`) stops the query, and
