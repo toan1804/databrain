@@ -393,21 +393,25 @@ impl Session for PgSession {
         if !kind.is_relation() {
             return Ok(None);
         }
-        let d = self.describe(schema, name).await?;
-        if d.object.kind != ObjectKind::Table {
-            return Ok(d.ddl);
-        }
-        // Names quoted the way Postgres prints them (only when needed).
+        // Names quoted the way Postgres prints them (only when needed), the
+        // kind and the comment: a view's DDL comes from its description, a
+        // table's is built below (not a whole description first).
         let head = self
             .client()
-            .query_one(
-                "select c.oid, format('%I.%I', n.nspname, c.relname) from pg_catalog.pg_class c \
+            .query_opt(
+                "select c.oid, format('%I.%I', n.nspname, c.relname), c.relkind::text, obj_description(c.oid, 'pg_class') \
+                 from pg_catalog.pg_class c \
                  join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2",
                 &[&schema, &name],
             )
             .await
-            .map_err(|e| map_err(&e))?;
-        let (oid, full): (u32, String) = (head.get(0), head.get(1));
+            .map_err(|e| map_err(&e))?
+            // Dropped since it was listed: the statement's answer, not a lost connection.
+            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let (oid, full, relkind, table_comment): (u32, String, String, Option<String>) = (head.get(0), head.get(1), head.get(2), head.get(3));
+        if !matches!(relkind.as_str(), "r" | "p") {
+            return Ok(self.describe(schema, name).await?.ddl);
+        }
         let cols = q(
             "select quote_ident(a.attname), pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, \
                     pg_catalog.pg_get_expr(d.adbin, d.adrelid), a.attidentity::text, a.attgenerated::text, \
@@ -470,7 +474,7 @@ impl Session for PgSession {
             ddl.push_str(&format!("\n{};", r.get::<_, String>(0).replacen(" ON ONLY ", " ON ", 1)));
         }
         let lit = databrain_connector_core::quote_literal;
-        if let Some(c) = d.object.comment.as_deref().filter(|c| !c.is_empty()) {
+        if let Some(c) = table_comment.as_deref().filter(|c| !c.is_empty()) {
             ddl.push_str(&format!("\n\nCOMMENT ON TABLE {full} IS {};", lit(c)));
         }
         for (col, cm) in &comments {

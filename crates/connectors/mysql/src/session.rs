@@ -298,14 +298,28 @@ impl Session for MysqlSession {
         Ok(l)
     }
 
-    /// Tables and views: SHOW CREATE (via describe). Routines: SHOW CREATE FUNCTION/PROCEDURE.
+    /// The DDL is read here, not in `describe`.
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
+    /// SHOW CREATE TABLE / VIEW / FUNCTION / PROCEDURE: one statement (a
+    /// table or view's, not a whole description for it).
     async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
         let what = match kind {
             ObjectKind::Function => "FUNCTION",
             ObjectKind::Procedure => "PROCEDURE",
-            k if k.is_relation() => return Ok(self.describe(schema, name).await?.ddl),
+            ObjectKind::View | ObjectKind::MaterializedView => "VIEW",
+            k if k.is_relation() => "TABLE",
             _ => return Ok(None),
         };
+        if matches!(what, "TABLE" | "VIEW") {
+            let show = format!("SHOW CREATE {what} {}.{}", quote_ident(ConnectorKind::Mysql, schema), quote_ident(ConnectorKind::Mysql, name));
+            let mut c = self.conn.lock().await;
+            let row: Option<mysql_async::Row> = c.query_first(show).await.map_err(map_err)?;
+            // Columns: name, Create Table|View, …
+            return Ok(row.and_then(|mut r| r.take::<String, _>(1)));
+        }
         let show = format!("SHOW CREATE {what} {}.{}", quote_ident(ConnectorKind::Mysql, schema), quote_ident(ConnectorKind::Mysql, name));
         let mut c = self.conn.lock().await;
         let row: Option<mysql_async::Row> = c.query_first(show).await.map_err(map_err)?;
@@ -345,17 +359,8 @@ impl Session for MysqlSession {
             })
             .collect();
 
-        let show = format!(
-            "SHOW CREATE {} {}.{}",
-            if is_view { "VIEW" } else { "TABLE" },
-            quote_ident(ConnectorKind::Mysql, schema),
-            quote_ident(ConnectorKind::Mysql, name)
-        );
-        let ddl: Option<String> = {
-            let mut c = self.conn.lock().await;
-            let row: Option<mysql_async::Row> = c.query_first(show).await.map_err(map_err)?;
-            row.and_then(|mut r| r.take::<String, _>(1))
-        };
+        // Not the DDL: `object_ddl` reads it when the DDL tab asks.
+        let ddl = None;
 
         let foreign_keys = self.foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();
         Ok(ObjectDetail {

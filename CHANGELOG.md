@@ -11,6 +11,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 - **Tab completion for `dbr`:** `eval "$(dbr completions zsh)"` in `~/.zshrc` (or `bash` in `~/.bashrc`) completes the options, files and, after `-c`, the saved connections' names in any case, read at each Tab.
 - **`dbr -i -x` shows long values whole:** each row as a record, a line per column, with long values wrapped to the terminal instead of cut at 40 characters (as `psql`'s `\x`); `--expanded` is the same.
 
+### Changed
+
+- **A table's description asks for that table only, and its DDL only when shown:** Databricks, Snowflake, SQL Server, DuckDB and MongoDB found a table by listing its whole schema (Snowflake: its tables, functions, procedures and sequences; SQL Server: every object with its row counts), and Databricks, Snowflake and MySQL read the DDL (`SHOW CREATE TABLE`, `GET_DDL`) for every description though only the DDL tab shows it. Now the table is looked up by name and the DDL read when the DDL tab opens (Databricks: two warehouse queries to open a table instead of four; Snowflake: four instead of about eight; MySQL: the DDL tab one `SHOW CREATE` instead of a whole description). Postgres builds a table's DDL without describing it first; Snowflake's table layout reads the columns only. Where the server can't give a table's DDL (a missing privilege), the DDL tab says why instead of "not available".
+
 ### Fixed
 
 - **Show DDL, Columns and completion no longer wait behind the explorer's background check:** right after connecting, and after DDL, the explorer checks which cached schemas changed, refreshes them and lists more ahead of time, all on the one catalog session a Show DDL also used; on a large Oracle database the check alone took over a minute. That work now has a session of its own on server databases (closed 2 minutes after its work, and not used where the server allows the user no second session), and Oracle's check reads only the schemas the explorer has listed (not every owner).
