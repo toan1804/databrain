@@ -21,6 +21,7 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { SignInDialog } from "./components/SignInDialog";
 import { IndexScopeDialog } from "./components/IndexScopeDialog";
 import { OracleClientDialog } from "./components/OracleClient";
+import { ExpiredPasswordDialog } from "./components/connection/ChangePasswordDialog";
 import { SshHostKeyDialog } from "./components/SshHostKeyDialog";
 import { InlineAi } from "./components/InlineAi";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -244,6 +245,7 @@ export default function App() {
       <IndexScopeDialog />
       <OracleClientDialog />
       <SshHostKeyDialog />
+      <ExpiredPasswordDialog />
       <InlineAi />
       <ConfirmDialog />
       <CompareDialogHost />

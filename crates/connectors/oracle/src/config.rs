@@ -83,6 +83,31 @@ pub(crate) async fn open(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource
     }
 }
 
+/// Sign in with the expired password in `creds`, setting `new` (OCI's
+/// password change at logon, which an expired password allows), then sign
+/// out. Instant Client only: the thin driver can't yet.
+pub(crate) async fn change_expired_password(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>, new: &str) -> Result<()> {
+    let (user, password) = match creds.get().await? {
+        Credential::Password { user, password } => (user, password.expose_secret().to_string()),
+        _ => return Err(ConnectorError::config("Oracle requires user/password authentication")),
+    };
+    if !uses_instant_client(cfg) {
+        return Err(ConnectorError::unsupported(
+            "The thin Oracle driver can't change an expired password yet: use the Instant Client driver (the connection's Driver setting), or ask an administrator",
+        ));
+    }
+    let cs = connect_string(cfg);
+    let lib = cfg.opt("client_lib_dir").map(str::to_string);
+    let new = new.to_string();
+    blocking(move || {
+        init_client(lib.as_deref())?;
+        let conn = oracle::Connector::new(&user, &password, &cs).new_password(&new).connect().map_err(map_err)?;
+        let _ = conn.close();
+        Ok(())
+    })
+    .await
+}
+
 /// Instant Client (thick) driver chosen for this connection?
 pub fn uses_instant_client(cfg: &ConnectionConfig) -> bool {
     matches!(cfg.opt("driver").map(str::trim), Some("instant_client" | "thick"))

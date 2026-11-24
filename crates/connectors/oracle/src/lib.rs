@@ -83,4 +83,8 @@ impl Connector for OracleConnector {
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
         Ok(Box::new(open(cfg, creds).await?))
     }
+
+    async fn connect_changing_password(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>, new: &str) -> Result<()> {
+        config::change_expired_password(cfg, creds, new).await
+    }
 }

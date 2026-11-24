@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- **An expired password opens the change-password dialog:** when a connection fails because its password expired (Oracle ORA-28001, MySQL 1862/1820, SQL Server 18487/18488), DataBrain says so and opens "Change password", which now asks only for the new password when one is saved (the saved one is used; it never goes to the window). Oracle with Instant Client changes it as it signs in; the thin Oracle driver, MySQL and SQL Server follow. PostgreSQL and Redshift can't sign in with an expired password at all: the error says an administrator must set a new one.
 - **Tab completion for `dbr`:** `eval "$(dbr completions zsh)"` in `~/.zshrc` (or `bash` in `~/.bashrc`) completes the options, files and, after `-c`, the saved connections' names in any case, read at each Tab.
 - **`dbr -i -x` shows long values whole:** each row as a record, a line per column, with long values wrapped to the terminal instead of cut at 40 characters (as `psql`'s `\x`); `--expanded` is the same.
 

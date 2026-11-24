@@ -210,23 +210,27 @@ pub fn reconnect(state: &AppState, id: &str) -> usize {
 /// Change the connection's password on the server, then the one saved for
 /// it (when one is saved): the next sign-in uses it. `current` must sign
 /// in (checked first: PostgreSQL and older MySQL don't check it themselves)
-/// and, with a saved password, be it. Idle sessions sign in again with the
-/// new one; running queries, jobs and open transactions go on. Neither
-/// password is logged or kept anywhere else.
-pub async fn change_password(state: &AppState, id: &str, current: String, new: String) -> Result<PasswordChanged> {
+/// and, with a saved password, be it; `None` takes the saved one (the app
+/// never hands it to the window). An expired password, which the server
+/// refuses for anything else, is changed as it signs in, where the driver
+/// can. Idle sessions sign in again with the new one; running queries, jobs
+/// and open transactions go on. Neither password is logged or kept
+/// anywhere else.
+pub async fn change_password(state: &AppState, id: &str, current: Option<String>, new: String) -> Result<PasswordChanged> {
     if new.is_empty() {
         return Err(invalid("Type the new password"));
     }
-    if new == current {
-        return Err(invalid("The new password is the current one"));
-    }
     let profile = state.workspace.get_connection(id)?;
     let saved = SecretRef::for_connection(id);
-    if profile.has_secret {
-        let stored = state.secrets.get(&saved)?;
-        if stored.as_ref().map(secrecy::ExposeSecret::expose_secret) != Some(current.as_str()) {
-            return Err(invalid("The current password isn't the one saved for this connection"));
-        }
+    let stored = if profile.has_secret { state.secrets.get(&saved)?.map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string()) } else { None };
+    let current = match (current, stored) {
+        (Some(c), Some(s)) if c != s => return Err(invalid("The current password isn't the one saved for this connection")),
+        (Some(c), _) => c,
+        (None, Some(s)) => s,
+        (None, None) => return Err(invalid("No password is saved for this connection: type the current one")),
+    };
+    if new == current {
+        return Err(invalid("The new password is the current one"));
     }
     // Said before the sign-in below (the engine refuses these too).
     let traits = profile.config.kind.traits();
@@ -241,12 +245,21 @@ pub async fn change_password(state: &AppState, id: &str, current: String, new: S
     }
     // A refused sign-in is the wrong password; anything else (unreachable,
     // a timeout, an SSH host key to trust) keeps its own error.
+    // An expired one is changed as it signs in (nothing else would take it).
     match state.engine.test_connection(&profile.config, Some(current.clone()), Some(id), None, None).await {
-        Err(e) if password_refused(&e) => return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}", e.message))),
+        Err(e) if e.code.as_deref() == Some(databrain_query_engine::PASSWORD_EXPIRED) => state.engine.change_expired_password(id, &current, &new).await?,
+        Err(e) if password_refused(&e) => {
+            // PostgreSQL and Redshift answer an expired password (VALID UNTIL) as a wrong one.
+            let expiry = if profile.config.kind == databrain_connector_core::ConnectorKind::Postgres {
+                " (if it expired, an administrator must set a new one: PostgreSQL doesn't let an expired password sign in, even to change it)"
+            } else {
+                ""
+            };
+            return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}{expiry}", e.message)));
+        }
         Err(e) => return Err(e),
-        Ok(_) => {}
+        Ok(_) => state.engine.change_password(id, &current, &new).await?,
     }
-    state.engine.change_password(id, &current, &new).await?;
     // Saved before anything signs in again, so nothing caches the old one.
     let saved_ok = if profile.has_secret { state.secrets.set(&saved, &SecretString::from(new)) } else { Ok(()) };
     state.engine.forget_credentials(id);

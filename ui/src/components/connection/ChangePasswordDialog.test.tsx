@@ -1,16 +1,17 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api } from "../../lib/api";
+import { announcePasswordExpired, api } from "../../lib/api";
 import type { ConnectionView } from "../../lib/types";
-import { canChangePassword, ChangePasswordDialog } from "./ChangePasswordDialog";
+import { useStore } from "../../store";
+import { canChangePassword, ChangePasswordDialog, ExpiredPasswordDialog } from "./ChangePasswordDialog";
 
-const conn = (kind: string, method = "password") =>
+const conn = (kind: string, method = "password", saved = false) =>
   ({
     id: "c1",
     name: "Sales",
     env: "none",
     connected: true,
-    has_secret: true,
+    has_secret: saved,
     created_at: 0,
     updated_at: 0,
     config: { kind, auth: { method, user: "app" }, ssl_mode: "prefer", read_only: false },
@@ -18,7 +19,11 @@ const conn = (kind: string, method = "password") =>
   }) as unknown as ConnectionView;
 
 describe("change password", () => {
-  afterEach(() => vi.restoreAllMocks());
+  const realToast = useStore.getState().toast;
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useStore.setState({ expiredPassword: null, connections: [], toast: realToast });
+  });
 
   it("is offered where the database lets a user change its own password with a password sign-in", () => {
     expect(canChangePassword(conn("postgres"))).toBe(true);
@@ -70,5 +75,54 @@ describe("change password", () => {
     expect(update).toHaveBeenCalledWith("c1", ["c3"], "n1");
     fireEvent.click(screen.getByText("Close", { selector: "button" }));
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("with a password saved, asks only for the new one and lets the app use the saved one", async () => {
+    const change = vi.spyOn(api, "changePassword").mockResolvedValueOnce({ others: [] });
+    const onClose = vi.fn();
+    render(<ChangePasswordDialog conn={conn("oracle", "password", true)} onClose={onClose} />);
+    expect(screen.queryByLabelText("Current password")).toBeNull();
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "n1" } });
+    fireEvent.change(screen.getByLabelText("New password again"), { target: { value: "n1" } });
+    fireEvent.click(screen.getByRole("button", { name: /Change password/ }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    // null: the saved password, read by the app (it never comes to the window).
+    expect(change).toHaveBeenCalledWith("c1", null, "n1");
+  });
+
+  it("an error saying the password expired is announced with its connection; others aren't", () => {
+    const seen: string[] = [];
+    const on = (e: Event) => seen.push((e as CustomEvent<string>).detail);
+    window.addEventListener("db:password-expired", on);
+    announcePasswordExpired({ kind: "auth", code: "password_expired", message: "ORA-28001: the password has expired" }, "c1");
+    announcePasswordExpired({ kind: "auth", message: "ORA-01017: invalid username/password" }, "c2");
+    announcePasswordExpired({ kind: "auth", code: "password_expired", message: "x" }, null);
+    window.removeEventListener("db:password-expired", on);
+    expect(seen).toEqual(["c1"]);
+  });
+
+  it("opens for the connection whose password expired, asking only the new one", async () => {
+    useStore.setState({ connections: [conn("oracle", "password", true)], expiredPassword: "c1" });
+    const change = vi.spyOn(api, "changePassword").mockResolvedValueOnce({ others: [] });
+    render(<ExpiredPasswordDialog />);
+    expect(await screen.findByText("The password of app has expired")).toBeTruthy();
+    expect(screen.queryByLabelText("Current password")).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain('refuses "Sales" until app has a new password');
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "n1" } });
+    fireEvent.change(screen.getByLabelText("New password again"), { target: { value: "n1" } });
+    fireEvent.click(screen.getByRole("button", { name: /Change password/ }));
+    await waitFor(() => expect(useStore.getState().expiredPassword).toBeNull());
+    expect(change).toHaveBeenCalledWith("c1", null, "n1");
+  });
+
+  it("an expired password DataBrain can't change is said, without a dialog", async () => {
+    const ro = conn("oracle", "password", true);
+    ro.config.read_only = true;
+    const toast = vi.fn();
+    useStore.setState({ connections: [ro], expiredPassword: "c1", toast });
+    render(<ExpiredPasswordDialog />);
+    await waitFor(() => expect(useStore.getState().expiredPassword).toBeNull());
+    expect(toast).toHaveBeenCalledWith(expect.stringContaining('The password of "Sales" has expired'), "error");
+    expect(screen.queryByText(/has expired/)).toBeNull();
   });
 });

@@ -70,6 +70,39 @@ impl QueryEngine {
         Ok(r?)
     }
 
+    /// Set `new` while signing in with `current`, an expired password (the
+    /// server refuses it for anything else): through the connection's SSH
+    /// tunnel, within its connect time limit. No session is kept; the
+    /// caller saves the new password. Refused on a read-only connection,
+    /// as [`Self::change_password`] is.
+    pub async fn change_expired_password(&self, connection_id: &str, current: &str, new: &str) -> Result<()> {
+        let profile = self.workspace.get_connection(connection_id)?;
+        let traits = profile.config.kind.traits();
+        if !traits.change_password {
+            return Err(EngineError::new("unsupported", format!("{} passwords can't be changed from DataBrain", traits.name)));
+        }
+        if profile.config.read_only {
+            return Err(EngineError::new("read_only", format!("\"{}\" is read-only: change its password with a connection that isn't", profile.name)));
+        }
+        if !matches!(profile.config.auth, databrain_auth::AuthMethod::Password { .. }) {
+            return Err(EngineError::new("invalid", "Only a connection that signs in with a password can change it here"));
+        }
+        let cfg = profile.config.normalized();
+        let connector = self.registry.get(cfg.kind)?;
+        connector.prepare(&cfg).await?;
+        let limit = self.connect_timeout_for(&cfg);
+        let work = async {
+            self.preflight(&cfg).await?;
+            let (cfg, _tunnel) = self.tunnel(&cfg, Some(connection_id), None).await?;
+            let creds: Arc<dyn CredentialSource> = Arc::new(InlineCredentialSource::new(cfg.auth.clone(), Some(SecretString::from(current.to_string()))));
+            connector.connect_changing_password(&cfg, creds, new).await.map_err(EngineError::from)
+        };
+        match tokio::time::timeout(limit, work).await {
+            Ok(r) => r,
+            Err(_) => Err(EngineError::new("connection", format!("No connection after {} s: the server did not finish the sign-in", limit.as_secs()))),
+        }
+    }
+
     /// Forget cached credentials after a connection is edited.
     pub fn forget_credentials(&self, connection_id: &str) {
         self.creds.lock().remove(connection_id);

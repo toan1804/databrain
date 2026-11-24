@@ -102,6 +102,10 @@ export const createAppSlice: StateCreator<State, [], [], AppSlice> = (set, get) 
       await onJobEvent((e) => get().handleJobEvent(e));
       window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
       window.addEventListener("db:ssh-host-key", (e) => set({ sshHostKey: (e as CustomEvent<SshHostKeyPrompt>).detail }));
+      // One dialog at a time: the explorer and a run failing together don't stack two.
+      window.addEventListener("db:password-expired", (e) => {
+        if (!get().expiredPassword) set({ expiredPassword: (e as CustomEvent<string>).detail });
+      });
       // Thin Oracle driver: downloaded once, on the first Oracle connection.
       let agentToast = false;
       void onOracleAgent((e) => {

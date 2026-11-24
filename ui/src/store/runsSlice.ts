@@ -1,5 +1,5 @@
 import type { StateCreator } from "zustand";
-import { announceSshHostKey, api, isTauri, toError } from "../lib/api";
+import { announcePasswordExpired, announceSshHostKey, api, isTauri, toError } from "../lib/api";
 import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, Origin, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
@@ -614,6 +614,8 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           const cancelled = e.error.kind === "cancelled";
           if (e.error.code === "oracle_client_missing") setTimeout(() => set({ oracleClientPrompt: true }), 0);
           announceSshHostKey(e.error);
+          // After this update: the dialog's listener sets the store too.
+          if (e.error.code === "password_expired") setTimeout(() => announcePasswordExpired(e.error, run.connectionId), 0);
           upd(e.index, {
             status: cancelled ? "cancelled" : "error",
             error: e.error,
