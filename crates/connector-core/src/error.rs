@@ -96,7 +96,8 @@ pub fn password_expired(code: Option<&str>, message: &str) -> bool {
         // Drivers add to the code: "1862 (HY000)", "18487 (line 1)".
         Some(c) => match c.split_whitespace().next().unwrap_or("") {
             "ORA-28001" => true,
-            "1862" | "1820" => says(&["password has expired", "must reset your password"]),
+            // MySQL "You must reset your password…", MariaDB "You must SET PASSWORD before…".
+            "1862" | "1820" => says(&["password has expired", "must reset your password", "must set password"]),
             "18487" | "18488" => says(&["password of the account has expired", "password of the account must be changed"]),
             _ => false,
         },
@@ -128,6 +129,7 @@ mod tests {
             (None, "Login failed for user 'app'. Reason: The password of the account has expired."),
             (Some("1862 (HY000)"), "Your password has expired. To log in you must change it using a client that supports expired passwords."),
             (Some("1820 (HY000)"), "You must reset your password using ALTER USER statement before executing this statement."),
+            (Some("1820 (HY000)"), "You must SET PASSWORD before executing this statement"),
             (Some("18487 (line 1)"), "Login failed for user 'app'. Reason: The password of the account has expired."),
             (Some("18488 (line 1)"), "Login failed for user 'app'. Reason: The password of the account must be changed."),
         ] {

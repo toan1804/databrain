@@ -47,3 +47,8 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# mysql_async 0.36.1 with one opt-in addition: CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS
+# (vendor/mysql_async/DATABRAIN.md), so an expired MySQL password can be changed.
+[patch.crates-io]
+mysql_async = { path = "vendor/mysql_async" }
