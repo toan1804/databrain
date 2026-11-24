@@ -64,6 +64,11 @@ impl ConnectorError {
     /// The server refused the sign-in (or every statement) because the
     /// password expired, so it must be changed before anything else.
     pub fn is_password_expired(&self) -> bool {
+        // A statement's error without a code is the statement's (or data's)
+        // words, never a sign-in's: `RAISE 'password has expired'`.
+        if self.code.is_none() && self.kind == ErrorKind::Query {
+            return false;
+        }
         password_expired(self.code.as_deref(), &self.message)
     }
 }
@@ -71,18 +76,24 @@ impl ConnectorError {
 /// Whether a driver's `code` and `message` say the password expired:
 /// Oracle ORA-28001; MySQL 1862 (refused at sign-in) and 1820 (signed in,
 /// but only ALTER USER allowed); SQL Server 18487 (expired) and 18488
-/// (must be changed). Their English messages too, for a driver that keeps
-/// no code. PostgreSQL and Redshift don't say why a sign-in failed.
+/// (must be changed). A number another database could also use counts only
+/// with its words about a password. Without a code, the words alone (a
+/// driver that keeps none), which [`ConnectorError::is_password_expired`]
+/// doesn't apply to a statement's error. PostgreSQL and Redshift don't say
+/// why a sign-in failed.
 pub fn password_expired(code: Option<&str>, message: &str) -> bool {
-    // Drivers add to the code: "1862 (HY000)", "18487 (line 1)".
-    let code = code.and_then(|c| c.split_whitespace().next()).unwrap_or("");
     let m = message.to_lowercase();
-    matches!(code, "ORA-28001" | "28001" | "1862" | "1820" | "18487" | "18488")
-        || m.contains("ora-28001")
-        || m.contains("password has expired")
-        || m.contains("password of the account has expired")
-        || m.contains("password of the account must be changed")
-        || m.contains("must reset your password")
+    let says = |words: &[&str]| words.iter().any(|w| m.contains(w));
+    match code {
+        // Drivers add to the code: "1862 (HY000)", "18487 (line 1)".
+        Some(c) => match c.split_whitespace().next().unwrap_or("") {
+            "ORA-28001" => true,
+            "1862" | "1820" => says(&["password has expired", "must reset your password"]),
+            "18487" | "18488" => says(&["password of the account has expired", "password of the account must be changed"]),
+            _ => false,
+        },
+        None => says(&["ora-28001", "password has expired", "password of the account has expired", "password of the account must be changed"]),
+    }
 }
 
 impl From<databrain_auth::AuthError> for ConnectorError {
@@ -106,6 +117,7 @@ mod tests {
         for (code, msg) in [
             (Some("ORA-28001"), "ORA-28001: the password has expired"),
             (None, "ORA-28001: the password has expired"),
+            (None, "Login failed for user 'app'. Reason: The password of the account has expired."),
             (Some("1862 (HY000)"), "Your password has expired. To log in you must change it using a client that supports expired passwords."),
             (Some("1820 (HY000)"), "You must reset your password using ALTER USER statement before executing this statement."),
             (Some("18487 (line 1)"), "Login failed for user 'app'. Reason: The password of the account has expired."),
@@ -120,10 +132,18 @@ mod tests {
             (Some("28P01"), "password authentication failed for user \"app\""),
             (Some("18456 (line 1)"), "Login failed for user 'app'."),
             (Some("18487000"), "x"),
-            (None, "table passwords has expired rows"),
+            // Another database's 1820 or 18487, and an Oracle code without its prefix.
+            (Some("1820 (line 3)"), "CREATE DATABASE failed. Some file names listed could not be created."),
+            (Some("18487"), "something else"),
+            (Some("28001"), "x"),
+            (Some("42P01"), "relation \"password has expired\" does not exist"),
         ] {
             assert!(!password_expired(code, msg), "{code:?} {msg}");
         }
         assert!(ConnectorError::connection("ORA-28001: the password has expired").with_code("ORA-28001").is_password_expired());
+        // A statement's own words (a RAISE, a cast of data) never are.
+        assert!(!ConnectorError::query("invalid input syntax for type integer: \"your password has expired\"").is_password_expired());
+        assert!(!ConnectorError::query("Your password has expired").with_code("P0001").is_password_expired());
+        assert!(ConnectorError::connection("ORA-28001: the password has expired").is_password_expired());
     }
 }

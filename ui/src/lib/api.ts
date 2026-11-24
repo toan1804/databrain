@@ -166,16 +166,26 @@ export function announceSshHostKey(err: EngineError) {
   if (p && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("db:ssh-host-key", { detail: p }));
 }
 
+/** What `db:password-expired` carries: the connection, and whether a run asked (it reopens a dismissed dialog). */
+export type PasswordExpired = { connectionId: string; run: boolean };
+
 /**
  * A connection whose password expired: the app offers to change it (the
  * server refuses anything else until then). `connectionId` is the one the
  * failing call or run was on.
  */
-export function announcePasswordExpired(err: EngineError, connectionId: string | null | undefined) {
+export function announcePasswordExpired(err: EngineError, connectionId: string | null | undefined, run = false) {
   if (err.code === "password_expired" && connectionId && typeof window !== "undefined") {
-    window.dispatchEvent(new CustomEvent("db:password-expired", { detail: connectionId }));
+    window.dispatchEvent(new CustomEvent<PasswordExpired>("db:password-expired", { detail: { connectionId, run } }));
   }
 }
+
+/**
+ * Calls the user makes happen (connecting, opening the explorer): only
+ * they open the dialog. Not completions as one types, revalidation or
+ * prefetch, which fail quietly and would take the keyboard mid-word.
+ */
+const ASKED_BY_THE_USER = new Set(["connect", "list_catalogs", "list_schemas", "list_objects"]);
 
 /** The saved connection a command is about, from its arguments. */
 function connectionOf(args?: Record<string, unknown>): string | null {
@@ -193,8 +203,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     // Any command can hit a missing Oracle client (connect, explorer, test).
     if (err.code === "oracle_client_missing" && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("db:oracle-client-missing"));
     announceSshHostKey(err);
-    // Not while changing it: the dialog says so itself.
-    if (cmd !== "change_password") announcePasswordExpired(err, connectionOf(args));
+    if (ASKED_BY_THE_USER.has(cmd)) announcePasswordExpired(err, connectionOf(args));
     throw err;
   }
 }

@@ -615,7 +615,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           if (e.error.code === "oracle_client_missing") setTimeout(() => set({ oracleClientPrompt: true }), 0);
           announceSshHostKey(e.error);
           // After this update: the dialog's listener sets the store too.
-          if (e.error.code === "password_expired") setTimeout(() => announcePasswordExpired(e.error, run.connectionId), 0);
+          if (e.error.code === "password_expired") setTimeout(() => announcePasswordExpired(e.error, run.connectionId, true), 0);
           upd(e.index, {
             status: cancelled ? "cancelled" : "error",
             error: e.error,

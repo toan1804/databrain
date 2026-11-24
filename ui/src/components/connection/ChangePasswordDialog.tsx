@@ -29,10 +29,25 @@ export function ExpiredPasswordDialog() {
     useStore.setState({ expiredPassword: null });
   }, [connId, changeable, conn]);
   if (!connId || !conn || !changeable) return null;
-  return <ChangePasswordDialog conn={conn} expired onClose={() => useStore.setState({ expiredPassword: null })} />;
+  return (
+    <ChangePasswordDialog
+      conn={conn}
+      expired
+      onClose={(changed) => {
+        const s = useStore.getState();
+        // Cancelled: the explorer doesn't ask again (a run does). Changed: its tree loads again.
+        useStore.setState({
+          expiredPassword: null,
+          expiredDismissed: changed ? s.expiredDismissed.filter((c) => c !== conn.id) : [...new Set([...s.expiredDismissed, conn.id])],
+        });
+        if (changed) void s.loadSchemas(conn.id, true).catch(() => {});
+      }}
+    />
+  );
 }
 
-export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn: ConnectionView; onClose: () => void; expired?: boolean }) {
+/** `onClose(true)` once the password was changed. */
+export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn: ConnectionView; onClose: (changed?: boolean) => void; expired?: boolean }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [again, setAgain] = useState("");
@@ -44,8 +59,9 @@ export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn:
   const [results, setResults] = useState<PasswordUpdate[] | null>(null);
   const user = conn.config.auth.method === "password" ? conn.config.auth.user : "";
   const mismatch = again !== "" && again !== next;
-  // With a password saved, it is the current one (read by the app, never shown here).
-  const useSaved = conn.has_secret;
+  // With a password saved, it is the current one (read by the app, never
+  // shown here); asked after all when the keychain doesn't give it.
+  const [useSaved, setUseSaved] = useState(conn.has_secret);
   const ready = (useSaved || current !== "") && next !== "" && next === again && !busy;
   const submit = async () => {
     if (!ready) return;
@@ -57,9 +73,12 @@ export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn:
       if (changed.others.length) {
         setOthers(changed.others);
         setPicked(new Set(changed.others.map((o) => o.id)));
-      } else onClose();
+      } else onClose(true);
     } catch (e) {
-      setProblem(toError(e).message);
+      const err = toError(e);
+      // The keychain didn't give the saved password: ask for it.
+      if (useSaved && err.message.startsWith("No password is saved")) setUseSaved(false);
+      setProblem(err.message);
     } finally {
       setBusy(false);
     }
@@ -72,10 +91,10 @@ export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn:
       const failed = done.filter((d) => d.error);
       if (!done.length) {
         useStore.getState().toast("Those connections are no longer saved", "info");
-        onClose();
+        onClose(true);
       } else if (!failed.length) {
         useStore.getState().toast(`New password saved for ${done.length} other connection${done.length === 1 ? "" : "s"}`, "success");
-        onClose();
+        onClose(true);
       } else setResults(done);
     } catch (e) {
       setProblem(toError(e).message);
@@ -87,16 +106,16 @@ export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn:
     return (
       <Modal
         title="Update the other connections too?"
-        onClose={() => !busy && onClose()}
+        onClose={() => !busy && onClose(true)}
         width={460}
         footer={
           results ? (
-            <button className="btn-primary" onClick={onClose}>
+            <button className="btn-primary" onClick={() => onClose(true)}>
               Close
             </button>
           ) : (
             <>
-              <button className="btn-ghost" onClick={onClose} disabled={busy}>
+              <button className="btn-ghost" onClick={() => onClose(true)} disabled={busy}>
                 Not now
               </button>
               <button className="btn-primary" disabled={busy || picked.size === 0} onClick={() => void updateOthers()}>
@@ -155,7 +174,7 @@ export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn:
       width={420}
       footer={
         <>
-          <button className="btn-ghost" onClick={onClose} disabled={busy}>
+          <button className="btn-ghost" onClick={() => onClose()} disabled={busy}>
             Cancel
           </button>
           <button className="btn-primary" disabled={!ready} onClick={() => void submit()}>

@@ -99,7 +99,15 @@ impl QueryEngine {
         };
         match tokio::time::timeout(limit, work).await {
             Ok(r) => r,
-            Err(_) => Err(EngineError::new("connection", format!("No connection after {} s: the server did not finish the sign-in", limit.as_secs()))),
+            // The sign-in may still finish in its thread (a driver's blocking
+            // logon isn't stopped by dropping it): the new password may be set.
+            Err(_) => Err(EngineError::new(
+                "connection",
+                format!(
+                    "No answer after {} s: the server didn't finish the sign-in. The new password may have been set all the same: try signing in with it before trying again",
+                    limit.as_secs()
+                ),
+            )),
         }
     }
 

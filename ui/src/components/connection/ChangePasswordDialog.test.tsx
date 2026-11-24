@@ -22,7 +22,7 @@ describe("change password", () => {
   const realToast = useStore.getState().toast;
   afterEach(() => {
     vi.restoreAllMocks();
-    useStore.setState({ expiredPassword: null, connections: [], toast: realToast });
+    useStore.setState({ expiredPassword: null, expiredDismissed: [], connections: [], toast: realToast });
   });
 
   it("is offered where the database lets a user change its own password with a password sign-in", () => {
@@ -92,7 +92,7 @@ describe("change password", () => {
 
   it("an error saying the password expired is announced with its connection; others aren't", () => {
     const seen: string[] = [];
-    const on = (e: Event) => seen.push((e as CustomEvent<string>).detail);
+    const on = (e: Event) => seen.push((e as CustomEvent<{ connectionId: string }>).detail.connectionId);
     window.addEventListener("db:password-expired", on);
     announcePasswordExpired({ kind: "auth", code: "password_expired", message: "ORA-28001: the password has expired" }, "c1");
     announcePasswordExpired({ kind: "auth", message: "ORA-01017: invalid username/password" }, "c2");
@@ -113,6 +113,47 @@ describe("change password", () => {
     fireEvent.click(screen.getByRole("button", { name: /Change password/ }));
     await waitFor(() => expect(useStore.getState().expiredPassword).toBeNull());
     expect(change).toHaveBeenCalledWith("c1", null, "n1");
+  });
+
+  it("after Cancel, the explorer doesn't ask again for that connection; a run does, and one at a time", () => {
+    const ask = useStore.getState().askExpiredPassword;
+    ask({ connectionId: "c1", run: false });
+    expect(useStore.getState().expiredPassword).toBe("c1");
+    ask({ connectionId: "c2", run: true });
+    expect(useStore.getState().expiredPassword).toBe("c1");
+    // What Cancel in the dialog leaves.
+    useStore.setState({ expiredPassword: null, expiredDismissed: ["c1"] });
+    ask({ connectionId: "c1", run: false });
+    expect(useStore.getState().expiredPassword).toBeNull();
+    ask({ connectionId: "c1", run: true });
+    expect(useStore.getState().expiredPassword).toBe("c1");
+  });
+
+  it("Cancel remembers the dismissal; a change clears it and reloads the explorer", async () => {
+    useStore.setState({ connections: [conn("oracle", "password", true)], expiredPassword: "c1" });
+    const { unmount } = render(<ExpiredPasswordDialog />);
+    fireEvent.click(await screen.findByText("Cancel"));
+    expect(useStore.getState().expiredDismissed).toEqual(["c1"]);
+    unmount();
+    const load = vi.fn().mockResolvedValue([]);
+    useStore.setState({ expiredPassword: "c1", loadSchemas: load });
+    vi.spyOn(api, "changePassword").mockResolvedValueOnce({ others: [] });
+    render(<ExpiredPasswordDialog />);
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "n1" } });
+    fireEvent.change(screen.getByLabelText("New password again"), { target: { value: "n1" } });
+    fireEvent.click(screen.getByRole("button", { name: /Change password/ }));
+    await waitFor(() => expect(load).toHaveBeenCalledWith("c1", true));
+    expect(useStore.getState().expiredDismissed).toEqual([]);
+  });
+
+  it("asks for the current password after all when the keychain doesn't give the saved one", async () => {
+    vi.spyOn(api, "changePassword").mockRejectedValueOnce({ kind: "invalid", message: "No password is saved for this connection: type the current one" });
+    render(<ChangePasswordDialog conn={conn("oracle", "password", true)} onClose={vi.fn()} />);
+    expect(screen.queryByLabelText("Current password")).toBeNull();
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "n1" } });
+    fireEvent.change(screen.getByLabelText("New password again"), { target: { value: "n1" } });
+    fireEvent.click(screen.getByRole("button", { name: /Change password/ }));
+    expect(await screen.findByLabelText("Current password")).toBeTruthy();
   });
 
   it("an expired password DataBrain can't change is said, without a dialog", async () => {

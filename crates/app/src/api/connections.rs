@@ -251,7 +251,7 @@ pub async fn change_password(state: &AppState, id: &str, current: Option<String>
         Err(e) if password_refused(&e) => {
             // PostgreSQL and Redshift answer an expired password (VALID UNTIL) as a wrong one.
             let expiry = if profile.config.kind == databrain_connector_core::ConnectorKind::Postgres {
-                " (if it expired, an administrator must set a new one: PostgreSQL doesn't let an expired password sign in, even to change it)"
+                " (if it may have expired: PostgreSQL refuses an expired password as a wrong one, even to change it, so an administrator must set a new one)"
             } else {
                 ""
             };

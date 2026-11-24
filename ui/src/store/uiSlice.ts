@@ -55,6 +55,8 @@ export interface UiSlice {
   sshHostKey: SshHostKeyPrompt | null;
   /** A connection whose password expired: the change-password dialog is open for it. */
   expiredPassword: string | null;
+  /** Connections whose expired-password dialog was cancelled: the explorer doesn't open it again (a run does). */
+  expiredDismissed: string[];
   toast: (message: string, kind?: Toast["kind"]) => void;
   dismissToast: (id: string) => void;
   setTheme: (t: Theme) => void;
@@ -102,6 +104,7 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   oracleClientPrompt: false,
   sshHostKey: null,
   expiredPassword: null,
+  expiredDismissed: [],
   toasts: [],
   confirm: null,
   compareDialog: null,

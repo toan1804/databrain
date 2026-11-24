@@ -35,7 +35,8 @@ pub const PASSWORD_EXPIRED: &str = "password_expired";
 impl From<ConnectorError> for EngineError {
     fn from(e: ConnectorError) -> Self {
         // An expired password is said apart (the app offers to change it),
-        // whatever kind the driver gave it; its own code is in the message.
+        // whatever kind the driver gave it. Its own code isn't kept (Oracle's
+        // is in the message; MySQL's and SQL Server's aren't).
         if e.is_password_expired() {
             return Self { kind: "auth".into(), message: e.message, code: Some(PASSWORD_EXPIRED.into()), position: None };
         }
@@ -94,6 +95,9 @@ mod password_tests {
             ConnectorError::query("You must reset your password using ALTER USER statement before executing this statement.").with_code("1820 (HY000)"),
         );
         assert_eq!(e.code.as_deref(), Some(PASSWORD_EXPIRED));
+        // Data or a RAISE saying so is the statement's error, its position kept.
+        let e = EngineError::from(ConnectorError::query("invalid input syntax for type integer: \"your password has expired\"").with_position(Some(8)));
+        assert_eq!((e.kind.as_str(), e.code, e.position), ("query", None, Some(8)));
         let e = EngineError::from(ConnectorError::connection("ORA-01017: invalid username/password").with_code("ORA-01017"));
         assert_eq!((e.kind.as_str(), e.code.as_deref()), ("connection", Some("ORA-01017")));
     }
