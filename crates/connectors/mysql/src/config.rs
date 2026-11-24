@@ -38,6 +38,26 @@ pub(crate) fn build_opts(cfg: &ConnectionConfig, user: String, password: String,
         .into()
 }
 
+/// Options for signing in with an expired password, to change it: the
+/// server then allows a session that takes only the change (MySQL: ALTER
+/// USER and SET PASSWORD; MariaDB: SET and SET PASSWORD; anything else
+/// fails with 1820), so nothing runs at sign-in (no init statements, no
+/// database chosen) and the settings the driver would read with a query
+/// are given.
+pub(crate) fn expired_opts(cfg: &ConnectionConfig, user: String, password: String, ssl: Option<SslOpts>) -> Opts {
+    OptsBuilder::default()
+        .ip_or_hostname(cfg.host_or_default())
+        .tcp_port(cfg.port.unwrap_or(3306))
+        .user(Some(user))
+        .pass(Some(password).filter(|p| !p.is_empty()))
+        .prefer_socket(false)
+        .max_allowed_packet(Some(16 * 1024 * 1024))
+        .wait_timeout(Some(60))
+        .can_handle_expired_passwords(true)
+        .ssl_opts(ssl)
+        .into()
+}
+
 /// TLS for the connection's SSL mode. With a CA file (`ssl_root_cert`)
 /// the server's certificate must chain to it (only to it); Verify also
 /// checks the host name. Without one, Prefer and Require encrypt without

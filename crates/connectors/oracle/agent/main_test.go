@@ -251,6 +251,111 @@ func TestAStatementThatDoesNotStopMakesTheHelperExit(t *testing.T) {
 	close(release)
 }
 
+// A cancel that isn't answered (a read that lost its place in the reply
+// waits forever) makes the helper exit: its connection closes, which frees
+// the session; DataBrain starts a new helper.
+func TestACancelThatIsNotAnsweredMakesTheHelperExit(t *testing.T) {
+	old := cancelGrace
+	cancelGrace = 100 * time.Millisecond
+	defer func() { cancelGrace = old }()
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	started, release, exited := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+		close(started)
+		<-release // ignores the cancel
+		return nil
+	}, func() { close(exited) })
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "query"})) }()
+	<-started
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 2, "op": "cancel", "target": 1})) }()
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an unanswered cancel kept the helper waiting")
+	}
+	close(release)
+}
+
+// A cancel answered in time doesn't: the next request runs.
+func TestACancelThatIsAnsweredKeepsTheHelper(t *testing.T) {
+	old := cancelGrace
+	cancelGrace = 200 * time.Millisecond
+	defer func() { cancelGrace = old }()
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	var mu sync.Mutex
+	var handled []uint64
+	exited := make(chan struct{})
+	started := make(chan struct{})
+	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+		mu.Lock()
+		handled = append(handled, r.ID)
+		mu.Unlock()
+		if r.ID == 1 {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}, func() { close(exited) })
+	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "query"}))
+	<-started
+	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 2, "op": "cancel", "target": 1}))
+	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 3, "op": "query"}))
+	select {
+	case <-exited:
+		t.Fatal("the helper exited after a cancel that was answered")
+	case <-time.After(500 * time.Millisecond):
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(handled) != "[1 3]" {
+		t.Fatalf("the request after the cancel didn't run: %v", handled)
+	}
+}
+
+// A stopped DML or block isn't ended by the watchdog: Oracle answers its
+// break once it has rolled it back, which may take long, and ending the
+// session would lose the transaction's other work.
+func TestAStoppedExecIsWaitedFor(t *testing.T) {
+	old := cancelGrace
+	cancelGrace = 50 * time.Millisecond
+	defer func() { cancelGrace = old }()
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	started, exited := make(chan struct{}), make(chan struct{})
+	release := make(chan struct{})
+	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+		close(started)
+		<-release // a long rollback
+		return nil
+	}, func() { close(exited) })
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "exec"})) }()
+	<-started
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 2, "op": "cancel", "target": 1})) }()
+	select {
+	case <-exited:
+		t.Fatal("a stopped exec ended the helper")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+}
+
+// readableFirst describes only what DBMS_SQL can parse without running it.
+func TestOnlySelectsAreDescribed(t *testing.T) {
+	for _, sql := range []string{"select 1 from dual", "SELECT*FROM t", "select/**/id from t", `select"DOC" from t`, "  -- c\n with q as (select 1 from dual) select * from q", "(select 1 from dual)"} {
+		if !isSelect(sql) {
+			t.Errorf("%q: not taken for a SELECT", sql)
+		}
+	}
+	for _, sql := range []string{"create table selection (a int)", "drop table t", "begin null; end;", "selected", "insert into t select 1 from dual", ""} {
+		if isSelect(sql) {
+			t.Errorf("%q: taken for a SELECT", sql)
+		}
+	}
+}
+
 // A request larger than the helper takes is answered with an error and the
 // next one runs: the helper doesn't take it for stdin closing and exit.
 func TestAnOversizedRequestIsRefusedAndTheHelperGoesOn(t *testing.T) {

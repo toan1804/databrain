@@ -372,7 +372,9 @@ impl QueryEngine {
                 }
                 Err(e) => {
                     status = if e.kind == "cancelled" { RunStatus::Cancelled } else { RunStatus::Error };
-                    if matches!(e.kind.as_str(), "connection") {
+                    // Lost, or ended to stop a statement its driver couldn't:
+                    // the next statement opens a new session.
+                    if matches!(e.kind.as_str(), "connection") || e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED) {
                         self.drop_session(&req.connection_id, req.session_key());
                     }
                     emit(JobEvent::StatementFailed {

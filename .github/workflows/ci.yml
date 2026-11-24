@@ -78,6 +78,19 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --no-fail-fast
 
+      # The thin Oracle driver's helper (Go): its own tests (the stop
+      # watchdog, the request loop), on Linux only.
+      - uses: actions/setup-go@v6
+        if: runner.os == 'Linux'
+        with:
+          go-version-file: crates/connectors/oracle/agent/go.mod
+          cache-dependency-path: crates/connectors/oracle/agent/go.sum
+
+      - name: Oracle helper tests (Go)
+        if: runner.os == 'Linux'
+        working-directory: crates/connectors/oracle/agent
+        run: go vet ./... && go test ./...
+
       # `cargo test` writes the TypeScript bindings of the Rust types (ts-rs):
       # they must be the ones committed.
       - name: TypeScript bindings up to date
@@ -177,6 +190,9 @@ jobs:
       DATABRAIN_MYSQL_HOST: 127.0.0.1
       DATABRAIN_MYSQL_PORT: 3306
       DATABRAIN_MYSQL_PASSWORD: pw
+      DATABRAIN_MARIADB_HOST: 127.0.0.1
+      DATABRAIN_MARIADB_PORT: 3307
+      DATABRAIN_MARIADB_PASSWORD: pw
       DATABRAIN_MONGO_URI: mongodb://127.0.0.1:27017
       DATABRAIN_CLICKHOUSE_HOST: 127.0.0.1
       DATABRAIN_CLICKHOUSE_PASSWORD: databrain
@@ -195,6 +211,12 @@ jobs:
           MYSQL_ROOT_PASSWORD: pw
         ports: ["3306:3306"]
         options: --health-cmd "mysqladmin ping -h 127.0.0.1 -ppw" --health-interval 5s --health-timeout 5s --health-retries 30
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: pw
+        ports: ["3307:3306"]
+        options: --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 30
       mongo:
         image: mongo:7
         ports: ["27017:27017"]
@@ -239,7 +261,7 @@ jobs:
         run: npm ci && npm run build
 
       # Redshift needs an AWS cluster (DATABRAIN_REDSHIFT_HOST): not here.
-      - name: Live tests (Postgres, MySQL, MongoDB, ClickHouse, SQL Server)
+      - name: Live tests (Postgres, MySQL, MariaDB, MongoDB, ClickHouse, SQL Server)
         # Not here: Redshift (needs a cluster) and the MySQL CA file test (needs a
         # server certificate for 127.0.0.1 signed by a known CA; run it by hand).
         run: cargo test -p databrain-connector-postgres -p databrain-connector-mysql -p databrain-connector-mongodb -p databrain-connector-clickhouse -p databrain-connector-mssql -p databrain-app --no-fail-fast -- --ignored --skip live_redshift --skip live_ca_file
