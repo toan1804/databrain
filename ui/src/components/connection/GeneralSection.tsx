@@ -5,6 +5,8 @@ import type { EnvTag, SslMode } from "../../lib/types";
 import { OracleAgentPanel, OracleClientPanel } from "../OracleClient";
 import { COLORS, Check, ENVS, Label, REDSHIFT_KEYS, isRedshift } from "./parts";
 import { ConnectionFormState } from "./useConnectionForm";
+import { isInstantClient } from "../../lib/oracle";
+
 
 export function GeneralSection({ f }: { f: ConnectionFormState }) {
   const { kind, info, name, setName, values, setValue, ssl, setSsl, readOnly, setReadOnly, color, setColor, env, setEnv, fields, defaultName, portValid, browseDb, addFiles } = f;
@@ -104,7 +106,7 @@ export function GeneralSection({ f }: { f: ConnectionFormState }) {
             return (
               <div key={f.key} className="col-span-2">
                 <Label htmlFor={id}>{f.label}</Label>
-                <select id={id} className="field" value={values.driver === "instant_client" ? "instant_client" : ""} onChange={(e) => setValue("driver", e.target.value)}>
+                <select id={id} className="field" value={isInstantClient(values.driver) ? "instant_client" : ""} onChange={(e) => setValue("driver", e.target.value)}>
                   <option value="">Thin (no Oracle software; downloaded on first use, 5 MB)</option>
                   <option value="instant_client">Oracle Instant Client</option>
                 </select>
@@ -112,8 +114,8 @@ export function GeneralSection({ f }: { f: ConnectionFormState }) {
               </div>
             );
           // Each Oracle driver has its own settings.
-          if (kind === "oracle" && f.key === "client_lib_dir" && values.driver !== "instant_client") return null;
-          if (kind === "oracle" && f.key === "driver_options" && values.driver === "instant_client") return null;
+          if (kind === "oracle" && f.key === "client_lib_dir" && !isInstantClient(values.driver)) return null;
+          if (kind === "oracle" && f.key === "driver_options" && isInstantClient(values.driver)) return null;
           if (f.key === "result_transfer")
             return (
               <div key={f.key}>
@@ -169,9 +171,9 @@ export function GeneralSection({ f }: { f: ConnectionFormState }) {
         })}
       </div>
 
-      {kind === "oracle" && values.driver !== "instant_client" && <OracleAgentPanel />}
+      {kind === "oracle" && !isInstantClient(values.driver) && <OracleAgentPanel />}
 
-      {kind === "oracle" && values.driver === "instant_client" && (
+      {kind === "oracle" && isInstantClient(values.driver) && (
         <OracleClientPanel libDir={values.client_lib_dir || null} onUseDir={(d) => setValue("client_lib_dir", d)} />
       )}
 
