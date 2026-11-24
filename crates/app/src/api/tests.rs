@@ -2159,3 +2159,179 @@ async fn change_password_checks_before_the_server() {
     let sf = save(ConnectorKind::Snowflake, Some("pw"));
     assert_eq!(change_password(&st, &sf.id, "pw".into(), "new".into()).await.unwrap_err().kind, "unsupported");
 }
+
+/// After a password change, the other saved connections signing in as the
+/// same user are found (same type, server, port and user, a password
+/// saved; SQL Server's instance and Oracle's service too); updating them
+/// saves the new password only where it signs in.
+#[tokio::test]
+async fn other_connections_with_the_same_login() {
+    let (st, _, _dir) = state();
+    let profile = |name: &str, kind: ConnectorKind, host: &str, port: Option<u16>, user: &str, has_secret: bool, opts: &[(&str, &str)]| {
+        let mut cfg = ConnectionConfig::new(kind, databrain_auth::AuthMethod::Password { user: user.into() });
+        cfg.host = Some(host.into());
+        cfg.port = port;
+        for (k, v) in opts {
+            cfg.options.insert(k.to_string(), v.to_string());
+        }
+        ConnectionProfile {
+            id: format!("id-{name}"),
+            name: name.into(),
+            config: cfg,
+            color: None,
+            env: EnvTag::None,
+            folder_id: None,
+            has_secret,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    };
+    let pg = profile("pg", ConnectorKind::Postgres, "db.example.com", Some(5432), "me", true, &[]);
+    // Same login: another name, the host in capitals, the default port left empty.
+    assert!(same_login(&pg, &profile("pg2", ConnectorKind::Postgres, "DB.example.com", None, "me", true, &[])));
+    // Not: itself, another user (case counts on PostgreSQL), host, port or type, no password saved.
+    assert!(!same_login(&pg, &pg));
+    assert!(!same_login(&pg, &profile("a", ConnectorKind::Postgres, "db.example.com", Some(5432), "Me", true, &[])));
+    assert!(!same_login(&pg, &profile("b", ConnectorKind::Postgres, "other", Some(5432), "me", true, &[])));
+    assert!(!same_login(&pg, &profile("c", ConnectorKind::Postgres, "db.example.com", Some(6543), "me", true, &[])));
+    assert!(!same_login(&pg, &profile("d", ConnectorKind::Mysql, "db.example.com", Some(5432), "me", true, &[])));
+    assert!(!same_login(&pg, &profile("e", ConnectorKind::Postgres, "db.example.com", Some(5432), "me", false, &[])));
+    // SQL Server: users in any case, the same instance; Oracle: the same service.
+    let ms = profile("ms", ConnectorKind::Mssql, "sql", None, "Sa", true, &[("instance", "PROD")]);
+    assert!(same_login(&ms, &profile("ms2", ConnectorKind::Mssql, "sql", Some(1433), "sa", true, &[("instance", "prod")])));
+    assert!(!same_login(&ms, &profile("ms3", ConnectorKind::Mssql, "sql", None, "sa", true, &[("instance", "TEST")])));
+    // Not through another SSH tunnel (the same host and port, another machine).
+    let mut tunnelled = profile("pg3", ConnectorKind::Postgres, "db.example.com", Some(5432), "me", true, &[]);
+    tunnelled.config.ssh = Some(databrain_connector_core::SshConfig {
+        host: "bastion".into(),
+        port: 22,
+        user: "ops".into(),
+        auth: databrain_connector_core::SshAuth::Agent,
+        host_key_fingerprint: None,
+    });
+    assert!(!same_login(&pg, &tunnelled));
+    let ora = profile("ora", ConnectorKind::Oracle, "o", None, "APP", true, &[("service_name", "pdb1")]);
+    assert!(same_login(&ora, &profile("ora2", ConnectorKind::Oracle, "o", None, "app", true, &[("service_name", "PDB1")])));
+    assert!(!same_login(&ora, &profile("ora3", ConnectorKind::Oracle, "o", None, "app", true, &[("service_name", "pdb2")])));
+    // The service may be the database field instead; a connect string picks its own.
+    let by_db = |name: &str, db: &str| {
+        let mut p = profile(name, ConnectorKind::Oracle, "o", None, "app", true, &[]);
+        p.config.database = Some(db.into());
+        p
+    };
+    assert!(same_login(&ora, &by_db("ora4", "PDB1")));
+    assert!(!same_login(&by_db("ora5", "PDB1"), &by_db("ora6", "PDB2")));
+    assert!(!same_login(
+        &ora,
+        &profile("ora7", ConnectorKind::Oracle, "o", None, "app", true, &[("service_name", "pdb1"), ("connect_string", "other:1521/pdb1")])
+    ));
+
+    // Updating: one that isn't the same login is refused; one where the new
+    // password can't be checked (no server here) keeps its own.
+    let save = |p: ConnectionProfile, secret: &str| {
+        save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile { id: String::new(), has_secret: false, ..p },
+                secret: Some(secret.into()),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+    };
+    let a = save(profile("A", ConnectorKind::Postgres, "127.0.0.1", Some(1), "me", true, &[]), "old");
+    let b = save(profile("B", ConnectorKind::Postgres, "127.0.0.1", Some(1), "me", true, &[]), "old");
+    let c = save(profile("C", ConnectorKind::Postgres, "127.0.0.1", Some(1), "you", true, &[]), "old");
+    let out = update_saved_passwords(&st, &a.id, &[b.id.clone(), c.id.clone()], "new".into()).await.unwrap();
+    assert_eq!(out.len(), 2);
+    assert!(out[0].error.as_deref().is_some_and(|e| e.starts_with("Couldn't sign in to check")), "{out:?}");
+    assert_eq!(out[1].error.as_deref(), Some("It doesn't sign in as the same user"));
+    // A wrong password, as each database says it.
+    let err = |code: Option<&str>, message: &str| EngineError { code: code.map(str::to_string), ..EngineError::new("connection", message) };
+    assert!(password_refused(&err(None, "password authentication failed for user \"me\"")));
+    assert!(password_refused(&err(Some("1045 (28000)"), "Zugriff verweigert")), "the code, whatever the language");
+    assert!(password_refused(&err(Some("18456 (line 1)"), "Échec de l'ouverture de session")));
+    assert!(password_refused(&err(None, "Access denied for user 'me'@'%' (using password: YES)")));
+    assert!(!password_refused(&err(Some("28000"), "no pg_hba.conf entry for host")), "not a wrong password");
+    assert!(password_refused(&err(None, "Login failed for user 'me'.")));
+    assert!(password_refused(&err(None, "ORA-01017: invalid username/password; logon denied")));
+    assert!(!password_refused(&err(None, "Connection refused (os error 61)")));
+    use secrecy::ExposeSecret;
+    for id in [&b.id, &c.id] {
+        assert_eq!(st.secrets.get(&SecretRef::for_connection(id)).unwrap().unwrap().expose_secret(), "old", "kept its own");
+    }
+}
+
+/// Live (PostgreSQL, `DATABRAIN_PG_*`): a password changed through one
+/// connection is offered for the other connection signing in as the same
+/// user, and updating it saves the new password there (it signs in).
+#[tokio::test]
+#[ignore = "needs DATABRAIN_PG_HOST"]
+async fn live_password_change_updates_the_other_connections() {
+    use secrecy::ExposeSecret;
+    let host = std::env::var("DATABRAIN_PG_HOST").expect("live test: DATABRAIN_PG_HOST not set");
+    let port = std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok());
+    let db = std::env::var("DATABRAIN_PG_DB").unwrap_or_else(|_| "postgres".into());
+    let (st, _, _dir) = state();
+    let save = |name: &str, user: &str, secret: &str| {
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: user.into() });
+        cfg.host = Some(host.clone());
+        cfg.port = port;
+        cfg.database = Some(db.clone());
+        save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: name.into(),
+                    config: cfg,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: false,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: Some(secret.into()),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+    };
+    let admin =
+        save("admin", &std::env::var("DATABRAIN_PG_USER").unwrap_or_else(|_| "postgres".into()), &std::env::var("DATABRAIN_PG_PASSWORD").unwrap_or_default());
+    let run = |sql: &str| databrain_query_engine::RunRequest {
+        connection_id: admin.id.clone(),
+        tab_id: "admin".into(),
+        sql: sql.into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Default::default(),
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+    };
+    let _ = st.engine.run_and_wait(&st.hub, run("drop role if exists kb_pw2"), None).await;
+    let out = st.engine.run_and_wait(&st.hub, run("create role kb_pw2 login password 'Old_pw_1'"), None).await.unwrap();
+    assert!(out[0].error.is_none(), "{out:?}");
+    let one = save("kb one", "kb_pw2", "Old_pw_1");
+    let two = save("kb two", "kb_pw2", "Old_pw_1");
+    let changed = change_password(&st, &one.id, "Old_pw_1".into(), "New_pw_2".into()).await.unwrap();
+    assert_eq!(changed.others, [OtherLogin { id: two.id.clone(), name: "kb two".into() }], "only the other one with this login");
+    let updated = update_saved_passwords(&st, &one.id, std::slice::from_ref(&two.id), "New_pw_2".into()).await.unwrap();
+    assert_eq!(updated[0].error, None, "{updated:?}");
+    assert_eq!(st.secrets.get(&SecretRef::for_connection(&two.id)).unwrap().unwrap().expose_secret(), "New_pw_2");
+    // A wrong password isn't saved: it must sign in.
+    let wrong = update_saved_passwords(&st, &one.id, std::slice::from_ref(&two.id), "Not_it".into()).await.unwrap();
+    assert!(wrong[0].error.as_deref().is_some_and(|e| e.starts_with("The new password doesn't sign in")), "{wrong:?}");
+    assert_eq!(st.secrets.get(&SecretRef::for_connection(&two.id)).unwrap().unwrap().expose_secret(), "New_pw_2");
+    st.engine.disconnect(&one.id);
+    st.engine.disconnect(&two.id);
+    let _ = st.engine.run_and_wait(&st.hub, run("drop role kb_pw2"), None).await;
+}

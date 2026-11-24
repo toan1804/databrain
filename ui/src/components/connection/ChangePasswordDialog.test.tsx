@@ -31,7 +31,7 @@ describe("change password", () => {
   });
 
   it("needs the new password twice, sends both and closes; a refusal stays shown", async () => {
-    const change = vi.spyOn(api, "changePassword").mockRejectedValueOnce({ kind: "query", message: "ORA-28003: password verification failed" }).mockResolvedValueOnce(null);
+    const change = vi.spyOn(api, "changePassword").mockRejectedValueOnce({ kind: "query", message: "ORA-28003: password verification failed" }).mockResolvedValueOnce({ others: [] });
     const onClose = vi.fn();
     render(<ChangePasswordDialog conn={conn("oracle")} onClose={onClose} />);
     const [current, next, again] = [screen.getByLabelText("Current password"), screen.getByLabelText("New password"), screen.getByLabelText("New password again")];
@@ -48,5 +48,27 @@ describe("change password", () => {
     fireEvent.click(button);
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(change).toHaveBeenLastCalledWith("c1", "old", "n1");
+  });
+
+  it("offers the new password to the other connections with this login, and says which it couldn't update", async () => {
+    vi.spyOn(api, "changePassword").mockResolvedValueOnce({ others: [{ id: "c2", name: "Sales copy" }, { id: "c3", name: "Reports" }] });
+    const update = vi
+      .spyOn(api, "updateSavedPasswords")
+      .mockResolvedValueOnce([{ id: "c3", name: "Reports", error: "Couldn't sign in to check the new password: timeout" }]);
+    const onClose = vi.fn();
+    render(<ChangePasswordDialog conn={conn("postgres")} onClose={onClose} />);
+    fireEvent.change(screen.getByLabelText("Current password"), { target: { value: "old" } });
+    fireEvent.change(screen.getByLabelText("New password"), { target: { value: "n1" } });
+    fireEvent.change(screen.getByLabelText("New password again"), { target: { value: "n1" } });
+    fireEvent.click(screen.getByRole("button", { name: /Change password/ }));
+    expect(await screen.findByText("Update the other connections too?")).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    // Both ticked; one unticked is left out.
+    fireEvent.click(screen.getByLabelText("Sales copy"));
+    fireEvent.click(screen.getByRole("button", { name: /Update it too/ }));
+    expect(await screen.findByText("Couldn't sign in to check the new password: timeout")).toBeTruthy();
+    expect(update).toHaveBeenCalledWith("c1", ["c3"], "n1");
+    fireEvent.click(screen.getByText("Close", { selector: "button" }));
+    expect(onClose).toHaveBeenCalled();
   });
 });
