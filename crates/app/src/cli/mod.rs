@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
+pub mod completions;
 pub mod jobs;
 pub mod mcp;
 pub mod query;
