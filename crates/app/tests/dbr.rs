@@ -176,6 +176,69 @@ async fn dbr_reads_data_files_and_folders() {
     assert_eq!(out, "{\"id\":1,\"id_2\":2,\"d\":\"0.1000000000000000055\",\"h\":\"123456789012345678901234\"}\n");
 }
 
+/// Every format dbr reads, typed as a user types it (relative, any case,
+/// a space in the name): its rows printed, never the name run as SQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn dbr_reads_every_data_format() {
+    let ext = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/duckdb-extensions");
+    if ext.is_dir() {
+        databrain_connector_duckdb::set_extension_dir(Some(ext.to_string_lossy().into_owned()));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    let rows = [
+        ("test.csv", "id,name\n1,a\n2,b\n"),
+        ("Test Data.CSV", "id,name\n1,a\n2,b\n"),
+        ("test.tsv", "id\tname\n1\ta\n2\tb\n"),
+        ("test.json", r#"[{"id":1,"name":"a"},{"id":2,"name":"b"}]"#),
+        ("test.jsonl", "{\"id\":1,\"name\":\"a\"}\n{\"id\":2,\"name\":\"b\"}\n"),
+        ("test.ndjson", "{\"id\":1,\"name\":\"a\"}\n{\"id\":2,\"name\":\"b\"}\n"),
+        ("test.psv", "id|name\n1|a\n2|b\n"),
+        ("test.txt", "id,name\n1,a\n2,b\n"),
+    ];
+    for (name, text) in rows {
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    let pq = dir.path().join("test.parquet");
+    let (code, _) =
+        dbr(&st, &["-i", &format!("COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(id, name)) TO '{}' (FORMAT parquet)", pq.display())], false).await;
+    assert_eq!(code, 0);
+    std::fs::copy(&pq, dir.path().join("test.pq")).unwrap();
+    // Compressed, any case: DuckDB writes them, then copied under upper-case names
+    // (another name: on macOS and Windows the case alone names the same file).
+    let values = "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(id, name)";
+    for (name, opts) in [
+        ("test.csv.gz", "FORMAT csv, COMPRESSION gzip"),
+        ("test.tsv.zst", "FORMAT csv, DELIMITER '\t', COMPRESSION zstd"),
+        ("test.jsonl.gz", "FORMAT json, COMPRESSION gzip"),
+    ] {
+        let to = dir.path().join(name);
+        let (code, out) = dbr(&st, &["-i", &format!("COPY ({values}) TO '{}' ({opts})", to.display())], false).await;
+        assert_eq!(code, 0, "{name}: {out}");
+        std::fs::copy(&to, dir.path().join(format!("UP_{}", name.to_uppercase()))).unwrap();
+    }
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let s = wb.add_worksheet();
+    s.write_string(0, 0, "id").unwrap();
+    s.write_string(0, 1, "name").unwrap();
+    for (r, n) in [(1u32, "a"), (2, "b")] {
+        s.write_number(r, 0, r as f64).unwrap();
+        s.write_string(r, 1, n).unwrap();
+    }
+    wb.save(dir.path().join("test.xlsx")).unwrap();
+
+    let more =
+        ["test.parquet", "test.pq", "test.xlsx", "test.csv.gz", "UP_TEST.CSV.GZ", "test.tsv.zst", "UP_TEST.TSV.ZST", "test.jsonl.gz", "UP_TEST.JSONL.GZ"];
+    for name in rows.iter().map(|r| r.0).chain(more) {
+        let typed = pathdiff(&dir.path().join(name));
+        let (code, out, err) = dbr_full(&st, &["-i", "--csv", &typed], false, Answer::No, Default::default()).await;
+        assert_eq!(code, 0, "{name}: {err}");
+        // Excel keeps every number as a double.
+        let want = if name.ends_with(".xlsx") { "id,name\n1.0,a\n2.0,b\n" } else { "id,name\n1,a\n2,b\n" };
+        assert_eq!(out, want, "{name}: {err}");
+    }
+}
+
 /// `p` relative to the current directory when it can be (as a user types it).
 fn pathdiff(p: &std::path::Path) -> String {
     let cwd = std::env::current_dir().unwrap();

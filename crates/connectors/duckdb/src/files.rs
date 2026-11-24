@@ -51,9 +51,24 @@ fn delimiter_of(path: &str) -> Option<&'static str> {
     }
 }
 
+/// DuckDB's `compression` option for a compressed file whose extension it
+/// won't see (it knows `.gz` and `.zst` in lower case only: `A.CSV.GZ`).
+fn compression_of(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    let c = if lower.ends_with(".gz") {
+        "gzip"
+    } else if lower.ends_with(".zst") {
+        "zstd"
+    } else {
+        return None;
+    };
+    (!path.ends_with(".gz") && !path.ends_with(".zst")).then_some(c)
+}
+
 /// SQL expression that reads the file (used in views and suggestions).
 pub fn scan_expr(path: &str, format: FileFormat) -> String {
     let lit = quote_literal(path);
+    let comp = compression_of(path).map(|c| format!(", compression = '{c}'")).unwrap_or_default();
     let dir_glob = || {
         let base = path.trim_end_matches(['/', '\\']);
         quote_literal(&format!("{base}/**/*.parquet"))
@@ -62,12 +77,12 @@ pub fn scan_expr(path: &str, format: FileFormat) -> String {
         // DuckDB's sniffer guesses the delimiter, and picks `,` for a TSV
         // whose values contain commas: the extension says which it is.
         FileFormat::Csv => match delimiter_of(path) {
-            Some(d) => format!("read_csv({lit}, delim = '{d}')"),
-            None => format!("read_csv({lit})"),
+            Some(d) => format!("read_csv({lit}, delim = '{d}'{comp})"),
+            None => format!("read_csv({lit}{comp})"),
         },
         FileFormat::Parquet if std::path::Path::new(path).is_dir() => format!("read_parquet({}, hive_partitioning = true)", dir_glob()),
         FileFormat::Parquet => format!("read_parquet({lit})"),
-        FileFormat::Json => format!("read_json_auto({lit})"),
+        FileFormat::Json => format!("read_json_auto({lit}{comp})"),
         FileFormat::Excel => format!("read_xlsx({lit})"),
         FileFormat::Delta => format!("delta_scan({lit})"),
         FileFormat::Iceberg => format!("iceberg_scan({lit}, allow_moved_paths = true)"),
@@ -220,6 +235,11 @@ mod tests {
         assert_eq!(scan_expr("/x/a.TSV", FileFormat::Csv), "read_csv('/x/a.TSV', delim = '\\t')");
         assert_eq!(scan_expr("/x/a.tsv.gz", FileFormat::Csv), "read_csv('/x/a.tsv.gz', delim = '\\t')");
         assert_eq!(scan_expr("/x/a.psv", FileFormat::Csv), "read_csv('/x/a.psv', delim = '|')");
+        // Compressed in upper case: DuckDB is told (it only sees `.gz`/`.zst`).
+        assert_eq!(scan_expr("/x/A.TSV.GZ", FileFormat::Csv), "read_csv('/x/A.TSV.GZ', delim = '\\t', compression = 'gzip')");
+        assert_eq!(scan_expr("/x/A.CSV.ZST", FileFormat::Csv), "read_csv('/x/A.CSV.ZST', compression = 'zstd')");
+        assert_eq!(scan_expr("/x/a.json.Gz", FileFormat::Json), "read_json_auto('/x/a.json.Gz', compression = 'gzip')");
+        assert_eq!(scan_expr("/x/a.csv.gz", FileFormat::Csv), "read_csv('/x/a.csv.gz')");
         assert_eq!(scan_expr("/x/a.txt", FileFormat::Csv), "read_csv('/x/a.txt')");
     }
 
