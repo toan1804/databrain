@@ -172,12 +172,20 @@ const SECRET_SAFE_OPTIONS: &[&str] = &[
     "excel_sheets",
     "connect_timeout_secs",
     "idle_disconnect_minutes",
-    // Oracle's driver (thin or Instant Client): the same server, user and
-    // connect string either way, and the password is never sent as it is
-    // (O5LOGON). Not `client_lib_dir`: another folder is other code that
-    // sees the password.
-    "driver",
 ];
+
+/// Oracle's `driver` (thin or Instant Client) leaves the password's
+/// destination when switching it can't change where or how it goes: no
+/// `driver_options` (TLS, a wallet, encryption: only the thin driver reads
+/// them) and no TNS alias (each driver looks one up in its own places, so
+/// it may name another host). An explicit address (a descriptor in
+/// parentheses, Easy Connect `host:port/service`) or the host fields reach
+/// the same server either way.
+fn oracle_driver_is_safe(c: &ConnectionConfig) -> bool {
+    let empty = |k: &str| c.opt(k).is_none_or(|v| v.trim().is_empty());
+    let explicit = c.opt("connect_string").map(str::trim).is_none_or(|s| s.is_empty() || s.starts_with('(') || s.contains('/') || s.contains(':'));
+    c.kind == ConnectorKind::Oracle && empty("driver_options") && explicit
+}
 
 impl ConnectionConfig {
     /// Where this connection's saved secrets go and how: the type, server,
@@ -187,7 +195,9 @@ impl ConnectionConfig {
     /// string, an account, a TLS switch all count). Two configs with a
     /// different destination must not share a saved password.
     pub fn secret_destination(&self) -> String {
-        let options: Vec<(&String, &String)> = self.options.iter().filter(|(k, _)| !SECRET_SAFE_OPTIONS.contains(&k.as_str())).collect();
+        let driver_safe = oracle_driver_is_safe(self);
+        let options: Vec<(&String, &String)> =
+            self.options.iter().filter(|(k, _)| !SECRET_SAFE_OPTIONS.contains(&k.as_str()) && !(driver_safe && k.as_str() == "driver")).collect();
         let ssh = self.ssh.as_ref().map(|s| (s.host.as_str(), s.port, s.user.as_str()));
         serde_json::json!({
             "kind": self.kind,
@@ -864,24 +874,43 @@ mod secret_destination_tests {
         assert_eq!(c.secret_destination(), base);
     }
 
-    /// Oracle: switching the driver (thin, Instant Client) keeps the saved
-    /// password; another Instant Client folder or connect string doesn't.
+    /// Oracle: switching the driver (thin, Instant Client, any spelling)
+    /// keeps the saved password where it can't change where or how it goes;
+    /// with TLS or wallet settings (only the thin driver reads them) or a
+    /// TNS alias (each driver looks it up elsewhere) it doesn't, nor another
+    /// Instant Client folder.
     #[test]
-    fn the_oracle_driver_is_the_same_destination() {
-        let ora = |driver: Option<&str>| {
+    fn the_oracle_driver_is_the_same_destination_only_where_it_changes_nothing() {
+        let ora = |driver: Option<&str>, extra: &[(&str, &str)]| {
             let mut c = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: "app".into() });
             c.host = Some("ora.example.com".into());
             c.options.insert("service_name".into(), "PDB1".into());
+            for (k, v) in extra {
+                c.options.insert((*k).into(), (*v).into());
+            }
             if let Some(d) = driver {
                 c.options.insert("driver".into(), d.into());
             }
-            c
+            c.secret_destination()
         };
-        let base = ora(None).secret_destination();
-        assert_eq!(ora(Some("instant_client")).secret_destination(), base);
-        assert_eq!(ora(Some("thin")).secret_destination(), base);
-        let mut lib = ora(Some("instant_client"));
-        lib.options.insert("client_lib_dir".into(), "/tmp/other".into());
-        assert_ne!(lib.secret_destination(), base);
+        // Allowed: the host fields, an Easy Connect string, a full descriptor.
+        for extra in [&[][..], &[("connect_string", "ora.example.com:1521/PDB1")], &[("connect_string", "(DESCRIPTION=(ADDRESS=(HOST=ora)(PORT=1521)))")]] {
+            let base = ora(None, extra);
+            for d in ["instant_client", "thick", "thin", ""] {
+                assert_eq!(ora(Some(d), extra), base, "{d} {extra:?}");
+            }
+        }
+        // Refused: TLS / wallet settings, a TNS alias.
+        for extra in [&[("driver_options", "SSL=true")][..], &[("driver_options", "WALLET=/w; SSL=true")], &[("connect_string", "PROD")]] {
+            assert_ne!(ora(Some("instant_client"), extra), ora(Some("thin"), extra), "{extra:?}");
+            assert_ne!(ora(Some("thick"), extra), ora(None, extra), "{extra:?}");
+        }
+        // Another Instant Client folder is other code that sees the password.
+        assert_ne!(ora(Some("instant_client"), &[("client_lib_dir", "/tmp/other")]), ora(None, &[]));
+        // Not Oracle: an option named driver counts.
+        let mut pg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "app".into() });
+        let before = pg.secret_destination();
+        pg.options.insert("driver".into(), "x".into());
+        assert_ne!(pg.secret_destination(), before);
     }
 }
