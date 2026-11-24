@@ -193,6 +193,8 @@ async fn dbr_reads_every_data_format() {
         ("test.json", r#"[{"id":1,"name":"a"},{"id":2,"name":"b"}]"#),
         ("test.jsonl", "{\"id\":1,\"name\":\"a\"}\n{\"id\":2,\"name\":\"b\"}\n"),
         ("test.ndjson", "{\"id\":1,\"name\":\"a\"}\n{\"id\":2,\"name\":\"b\"}\n"),
+        ("test.psv", "id|name\n1|a\n2|b\n"),
+        ("test.txt", "id,name\n1,a\n2,b\n"),
     ];
     for (name, text) in rows {
         std::fs::write(dir.path().join(name), text).unwrap();
@@ -201,6 +203,20 @@ async fn dbr_reads_every_data_format() {
     let (code, _) =
         dbr(&st, &["-i", &format!("COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(id, name)) TO '{}' (FORMAT parquet)", pq.display())], false).await;
     assert_eq!(code, 0);
+    std::fs::copy(&pq, dir.path().join("test.pq")).unwrap();
+    // Compressed, any case: DuckDB writes them, then copied under upper-case names
+    // (another name: on macOS and Windows the case alone names the same file).
+    let values = "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(id, name)";
+    for (name, opts) in [
+        ("test.csv.gz", "FORMAT csv, COMPRESSION gzip"),
+        ("test.tsv.zst", "FORMAT csv, DELIMITER '\t', COMPRESSION zstd"),
+        ("test.jsonl.gz", "FORMAT json, COMPRESSION gzip"),
+    ] {
+        let to = dir.path().join(name);
+        let (code, out) = dbr(&st, &["-i", &format!("COPY ({values}) TO '{}' ({opts})", to.display())], false).await;
+        assert_eq!(code, 0, "{name}: {out}");
+        std::fs::copy(&to, dir.path().join(format!("UP_{}", name.to_uppercase()))).unwrap();
+    }
     let mut wb = rust_xlsxwriter::Workbook::new();
     let s = wb.add_worksheet();
     s.write_string(0, 0, "id").unwrap();
@@ -211,21 +227,15 @@ async fn dbr_reads_every_data_format() {
     }
     wb.save(dir.path().join("test.xlsx")).unwrap();
 
-    for name in rows.iter().map(|r| r.0).chain(["test.parquet", "test.xlsx"]) {
+    let more =
+        ["test.parquet", "test.pq", "test.xlsx", "test.csv.gz", "UP_TEST.CSV.GZ", "test.tsv.zst", "UP_TEST.TSV.ZST", "test.jsonl.gz", "UP_TEST.JSONL.GZ"];
+    for name in rows.iter().map(|r| r.0).chain(more) {
         let typed = pathdiff(&dir.path().join(name));
         let (code, out, err) = dbr_full(&st, &["-i", "--csv", &typed], false, Answer::No, Default::default()).await;
         assert_eq!(code, 0, "{name}: {err}");
         // Excel keeps every number as a double.
         let want = if name.ends_with(".xlsx") { "id,name\n1.0,a\n2.0,b\n" } else { "id,name\n1,a\n2,b\n" };
         assert_eq!(out, want, "{name}: {err}");
-    }
-
-    // Not there: said so before anything runs, with and without -i.
-    let gone = pathdiff(&dir.path().join("gone.csv"));
-    for a in [vec!["-i", gone.as_str()], vec![gone.as_str()]] {
-        let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
-        let e = parse(&args, |p| p.is_file() || p.is_dir()).unwrap_err();
-        assert!(e.contains("gone.csv: no such file"), "{e}");
     }
 }
 
