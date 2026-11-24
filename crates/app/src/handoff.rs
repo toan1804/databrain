@@ -63,6 +63,23 @@ pub struct Reply {
     pub error: Option<String>,
 }
 
+/// Files the system asks the app to open (a double-click, "Open With"):
+/// each existing file or folder by its full path, a `.sql` file in its
+/// file tab, any other as data. Nothing runs: `None` when none is a file.
+pub fn file_opens(paths: impl IntoIterator<Item = PathBuf>) -> Option<DbrOpen> {
+    let items: Vec<OpenItem> = paths
+        .into_iter()
+        .filter(|p| p.exists())
+        .filter_map(|p| std::path::absolute(&p).ok())
+        .map(|p| {
+            let sql = p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql"));
+            let path = p.to_string_lossy().into_owned();
+            if sql { OpenItem::SqlFile { path } } else { OpenItem::Data { path } }
+        })
+        .collect();
+    (!items.is_empty()).then(|| DbrOpen { connection_id: None, items, params: HashMap::new(), run: false })
+}
+
 /// The request as the UI takes it: the connection found among `conns` as
 /// `dbr -i` finds it, the files checked to be there by their full paths.
 pub fn resolve(conns: &[databrain_workspace::ConnectionProfile], req: OpenRequest) -> Result<DbrOpen, String> {
@@ -534,6 +551,20 @@ mod tests {
         let h: Handler = Arc::new(|_| Ok(()));
         tokio::spawn(async move { answer(app, &*h, Some("t0k3n")).await });
         assert!(greeted(cli, "t0k3n").await);
+    }
+
+    #[test]
+    fn files_the_system_opens_are_opened_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (csv, sql) = (dir.path().join("a.csv"), dir.path().join("b.SQL"));
+        std::fs::write(&csv, "x\n1\n").unwrap();
+        std::fs::write(&sql, "select 1").unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        // macOS's own arguments and missing files are left out.
+        let o = file_opens([PathBuf::from("-psn_0_123"), csv.clone(), sql.clone(), dir.path().join("gone.csv"), dir.path().to_path_buf()]).unwrap();
+        assert_eq!(o.items, [OpenItem::Data { path: s(&csv) }, OpenItem::SqlFile { path: s(&sql) }, OpenItem::Data { path: s(dir.path()) }]);
+        assert!(!o.run && o.connection_id.is_none());
+        assert!(file_opens([PathBuf::from("-psn_0_123")]).is_none());
     }
 
     #[tokio::test]
