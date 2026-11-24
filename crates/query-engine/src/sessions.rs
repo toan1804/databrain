@@ -244,7 +244,7 @@ impl QueryEngine {
                 return false;
             }
             // A catalog call still running keeps its handle; the map forgets it.
-            if SessionRole::parse(key) == SessionRole::Meta {
+            if matches!(SessionRole::parse(key), SessionRole::Meta | SessionRole::Scan) {
                 return true;
             }
             !(busy.contains(key) || Arc::strong_count(&live.session) > 1 || live.session.in_transaction())
@@ -438,6 +438,24 @@ impl QueryEngine {
                 Ok(f(s).await?)
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Session for the explorer's background catalog work ([`Lane::Background`]):
+    /// its own for server databases; local files share the metadata session
+    /// (one handle per file), as indexing does.
+    pub(crate) fn scan_tab(&self, connection_id: &str) -> String {
+        match self.workspace.get_connection(connection_id).map(|p| p.config.kind) {
+            Ok(k) if !k.traits().local => SessionRole::Scan.key(),
+            _ => meta_tab(),
+        }
+    }
+
+    /// The catalog session for `lane`.
+    pub(crate) fn lane_tab(&self, connection_id: &str, lane: Lane) -> String {
+        match lane {
+            Lane::User => meta_tab(),
+            Lane::Background => self.scan_tab(connection_id),
         }
     }
 

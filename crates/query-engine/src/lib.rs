@@ -173,6 +173,17 @@ type Waiter = tokio::sync::mpsc::UnboundedSender<JobEvent>;
 
 type SessionKey = (String, String); // (connection_id, tab_id)
 
+/// Which catalog session a call takes: the user's (what someone waits for:
+/// Show DDL, Columns, completion, a click in the explorer) or the
+/// background's (the explorer's checks, refreshes and listings ahead of
+/// time), so the second never holds up the first ([`SessionRole::Scan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lane {
+    #[default]
+    User,
+    Background,
+}
+
 /// The explorer's catalog session ([`SessionRole::Meta`]).
 fn meta_tab() -> String {
     SessionRole::Meta.key()

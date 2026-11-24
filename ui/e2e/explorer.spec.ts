@@ -11,7 +11,8 @@ test.describe("explorer", () => {
     await expect(tree.filter({ hasText: /^orders/ })).toBeVisible();
     await expect(tree.filter({ hasText: /^customers/ })).toBeVisible();
     await expect(tree.filter({ hasText: /revenue_by_day/ })).toBeVisible();
-    expect(await calls(page, "list_objects")).toContainEqual({ id: "conn-shop", schema: "public" });
+    // The user's: opened on a click, not listed ahead of time.
+    expect(await calls(page, "list_objects")).toContainEqual({ id: "conn-shop", schema: "public", background: false });
 
     // A table opens to its columns (described on demand).
     await tree.filter({ hasText: /^orders/ }).click();

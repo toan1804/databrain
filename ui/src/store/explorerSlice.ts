@@ -60,7 +60,8 @@ export interface ExplorerSlice {
   openExplorer: (connId: string, force?: boolean) => Promise<void>;
   /** Schemas of one catalog (cache first, then live). */
   loadCatalogSchemas: (connId: string, catalog: string, force?: boolean) => Promise<SchemaInfo[]>;
-  loadObjects: (connId: string, schema: string, force?: boolean) => Promise<DbObject[]>;
+  /** `background`: listed ahead of time, not for a click: the backend's background catalog session, so it never holds up Show DDL, Columns or completion. */
+  loadObjects: (connId: string, schema: string, force?: boolean, background?: boolean) => Promise<DbObject[]>;
   /**
    * Tables of every chosen schema ("Choose schemas/catalogs…"), listed in the
    * background (cache first), so completion knows them without opening each.
@@ -307,7 +308,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       );
       const todo = cachedListed.filter(([, c]) => !c).map(([n]) => n).slice(0, 8);
       for (const name of todo) {
-        prefetchChain = prefetchChain.then(() => (get().explorer[connId]?.offline ? undefined : get().loadObjects(connId, name).catch(() => {})));
+        prefetchChain = prefetchChain.then(() => (get().explorer[connId]?.offline ? undefined : get().loadObjects(connId, name, false, true).catch(() => {})));
       }
       // Chosen schemas: all of them, so completion knows their tables.
       void get().exploreChosen(connId);
@@ -337,7 +338,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     }
     for (const id of ids) {
       if (get().objects[`${connId}|${id}`]) continue;
-      prefetchChain = prefetchChain.then(() => (current() && !get().objects[`${connId}|${id}`] ? get().loadObjects(connId, id).catch(() => {}) : undefined));
+      prefetchChain = prefetchChain.then(() => (current() && !get().objects[`${connId}|${id}`] ? get().loadObjects(connId, id, false, true).catch(() => {}) : undefined));
     }
     await prefetchChain;
   },
@@ -361,7 +362,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     put(list);
     return list;
   },
-  loadObjects: async (connId, schema, force = false) => {
+  loadObjects: async (connId, schema, force = false, background = false) => {
     const key = `${connId}|${schema}`;
     const have = get().objects[key];
     const put = (objs: DbObject[]) => set((s) => ({ objects: { ...s.objects, [key]: objs } }));
@@ -371,7 +372,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       const ex = get().explorer[connId];
       if (ex && !ex.offline && ex.deferred?.includes(schema)) {
         set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], deferred: s.explorer[connId]?.deferred?.filter((x) => x !== schema) } } }));
-        void once(`refresh|${key}`, () => api.refreshSchema(connId, schema))
+        void once(`bgrefresh|${key}`, () => api.refreshSchema(connId, schema, true))
           .then((r) => r.mode !== "unchanged" && put(r.objects))
           .catch(() => {});
       }
@@ -394,12 +395,14 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       const ex = get().explorer[connId];
       // Not covered by the fingerprint check (none on this engine, or deferred): check it now.
       if (ex && !ex.offline && (ex.fingerprints === false || ex.deferred?.includes(schema)))
-        void once(`refresh|${key}`, () => api.refreshSchema(connId, schema))
+        void once(`bgrefresh|${key}`, () => api.refreshSchema(connId, schema, true))
           .then((r) => r.mode !== "unchanged" && put(r.objects))
           .catch(() => {});
       return cached.objects;
     }
-    const objs = await once(`list|${key}`, () => api.listObjects(connId, schema));
+    // Its own dedupe key per session: a click never waits on a listing ahead
+    // of time queued behind the background session's scan.
+    const objs = await once(`${background ? "bglist" : "list"}|${key}`, () => api.listObjects(connId, schema, background));
     get().markOnline(connId);
     put(objs);
     return objs;

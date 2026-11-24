@@ -44,10 +44,18 @@ const VERSIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// next incremental refresh) are read meanwhile, outside the write queue,
 /// and everything is saved afterwards, in order with other cache writes.
 pub async fn list_objects(state: &AppState, id: &str, schema: &str) -> Result<Vec<DbObject>> {
-    let objs = state.engine.list_objects(id, schema).await?;
+    list_objects_in(state, id, schema, Lane::User).await
+}
+
+/// [`list_objects`] on `lane`'s catalog session: a schema the user opened
+/// ([`Lane::User`]), or one listed ahead of time ([`Lane::Background`]).
+/// The object versions read after it (for the next refresh) is background
+/// work either way: nobody waits for it.
+pub async fn list_objects_in(state: &AppState, id: &str, schema: &str, lane: Lane) -> Result<Vec<DbObject>> {
+    let objs = state.engine.list_objects_in(id, schema, lane).await?;
     if cacheable(state, id, schema) {
         let (engine, id3, sc3) = (state.engine.clone(), id.to_string(), schema.to_string());
-        let mut versions = tokio::spawn(async move { engine.object_versions(&id3, &sc3).await.ok().flatten() });
+        let mut versions = tokio::spawn(async move { engine.object_versions_in(&id3, &sc3, Lane::Background).await.ok().flatten() });
         let (ws, id2, sc, o2) = (state.workspace.clone(), id.to_string(), schema.to_string(), objs.clone());
         state.meta.push(async move {
             let got = match tokio::time::timeout(VERSIONS_WAIT, &mut versions).await {
@@ -148,31 +156,38 @@ pub struct SchemaRefresh {
 
 /// Bring one schema's listing up to date, table by table when the engine
 /// has object versions and the schema was listed before; otherwise list it.
+/// `lane`: the user's Refresh, or the explorer checking a schema it showed
+/// from its cache (in the background, [`Lane::Background`]).
 pub async fn refresh_schema(state: &AppState, id: &str, schema: &str) -> Result<SchemaRefresh> {
-    refresh_schema_at(state, id, schema, None, true).await
+    refresh_schema_in(state, id, schema, Lane::User).await
+}
+
+/// [`refresh_schema`] on `lane`'s catalog session.
+pub async fn refresh_schema_in(state: &AppState, id: &str, schema: &str, lane: Lane) -> Result<SchemaRefresh> {
+    refresh_schema_at(state, id, schema, None, true, lane).await
 }
 
 /// `fingerprint`: the schema's new one, when revalidation found it moved.
 /// `asked`: the user's Refresh. Either re-lists a schema whose objects
 /// didn't change, for its row estimates (in the fingerprint, not in
 /// object versions).
-async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint: Option<&str>, asked: bool) -> Result<SchemaRefresh> {
+async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint: Option<&str>, asked: bool, lane: Lane) -> Result<SchemaRefresh> {
     // Compare against the listings saved so far, not ones still queued.
     state.meta.flush().await;
     let ws = state.engine.workspace();
     let full =
         |objects: Vec<DbObject>, n: usize| SchemaRefresh { schema: schema.to_string(), mode: RefreshMode::Full, added: n, changed: 0, removed: 0, objects };
     if !cacheable(state, id, schema) {
-        let objs = state.engine.list_objects(id, schema).await?;
+        let objs = state.engine.list_objects_in(id, schema, lane).await?;
         let n = objs.len();
         return Ok(full(objs, n));
     }
     let old = ws.meta_versions(id, schema)?;
     let listed = ws.meta_listing(id, schema)?;
-    let new = state.engine.object_versions(id, schema).await?;
+    let new = state.engine.object_versions_in(id, schema, lane).await?;
     let (Some(new), Some(listed)) = (new.clone(), listed.filter(|_| !old.is_empty())) else {
         // First listing, or no versions: list everything.
-        let objs = state.engine.list_objects(id, schema).await?;
+        let objs = state.engine.list_objects_in(id, schema, lane).await?;
         ws.meta_put_listing(id, schema, &objs, new.as_ref(), fingerprint)?;
         let n = objs.len();
         return Ok(full(objs, n));
@@ -203,19 +218,19 @@ async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint
         // Same versions, so no table's columns become stale.
         // Refresh reports no change of definitions (its objects carry the
         // new estimates); revalidation a listing, so the explorer takes them.
-        let objs = state.engine.list_objects(id, schema).await?;
+        let objs = state.engine.list_objects_in(id, schema, lane).await?;
         ws.meta_put_listing(id, schema, &objs, Some(&new), fingerprint)?;
         let mode = if asked { RefreshMode::Unchanged } else { RefreshMode::Full };
         return Ok(SchemaRefresh { schema: schema.into(), mode, added: 0, changed: 0, removed: 0, objects: objs });
     }
     if touched.len() as f64 > (new.len().max(1) as f64) * FULL_RELIST_SHARE && touched.len() > 20 {
-        let objs = state.engine.list_objects(id, schema).await?;
+        let objs = state.engine.list_objects_in(id, schema, lane).await?;
         ws.meta_put_listing(id, schema, &objs, Some(&new), fingerprint)?;
         return Ok(SchemaRefresh { schema: schema.into(), mode: RefreshMode::Full, added, changed, removed: removed.len(), objects: objs });
     }
     let mut upserts = Vec::new();
     for chunk in touched.chunks(500) {
-        upserts.extend(state.engine.list_objects_named(id, schema, chunk).await?);
+        upserts.extend(state.engine.list_objects_named_in(id, schema, chunk, lane).await?);
     }
     // Only rows whose version moved (a name may cover a table and a function).
     upserts.retain(|o| {
@@ -263,7 +278,11 @@ pub async fn revalidate_explorer(state: &AppState, id: &str, open: &[String], fo
         return Ok(out);
     }
     let listed = ws.meta_listed_schemas(id)?;
-    let fps = state.engine.explorer_fingerprints(id).await?;
+    // The listed schemas only (the others have nothing to compare with), on
+    // the background session like the refreshes below: what the user waits
+    // for (Show DDL, Columns, completion) never queues behind this check.
+    let names: Vec<String> = listed.iter().map(|(s, _)| s.clone()).filter(|s| cacheable(state, id, s)).collect();
+    let fps = state.engine.explorer_fingerprints(id, &names).await?;
     ws.meta_touch_checked(id)?;
     let open: std::collections::HashSet<&str> = open.iter().map(String::as_str).collect();
     // Open schemas first.
@@ -293,7 +312,7 @@ pub async fn revalidate_explorer(state: &AppState, id: &str, open: &[String], fo
             out.deferred.push(schema);
             continue;
         }
-        match refresh_schema_at(state, id, &schema, fp.as_deref(), false).await {
+        match refresh_schema_at(state, id, &schema, fp.as_deref(), false, Lane::Background).await {
             Ok(r) => out.refreshed.push(r),
             // E.g. dropped meanwhile: the schema list refresh removes it.
             Err(_) => out.deferred.push(schema),

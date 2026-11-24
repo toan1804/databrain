@@ -249,7 +249,8 @@ export const api = {
   trustSshHostKey: (host: string, port: number, fingerprint: string) => call<number>("trust_ssh_host_key", { host, port, fingerprint }),
 
   listSchemas: (id: string) => call<SchemaInfo[]>("list_schemas", { id }),
-  listObjects: (id: string, schema: string) => call<DbObject[]>("list_objects", { id, schema }),
+  /** `background`: listed ahead of time (the backend's background catalog session), not for a click. */
+  listObjects: (id: string, schema: string, background = false) => call<DbObject[]>("list_objects", { id, schema, background }),
   /** Catalogs of three-level engines (null for two-level ones). */
   listCatalogs: (id: string) => call<CatalogInfo[] | null>("list_catalogs", { id }),
   listCatalogSchemas: (id: string, catalog: string) => call<SchemaInfo[]>("list_catalog_schemas", { id, catalog }),
@@ -259,7 +260,8 @@ export const api = {
   cachedColumns: (id: string, schema: string, name: string) => call<CachedColumns | null>("cached_columns", { id, schema, name }),
   clearExplorerCache: (id: string) => call<void>("clear_explorer_cache", { id }),
   /** Bring one schema up to date: only changed objects are fetched when the engine has versions. */
-  refreshSchema: (id: string, schema: string) => call<SchemaRefresh>("refresh_schema", { id, schema }),
+  /** `background`: the explorer re-checking a schema it showed from its cache; Refresh is the user's. */
+  refreshSchema: (id: string, schema: string, background = false) => call<SchemaRefresh>("refresh_schema", { id, schema, background }),
   /** One fingerprint query; changed cached schemas are refreshed table by table. */
   revalidateExplorer: (id: string, open: string[], force: boolean) => call<ExplorerRevalidation>("revalidate_explorer", { id, open, force }),
   searchObjects: (id: string, query: string, limit?: number) =>

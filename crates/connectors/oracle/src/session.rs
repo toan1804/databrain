@@ -142,6 +142,20 @@ impl OracleSession {
     }
 }
 
+/// Per owner: a count and a hash of each object's kind, name and last DDL
+/// time; `filter` narrows the owners (`" and owner in (…)"`).
+fn fingerprints_sql(filter: &str) -> String {
+    format!(
+        "select owner, count(*) || '/' || sum(ora_hash(object_type || ':' || object_name || ':' || to_char(last_ddl_time, 'YYYYMMDDHH24MISS'))) \
+         from all_objects where object_type in ('TABLE','VIEW','MATERIALIZED VIEW','PROCEDURE','FUNCTION','PACKAGE','SEQUENCE') \
+           and object_name not like 'BIN$%'{filter} group by owner"
+    )
+}
+
+fn fingerprint_rows(rows: Vec<Vec<Option<String>>>) -> std::collections::HashMap<String, String> {
+    rows.into_iter().filter_map(|r| Some((r.first().cloned().flatten()?, r.get(1).cloned().flatten().unwrap_or_default()))).collect()
+}
+
 #[async_trait]
 impl Session for OracleSession {
     fn kind(&self) -> ConnectorKind {
@@ -535,15 +549,19 @@ impl Session for OracleSession {
 
     /// Every object type the explorer lists: count + hash of name and DDL time.
     async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let rows = self
-            .query_named(
-                "select owner, count(*) || '/' || sum(ora_hash(object_type || ':' || object_name || ':' || to_char(last_ddl_time, 'YYYYMMDDHH24MISS'))) \
-                 from all_objects where object_type in ('TABLE','VIEW','MATERIALIZED VIEW','PROCEDURE','FUNCTION','PACKAGE','SEQUENCE') \
-                   and object_name not like 'BIN$%' group by owner",
-                vec![],
-            )
-            .await?;
-        Ok(Some(rows.into_iter().filter_map(|r| Some((r.first().cloned().flatten()?, r.get(1).cloned().flatten().unwrap_or_default()))).collect()))
+        Ok(Some(fingerprint_rows(self.query_dynamic(fingerprints_sql("")).await?)))
+    }
+
+    /// The listed owners only: ALL_OBJECTS grouped over every owner of a
+    /// large database takes a minute or more; a few owners, a moment.
+    /// At most 1,000 owners per query (Oracle's IN list).
+    async fn explorer_fingerprints_of(&self, schemas: &[String]) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in schemas.chunks(1000) {
+            let owners = chunk.iter().map(|s| databrain_connector_core::quote_literal(s)).collect::<Vec<_>>().join(", ");
+            out.extend(fingerprint_rows(self.query_dynamic(fingerprints_sql(&format!(" and owner in ({owners})"))).await?));
+        }
+        Ok(Some(out))
     }
 
     /// last_ddl_time per object (same kinds and de-duplication as `list_objects`).
@@ -734,6 +752,25 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
         read("select 1 from dual").await.unwrap();
         run(&s, "drop table db_xml purge").await;
+    }
+
+    /// Live, thin driver: the fingerprints of the listed owners only are
+    /// the same as the whole database's for those owners, and nothing else.
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST and DATABRAIN_ORACLE_AGENT (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_fingerprints_of_listed_owners() {
+        let s = live_session("thin", false).await.expect("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
+        let all = s.explorer_fingerprints().await.unwrap().unwrap();
+        assert!(all.len() > 2, "{all:?}");
+        let mut owners: Vec<String> = all.keys().take(2).cloned().collect();
+        owners.push("NO_SUCH_OWNER".into());
+        owners.push("O'BRIEN".into());
+        let some = s.explorer_fingerprints_of(&owners).await.unwrap().unwrap();
+        assert_eq!(some.len(), 2, "{some:?}");
+        for (k, v) in &some {
+            assert_eq!(all.get(k), Some(v), "{k}");
+        }
+        assert!(s.explorer_fingerprints_of(&[]).await.unwrap().unwrap().is_empty());
     }
 
     /// Live, Instant Client driver: same checks (DATABRAIN_ORACLE_LIB_DIR).

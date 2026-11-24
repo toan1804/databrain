@@ -33,9 +33,10 @@ pub(crate) async fn list_schemas(state: State<'_, AppState>, id: String) -> R<Ve
     api::list_schemas(&state, &id).await
 }
 
+/// `background`: listed ahead of time, not for a click (its own catalog session).
 #[tauri::command]
-pub(crate) async fn list_objects(state: State<'_, AppState>, id: String, schema: String) -> R<Vec<DbObject>> {
-    api::list_objects(&state, &id, &schema).await
+pub(crate) async fn list_objects(state: State<'_, AppState>, id: String, schema: String, background: Option<bool>) -> R<Vec<DbObject>> {
+    api::list_objects_in(&state, &id, &schema, lane(background)).await
 }
 
 #[tauri::command]
@@ -68,9 +69,10 @@ pub(crate) async fn clear_explorer_cache(state: State<'_, AppState>, id: String)
     api::clear_explorer_cache(&state, &id).await
 }
 
+/// `background`: the explorer checking a schema it showed from its cache.
 #[tauri::command]
-pub(crate) async fn refresh_schema(state: State<'_, AppState>, id: String, schema: String) -> R<api::SchemaRefresh> {
-    api::refresh_schema(&state, &id, &schema).await
+pub(crate) async fn refresh_schema(state: State<'_, AppState>, id: String, schema: String, background: Option<bool>) -> R<api::SchemaRefresh> {
+    api::refresh_schema_in(&state, &id, &schema, lane(background)).await
 }
 
 #[tauri::command]
@@ -151,4 +153,9 @@ pub(crate) async fn schema_diff(
 #[tauri::command]
 pub(crate) async fn explore_query(state: State<'_, AppState>, connection_id: String, key: String, sql: String) -> R<api::ExploreRows> {
     api::explore_query(&state, &connection_id, &key, &sql).await
+}
+
+/// The catalog session a command from the explorer takes.
+fn lane(background: Option<bool>) -> databrain_query_engine::Lane {
+    if background.unwrap_or(false) { databrain_query_engine::Lane::Background } else { databrain_query_engine::Lane::User }
 }

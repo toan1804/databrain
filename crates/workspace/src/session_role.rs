@@ -41,6 +41,11 @@ pub enum SessionRole {
     Meta,
     /// AI indexing's own catalog session on a server database.
     Index,
+    /// The explorer's background catalog work on a server database (the
+    /// check after connecting or DDL, the refreshes it starts, listings
+    /// ahead of time): its own session, so what the user waits for (Show
+    /// DDL, Columns, completion, a click) never queues behind a scan.
+    Scan,
     /// An assistant chat's sessions (`chat` is `mcp` for the MCP server).
     Ai { chat: String, part: AiPart },
     /// A job step's runs.
@@ -62,6 +67,7 @@ pub enum SessionRole {
 
 const META: &str = "__meta__";
 const INDEX: &str = "__index__";
+const SCAN: &str = "__scan__";
 const TESTS: &str = "__tests__";
 const LOAD: &str = "__load__:";
 const EXPORT: &str = "__export__:";
@@ -77,6 +83,9 @@ impl SessionRole {
         }
         if key == INDEX {
             return SessionRole::Index;
+        }
+        if key == SCAN {
+            return SessionRole::Scan;
         }
         if key == TESTS {
             return SessionRole::Tests;
@@ -120,6 +129,7 @@ impl SessionRole {
             SessionRole::Notebook { notebook, cell: Some(c) } => format!("nb:{notebook}:{c}"),
             SessionRole::Meta => META.into(),
             SessionRole::Index => INDEX.into(),
+            SessionRole::Scan => SCAN.into(),
             SessionRole::Ai { chat, part } => format!("{}{chat}", part.prefix()),
             SessionRole::JobStep { job, node } => format!("job:{job}:{node}"),
             SessionRole::Load(id) => format!("{LOAD}{id}"),
@@ -134,7 +144,7 @@ impl SessionRole {
     /// settings, a transaction), so it can be closed and opened again at
     /// any time (Refresh, the sandbox switch on a DuckDB file).
     pub fn catalog_only(&self) -> bool {
-        matches!(self, SessionRole::Meta | SessionRole::Index)
+        matches!(self, SessionRole::Meta | SessionRole::Index | SessionRole::Scan)
     }
 
     /// Closed by its owner when its one task ends (a load, a dry run, an
