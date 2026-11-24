@@ -1,6 +1,6 @@
 # Design: one query over several connections
 
-Status: proposal (2026-11-25). Nothing is implemented. Decisions so far and what is still open are in §12.
+Status: proposal (2026-11-25). Nothing is implemented. The decisions are in §12; nothing is open.
 
 ## 1. Problem
 
@@ -111,7 +111,7 @@ and per keystroke for highlighting, so it gets a `crates/bench` path.
   others; the error names the part and its connection.
 - **Sessions:** a part never runs in the tab's manual-commit transaction (it has
   its own session); a combined query is refused while the tab has a transaction
-  open only if the tab's connection is one of its parts (§12, open 1).
+  open only if the tab's connection is one of its parts (§12, 5).
 - **Cost preview** (BigQuery, Snowflake, Databricks): `estimate_cost` per part,
   shown per part and summed.
 - **History:** one entry for the combined statement (on Results), plus one per
@@ -124,15 +124,18 @@ A join over a truncated part is a wrong answer that looks right. So:
 
 - Parts are read **whole**. The tab's row limit applies to the outer query's
   result only.
-- A per-part cap (setting `combined_part_rows`, default 5,000,000 rows) **fails**
+- A per-part cap (setting `combined_part_rows`, default 1,000,000 rows) **fails**
   the statement when a part passes it, instead of cutting it. The user always
   knows: the error names the part and the cap ("part `orders` has more than
-  5,000,000 rows: filter it in the part, or run again without the limit") and
+  1,000,000 rows: filter it in the part, or run again without the limit") and
   has a "Run again without the limit" action (for that tab; the setting changes
   the default). `dbr` takes `--part-rows N` (0: no limit); a job step has the
   same as a setting of the step.
-- Large parts go to disk as results already do (the outputs budget); the outer
-  query reads their Parquet files.
+- The cap is in rows, not bytes: rows are what the user can act on (a `WHERE`,
+  a `LIMIT`). Memory is already protected: large parts go to disk as results
+  do (the outputs budget), and the outer query reads their Parquet files.
+- Disk is checked apart: a part stops, saying so, when the disk holding the
+  spill folder is nearly full (`sysmem::disk_space`), whatever its row count.
 - Progress shows each part's rows as they arrive, so a part that is reading far
   more than expected is seen while it runs.
 
@@ -236,7 +239,7 @@ masks exist. App size: unchanged apart from the code.
 3. **Around it:** the AI and MCP, lineage across parts, history grouping in the
    UI.
 4. **Maybe:** pushdown of simple filters; `@conn.schema.table` as a shorthand
-   for a whole-table part (§12, open 2).
+   for a whole-table part (§12, 6).
 
 Each phase is its own PR or several, reviewed as usual.
 
@@ -251,15 +254,15 @@ Decided (2026-11-25):
    message and a way to run without it.
 4. **MongoDB and Neo4j parts:** phase 2, refused with a clear message before.
 
-Open:
+5. **A part on the tab's connection while the tab has a transaction open** is
+   refused, saying why (it would run in its own session and not see the
+   uncommitted changes).
+6. **No whole-table shorthand** (`FROM @sales.public.orders`) before pushdown:
+   it is an easy way to read 40 M rows by accident.
+7. **The cap is in rows, 1,000,000 by default** (§4): it catches the unfiltered
+   part, and going past it is one action; a free-disk check covers bytes.
 
-1. **A part on the tab's connection while the tab has a transaction open:** run
-   the part in its own session (it won't see uncommitted changes) or refuse?
-   Proposed: refuse, saying why.
-2. **Shorthand for a whole table** (`FROM @sales.public.orders`): tempting, and
-   an easy way to read 40 M rows by accident. Proposed: not before pushdown.
-3. **The default cap** (5,000,000 rows): the right number, and whether it should
-   be in bytes like the outputs budget.
+Open: none.
 
 ## 13. Alternatives considered
 
