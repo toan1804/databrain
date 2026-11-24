@@ -166,6 +166,35 @@ export function announceSshHostKey(err: EngineError) {
   if (p && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("db:ssh-host-key", { detail: p }));
 }
 
+/** What `db:password-expired` carries: the connection, and whether a run asked (it reopens a dismissed dialog). */
+export type PasswordExpired = { connectionId: string; run: boolean };
+
+/**
+ * A connection whose password expired: the app offers to change it (the
+ * server refuses anything else until then). `connectionId` is the one the
+ * failing call or run was on.
+ */
+export function announcePasswordExpired(err: EngineError, connectionId: string | null | undefined, run = false) {
+  if (err.code === "password_expired" && connectionId && typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent<PasswordExpired>("db:password-expired", { detail: { connectionId, run } }));
+  }
+}
+
+/**
+ * Calls the user makes happen (connecting, opening the explorer): only
+ * they open the dialog. Not completions as one types, revalidation or
+ * prefetch, which fail quietly and would take the keyboard mid-word.
+ */
+const ASKED_BY_THE_USER = new Set(["connect", "list_catalogs", "list_schemas", "list_objects"]);
+
+/** The saved connection a command is about, from its arguments. */
+function connectionOf(args?: Record<string, unknown>): string | null {
+  if (!args) return null;
+  const req = args.req as { connection_id?: unknown } | undefined;
+  for (const v of [args.id, args.connId, args.connectionId, args.connection_id, req?.connection_id]) if (typeof v === "string" && v) return v;
+  return null;
+}
+
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
     return await invoke<T>(cmd, args);
@@ -174,6 +203,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     // Any command can hit a missing Oracle client (connect, explorer, test).
     if (err.code === "oracle_client_missing" && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("db:oracle-client-missing"));
     announceSshHostKey(err);
+    if (ASKED_BY_THE_USER.has(cmd)) announcePasswordExpired(err, connectionOf(args));
     throw err;
   }
 }
@@ -211,7 +241,8 @@ export const api = {
   reconnect: (id: string) => call<number>("reconnect", { id }),
   /** Change the connection's password on the server, then the saved one. */
   /** Change the password on the server and the saved one; the other connections signing in as the same user. */
-  changePassword: (id: string, current: string, next: string) => call<PasswordChanged>("change_password", { id, current, new: next }),
+  /** `current`: `null` uses the password saved for the connection (it never comes to the window). */
+  changePassword: (id: string, current: string | null, next: string) => call<PasswordChanged>("change_password", { id, current, new: next }),
   /** Save the new password for those of them that `ids` names, each once it signs in there. */
   updateSavedPasswords: (source: string, ids: string[], next: string) => call<PasswordUpdate[]>("update_saved_passwords", { source, ids, new: next }),
   /** Pin a checked SSH host key on the saved connections through `host:port` that have none. */
