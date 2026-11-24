@@ -191,9 +191,9 @@ type session struct {
 	// (e.g. current_schema, which unqualified names depend on), in the
 	// order they last ran; see remember.
 	setup []setupStmt
-	// plans: each query's columns of an object type, converted before it
-	// runs (see readableFirst), by its text.
-	plans map[string]plan
+	// plain: query texts found to have no column of an object type (see
+	// readableFirst), so they run without being described again.
+	plain map[string]bool
 }
 
 // setupStmt is a remembered ALTER SESSION statement and what it sets.
@@ -383,7 +383,7 @@ func (s *session) reconnect(ctx context.Context) error {
 		return errors.New("not connected")
 	}
 	s.close()
-	s.db, s.conn, s.tx, s.plans = nil, nil, nil, nil
+	s.db, s.conn, s.tx, s.plain = nil, nil, nil, nil
 	if err := s.connect(ctx, s.req); err != nil {
 		return err
 	}
@@ -1145,11 +1145,8 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		w.mu.Lock()
 		before := w.frames
 		w.mu.Unlock()
-		r, err := s.readableFirst(ctx, r)
-		if err != nil {
-			return err
-		}
-		err = s.withReconnect(ctx, w, r, func() error { return s.query(ctx, w, r) })
+		r := s.readableFirst(ctx, r)
+		err := s.withReconnect(ctx, w, r, func() error { return s.query(ctx, w, r) })
 		if !undecodable(err) || ctx.Err() != nil {
 			return err
 		}
@@ -1161,7 +1158,7 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		return s.withReconnect(ctx, w, r, func() error { return s.textQuery(ctx, w, r) })
 	case "exec":
 		// DDL may change a table's columns: queries are described again.
-		s.plans = nil
+		s.plain = nil
 		return s.withReconnect(ctx, w, r, func() error { return s.exec(ctx, w, r) })
 	case "execmany":
 		return s.execMany(ctx, w, r)
@@ -1217,6 +1214,7 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 	var running uint64
 	var cancel context.CancelFunc
 	var runDone chan struct{} // closed when the running request returns
+	var runOp string
 	var gone bool
 	finished := make(chan struct{})
 	defer close(finished)
@@ -1232,10 +1230,11 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 				gone = true
 				if cancel != nil {
 					cancel()
+					grace := gracePeriod
 					go func() {
 						select {
 						case <-finished:
-						case <-time.After(gracePeriod):
+						case <-time.After(grace):
 							stuck()
 						}
 					}()
@@ -1264,16 +1263,21 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 				mu.Lock()
 				if cancel != nil && (r.Target == 0 || r.Target == running) {
 					cancel()
-					// A cancel that isn't answered: leave (see cancelGrace).
-					done := runDone
-					go func() {
-						select {
-						case <-done:
-						case <-finished:
-						case <-time.After(cancelGrace):
-							stuck()
-						}
-					}()
+					// A query's cancel that isn't answered: leave (see
+					// cancelGrace). Not a DML or a block: Oracle answers its
+					// break once it has rolled it back, which takes as long as
+					// it ran, and leaving would lose the transaction's work.
+					if runOp == "query" {
+						done, grace := runDone, cancelGrace
+						go func() {
+							select {
+							case <-done:
+							case <-finished:
+							case <-time.After(grace):
+								stuck()
+							}
+						}()
+					}
 				}
 				mu.Unlock()
 				continue
@@ -1295,12 +1299,12 @@ func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writ
 			continue
 		}
 		done := make(chan struct{})
-		running, cancel, runDone = r.ID, c, done
+		running, cancel, runDone, runOp = r.ID, c, done, r.Op
 		mu.Unlock()
 		err := handle(ctx, w, r)
 		close(done)
 		mu.Lock()
-		running, cancel, runDone = 0, nil, nil
+		running, cancel, runDone, runOp = 0, nil, nil, ""
 		mu.Unlock()
 		cancelled := ctx.Err() != nil
 		c()

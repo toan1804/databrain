@@ -83,7 +83,7 @@ jobs:
       - uses: actions/setup-go@v6
         if: runner.os == 'Linux'
         with:
-          go-version: "1.27.1"
+          go-version-file: crates/connectors/oracle/agent/go.mod
           cache-dependency-path: crates/connectors/oracle/agent/go.sum
 
       - name: Oracle helper tests (Go)

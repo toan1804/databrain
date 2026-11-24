@@ -287,18 +287,20 @@ func TestACancelThatIsAnsweredKeepsTheHelper(t *testing.T) {
 	var mu sync.Mutex
 	var handled []uint64
 	exited := make(chan struct{})
+	started := make(chan struct{})
 	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
 		mu.Lock()
 		handled = append(handled, r.ID)
 		mu.Unlock()
 		if r.ID == 1 {
+			close(started)
 			<-ctx.Done()
 			return ctx.Err()
 		}
 		return nil
 	}, func() { close(exited) })
 	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "query"}))
-	time.Sleep(20 * time.Millisecond)
+	<-started
 	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 2, "op": "cancel", "target": 1}))
 	_, _ = inW.Write(reqFrame(t, map[string]any{"id": 3, "op": "query"}))
 	select {
@@ -310,6 +312,47 @@ func TestACancelThatIsAnsweredKeepsTheHelper(t *testing.T) {
 	defer mu.Unlock()
 	if fmt.Sprint(handled) != "[1 3]" {
 		t.Fatalf("the request after the cancel didn't run: %v", handled)
+	}
+}
+
+// A stopped DML or block isn't ended by the watchdog: Oracle answers its
+// break once it has rolled it back, which may take long, and ending the
+// session would lose the transaction's other work.
+func TestAStoppedExecIsWaitedFor(t *testing.T) {
+	old := cancelGrace
+	cancelGrace = 50 * time.Millisecond
+	defer func() { cancelGrace = old }()
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	started, exited := make(chan struct{}), make(chan struct{})
+	release := make(chan struct{})
+	go serve(inR, io.Discard, func(ctx context.Context, w *writer, r *request) error {
+		close(started)
+		<-release // a long rollback
+		return nil
+	}, func() { close(exited) })
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 1, "op": "exec"})) }()
+	<-started
+	go func() { _, _ = inW.Write(reqFrame(t, map[string]any{"id": 2, "op": "cancel", "target": 1})) }()
+	select {
+	case <-exited:
+		t.Fatal("a stopped exec ended the helper")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+}
+
+// readableFirst describes only what DBMS_SQL can parse without running it.
+func TestOnlySelectsAreDescribed(t *testing.T) {
+	for _, sql := range []string{"select 1 from dual", "SELECT*FROM t", "select/**/id from t", `select"DOC" from t`, "  -- c\n with q as (select 1 from dual) select * from q", "(select 1 from dual)"} {
+		if !isSelect(sql) {
+			t.Errorf("%q: not taken for a SELECT", sql)
+		}
+	}
+	for _, sql := range []string{"create table selection (a int)", "drop table t", "begin null; end;", "selected", "insert into t select 1 from dual", ""} {
+		if isSelect(sql) {
+			t.Errorf("%q: taken for a SELECT", sql)
+		}
 	}
 }
 

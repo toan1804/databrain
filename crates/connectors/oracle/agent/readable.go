@@ -13,7 +13,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -165,49 +164,42 @@ func (s *session) retryReadable(ctx context.Context, w *writer, r *request, caus
 	return err
 }
 
-// plan is what readableFirst found for a query: the statement to run
-// instead ("" = the query as it is) and its converted columns' db_type.
-type plan struct {
-	sql    string
-	labels map[int]string
-	refuse error // an object column that can't be converted: not run
-}
+// maxPlain bounds the remembered query texts (a session running ever new SQL).
+const maxPlain = 512
 
-// maxPlans bounds the remembered plans (a session running ever new SQL).
-const maxPlans = 256
-
-// readableFirst describes the query (on an empty result: go-ora reads no
-// value) and, when a column is of a type go-ora can't decode, returns it
-// with that column converted to text, before anything is read. Remembered
-// by the query's text until the session reconnects or runs an exec (DDL may
-// change a column's type). A query that can't be described so (a duplicate
-// column name, FOR UPDATE, not a SELECT) runs as it is.
-func (s *session) readableFirst(ctx context.Context, r *request) (*request, error) {
-	if len(r.labels) > 0 {
-		return r, nil
+// readableFirst describes the query (DBMS_SQL: nothing runs or is read) and,
+// when a column is of a type go-ora can't decode, returns it with that
+// column converted to text before anything is read. A query found to have
+// none is remembered by its text (until the session reconnects, as after a
+// stop the helper gave up on, or runs an exec): it isn't described again.
+// One with such a column is described each time (a column list kept could
+// miss one another session added). A query that can't be described or
+// converted (a parse error, two columns of a name, FOR UPDATE, WITH
+// FUNCTION) runs as it is, as before; should go-ora then wait on it, Stop
+// ends it (cancelGrace).
+func (s *session) readableFirst(ctx context.Context, r *request) *request {
+	if len(r.labels) > 0 || !isSelect(r.SQL) || s.plain[r.SQL] {
+		return r
 	}
-	p, ok := s.plans[r.SQL]
-	if !ok {
-		var sure bool
-		p, sure = s.describe(ctx, r)
-		if !sure {
-			// Not answered (stopped, the connection lost): not remembered.
-			return r, nil
+	found, err := s.hasObjectColumn(ctx, r.SQL)
+	if err != nil || !found {
+		// Answered (no such column, or the server's own error, which the
+		// query will give): remembered. Not answered: not.
+		if err == nil || !(ctx.Err() != nil || lostConn(err)) {
+			if s.plain == nil || len(s.plain) >= maxPlain {
+				s.plain = map[string]bool{}
+			}
+			s.plain[r.SQL] = true
 		}
-		if s.plans == nil || len(s.plans) >= maxPlans {
-			s.plans = map[string]plan{}
-		}
-		s.plans[r.SQL] = p
+		return r
 	}
-	if p.refuse != nil {
-		return nil, unreadableHint(errors.New("a column of this result has an object type the thin Oracle driver can't read, and it couldn't be converted to text"), p.refuse)
-	}
-	if p.sql == "" {
-		return r, nil
+	query, labels, err := s.readablePlan(ctx, r)
+	if err != nil {
+		return r
 	}
 	out := *r
-	out.SQL, out.labels = p.sql, p.labels
-	return &out, nil
+	out.SQL, out.labels = query, labels
+	return &out
 }
 
 // describeSQL parses :1 (a SELECT; parse runs nothing) and returns its
@@ -221,59 +213,45 @@ const describeSQL = "declare c integer; n integer; d dbms_sql.desc_tab2; r varch
 
 // objectTypeCodes: DBMS_SQL's codes of the types go-ora may not decode
 // (named types: objects, collections, XMLTYPE, SDO_GEOMETRY; REF; opaque;
-// native JSON; VECTOR).
-var objectTypeCodes = map[string]bool{"58": true, "109": true, "111": true, "119": true, "127": true}
+// VECTOR). Not native JSON (119): go-ora reads it, as a BLOB.
+var objectTypeCodes = map[string]bool{"58": true, "109": true, "111": true, "127": true}
 
-// isSelect: the statement starts with SELECT or WITH (past comments): only
-// those are parsed with DBMS_SQL, which would run DDL at parse.
+// isSelect: the statement starts with SELECT or WITH (past comments, in any
+// case, `select*from` and `select/**/` too) or a parenthesis: only those are
+// parsed with DBMS_SQL, which would run DDL at parse.
 func isSelect(sql string) bool {
-	f := strings.Fields(strings.ToUpper(stripComments(sql)))
-	return len(f) > 0 && (f[0] == "SELECT" || f[0] == "WITH" || strings.HasPrefix(f[0], "SELECT(") || strings.HasPrefix(f[0], "("))
+	t := strings.ToUpper(stripComments(sql))
+	if strings.HasPrefix(t, "(") {
+		return true
+	}
+	end := strings.IndexFunc(t, func(c rune) bool { return c < 'A' || c > 'Z' })
+	if end < 0 {
+		end = len(t)
+	}
+	return t[:end] == "SELECT" || t[:end] == "WITH"
 }
 
 // hasObjectColumn: whether the query returns a column of an object type,
 // asked of the server without running it (DBMS_SQL describes any SELECT,
-// one with two columns of a name too). ok: the server answered.
-func (s *session) hasObjectColumn(ctx context.Context, query string) (found, ok bool, err error) {
+// one with two columns of a name too). The text is bound as a VARCHAR2
+// (fewer round trips than a CLOB), as a CLOB past 32 KB.
+func (s *session) hasObjectColumn(ctx context.Context, query string) (bool, error) {
 	t, err := s.target(ctx)
 	if err != nil {
-		return false, false, err
+		return false, err
+	}
+	var text any = query
+	if len(query) > 32000 {
+		text = go_ora.Clob{String: query, Valid: true}
 	}
 	var codes string
-	if _, err := t.ExecContext(ctx, describeSQL, go_ora.Clob{String: query, Valid: true}, go_ora.Out{Dest: &codes, Size: 32767}); err != nil {
-		return false, false, err
+	if _, err := t.ExecContext(ctx, describeSQL, text, go_ora.Out{Dest: &codes, Size: 32767}); err != nil {
+		return false, err
 	}
 	for _, c := range strings.Split(codes, ",") {
 		if objectTypeCodes[strings.TrimSpace(c)] {
-			return true, true, nil
+			return true, nil
 		}
 	}
-	return false, true, nil
-}
-
-// describe finds the query's columns of an object type (see readableFirst);
-// sure: the server answered (an error it gave counts: the query runs as it
-// is, and fails with that error). A query with such a column that can't be
-// converted (two columns of a name, FOR UPDATE) is refused (refuse): run as
-// it is, go-ora may wait forever on it.
-func (s *session) describe(ctx context.Context, r *request) (plan, bool) {
-	unsure := func(err error) bool { return ctx.Err() != nil || lostConn(err) }
-	if !isSelect(r.SQL) {
-		return plan{}, true
-	}
-	found, _, err := s.hasObjectColumn(ctx, r.SQL)
-	if err != nil {
-		return plan{}, !unsure(err)
-	}
-	if !found {
-		return plan{}, true
-	}
-	query, labels, err := s.readablePlan(ctx, r)
-	if err != nil {
-		if unsure(err) {
-			return plan{}, false
-		}
-		return plan{refuse: err}, true
-	}
-	return plan{sql: query, labels: labels}, true
+	return false, nil
 }

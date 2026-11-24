@@ -657,8 +657,9 @@ mod tests {
     /// Live, thin driver: a table's XMLTYPE values (small, a few KB, large
     /// enough for a LOB) are read as text every time, never leaving the
     /// helper waiting for bytes that don't come (each read has a time limit,
-    /// so a hang fails the test); a stop of a long statement ends it within
-    /// the stop's time limit, and the tab's next statement runs.
+    /// so a hang fails the test); queries that read before still do, and a
+    /// column another session adds shows; a stop of a long statement ends
+    /// it within the stop's time limit, and the tab's next statement runs.
     #[ignore = "live: needs DATABRAIN_ORACLE_HOST and DATABRAIN_ORACLE_AGENT (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_thin_xmltype_and_stop() {
@@ -706,14 +707,17 @@ mod tests {
         }
         // A value made in the query reads too.
         read("select xmltype('<a>1</a>') x from dual").await.unwrap();
-        // One that can't be converted (two columns of a name, FOR UPDATE) is
-        // refused at once, saying why, instead of read (go-ora could wait forever).
-        for sql in ["select doc, doc from db_xml", "select doc from db_xml for update"] {
-            let e = read(sql).await.unwrap_err();
-            assert!(e.message.contains("thin Oracle driver can't read"), "{sql}: {e:?}");
-        }
-        // Not a statement the helper describes with DBMS_SQL (that would run DDL): runs as it is.
-        read("select count(*) from db_xml").await.unwrap();
+        // What read before still does: values made in the query with one name,
+        // WITH FUNCTION, native JSON (go-ora reads it; not converted).
+        read("select xmltype('<a/>') x, xmltype('<b/>') x from dual").await.unwrap();
+        read("with function f return number is begin return 1; end; select f() v, xmltype('<a/>') d from dual").await.unwrap();
+        read("select json('{\"b\":2}') j from dual").await.unwrap();
+        // A column another session adds is there the next time (no column list kept).
+        let other = live_session("thin", false).await.unwrap();
+        run(&other, "alter table db_xml add (c number)").await;
+        let c = read("select * from db_xml order by id").await.unwrap();
+        assert_eq!(c.schema.as_ref().map(|s| s.fields().len()), Some(3), "{:?}", c.schema);
+        drop(other);
 
         // Stop a long statement: it ends within the stop's limit, the next one runs.
         let token = databrain_connector_core::CancellationToken::new();

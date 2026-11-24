@@ -238,15 +238,17 @@ pub(crate) fn thin_execute(a: Arc<agent::Agent>, sql: &str, opts: ExecOptions) -
     let sql = sql.to_string();
     tokio::spawn(async move {
         if let Err(e) = thin_run(&a, &sql, is_query, &opts, &tx).await {
-            let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else { e };
+            // Stopped: said as stopped, keeping "session ended" when it was.
+            let e = if opts.cancel.is_cancelled() && !e.is_cancelled() { ConnectorError::cancelled() } else { e };
             tx.send_err(e).await;
         }
     });
     stream
 }
 
-/// How long a stopped statement may take to end on the thin driver before
-/// its helper is ended (the helper itself gives up after 5 s).
+/// How long a stopped query may take to end on the thin driver before its
+/// helper is ended (the helper itself gives up after 5 s). Not a DML or a
+/// block: Oracle answers its stop after rolling it back.
 const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 300 } else { 10_000 });
 
 pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
@@ -276,7 +278,10 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
     // later statement on it would wait behind this one.
     let mut stopped_at: Option<tokio::time::Instant> = None;
     loop {
-        let deadline = stopped_at.map(|t| t + CANCEL_WAIT);
+        // Queries only: a stopped DML or block answers once Oracle has rolled
+        // it back, which takes as long as it ran; ending the session then
+        // would lose the transaction's other work.
+        let deadline = stopped_at.filter(|_| is_query).map(|t| t + CANCEL_WAIT);
         let frame = tokio::select! {
             f = agent::Agent::next(&mut r, id) => match f {
                 // The helper exited (it gave up on a stop): stopped, not failed.
@@ -447,17 +452,25 @@ mod stop_tests {
         let a = agent::Agent::from_child(child);
         let cancel = databrain_connector_core::CancellationToken::new();
         let opts = ExecOptions { cancel: cancel.clone(), ..ExecOptions::default() };
-        let (tx, _stream) = databrain_connector_core::QueryStream::channel(4);
         let c = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             c.cancel();
         });
         let started = std::time::Instant::now();
-        let r = tokio::time::timeout(std::time::Duration::from_secs(10), thin_run(&a, "select doc from t", true, &opts, &tx))
-            .await
-            .expect("the stop was waited on forever");
-        let e = r.unwrap_err();
+        // Through thin_execute, as a run does: the error it passes on keeps the code.
+        let mut stream = thin_execute(a.clone(), "select doc from t", opts);
+        let e = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match stream.next().await {
+                    Some(Err(e)) => break e,
+                    Some(Ok(_)) => continue,
+                    None => panic!("ended without an error"),
+                }
+            }
+        })
+        .await
+        .expect("the stop was waited on forever");
         assert!(e.is_cancelled() && e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED), "{e:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
         for _ in 0..50 {
