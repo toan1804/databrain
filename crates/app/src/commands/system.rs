@@ -39,6 +39,22 @@ pub(crate) async fn take_dbr_opens(opens: State<'_, crate::DbrOpens>) -> R<Vec<c
     Ok(std::mem::take(&mut *opens.0.lock()))
 }
 
+/// Where the `dbr` command stands (Settings → Terminal).
+#[tauri::command]
+pub(crate) async fn dbr_command_status() -> R<crate::dbr_install::DbrCommand> {
+    tokio::task::spawn_blocking(crate::dbr_install::status).await.map_err(|e| EngineError::new("internal", e.to_string()))
+}
+
+/// Put `dbr` on the PATH (asks for an administrator's password on macOS
+/// when /usr/local/bin isn't writable).
+#[tauri::command]
+pub(crate) async fn install_dbr_command() -> R<crate::dbr_install::DbrCommand> {
+    tokio::task::spawn_blocking(crate::dbr_install::install)
+        .await
+        .map_err(|e| EngineError::new("internal", e.to_string()))?
+        .map_err(|e| EngineError::new("io", e))
+}
+
 /// Open a provider's billing page in the browser (https only).
 #[tauri::command]
 pub(crate) async fn open_link(app: AppHandle, url: String) -> R<()> {

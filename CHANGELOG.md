@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- **Install the `dbr` command:** Settings → Terminal → "Install the dbr command" puts `dbr` on your PATH (macOS: a link in `/usr/local/bin`, asking for an administrator's password when needed; Windows: the install folder on your PATH; Linux AppImage: a script in `~/.local/bin`), and says where it is when it already is.
 - **`dbr` opens files in the app:** without `-i`, `dbr orders.csv` opens the file's rows in a tab of the running DataBrain (started when it isn't), `dbr -c sales report.sql` opens the `.sql` file there on that connection (`--run` runs it too), and `dbr -c sales "select …"` opens the SQL in a new tab and runs it, as the editor runs it: the read-only setting and the production confirmation apply. `-i` still prints the rows in the terminal.
 - **Stop one step of a background run:** a step's Stop now works on a run the background runner (or `dbr jobs run`) is doing, as on the app's own runs; `dbr jobs stop <job> --step <step>` does it from a terminal. The rest of the run goes on.
 
