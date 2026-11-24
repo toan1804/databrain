@@ -175,6 +175,17 @@ pub trait Session: Send + Sync {
         Ok(None)
     }
 
+    /// [`Session::explorer_fingerprints`] of `schemas` only (the ones the
+    /// explorer has listed). The default asks for every schema and keeps
+    /// these; engines whose catalog query is slow on a large database
+    /// (Oracle's ALL_OBJECTS) ask for these only.
+    async fn explorer_fingerprints_of(&self, schemas: &[String]) -> Result<Option<HashMap<String, String>>> {
+        Ok(self.explorer_fingerprints().await?.map(|mut all| {
+            all.retain(|k, _| schemas.iter().any(|s| s == k));
+            all
+        }))
+    }
+
     /// Opaque version of every object [`Session::list_objects`] returns, keyed
     /// by [`version_key`]; it changes when the object's definition, columns
     /// or comment change. Lets a changed schema be refreshed table by table

@@ -25,8 +25,13 @@ impl QueryEngine {
     }
 
     pub async fn list_objects(&self, connection_id: &str, schema: &str) -> Result<Vec<DbObject>> {
+        self.list_objects_in(connection_id, schema, Lane::User).await
+    }
+
+    /// [`Self::list_objects`] on `lane`'s session.
+    pub async fn list_objects_in(&self, connection_id: &str, schema: &str, lane: Lane) -> Result<Vec<DbObject>> {
         let schema = schema.to_string();
-        self.with_meta(connection_id, |s| {
+        self.with_lane(connection_id, lane, |s| {
             let schema = schema.clone();
             async move { s.list_objects(&schema).await }
         })
@@ -110,8 +115,20 @@ impl QueryEngine {
         Ok(Some(DefaultNamespace { levels, ambiguous }))
     }
 
-    pub async fn explorer_fingerprints(&self, connection_id: &str) -> Result<Option<HashMap<String, String>>> {
-        self.with_meta(connection_id, |s| async move { s.explorer_fingerprints().await }).await
+    /// The fingerprints of `schemas` (the ones the explorer has listed: the
+    /// others have nothing to compare with), on the background session: the
+    /// check after connecting or DDL can take a while on a large catalog,
+    /// and nobody waits for it. No schema listed: nothing is asked.
+    pub async fn explorer_fingerprints(&self, connection_id: &str, schemas: &[String]) -> Result<Option<HashMap<String, String>>> {
+        if schemas.is_empty() {
+            return Ok(Some(HashMap::new()));
+        }
+        let schemas = schemas.to_vec();
+        self.with_lane(connection_id, Lane::Background, |s| {
+            let schemas = schemas.clone();
+            async move { s.explorer_fingerprints_of(&schemas).await }
+        })
+        .await
     }
 
     /// [`Self::explorer_fingerprints`] on the indexing session, so an index
@@ -121,8 +138,13 @@ impl QueryEngine {
     }
 
     pub async fn object_versions(&self, connection_id: &str, schema: &str) -> Result<Option<HashMap<String, String>>> {
+        self.object_versions_in(connection_id, schema, Lane::User).await
+    }
+
+    /// [`Self::object_versions`] on `lane`'s session.
+    pub async fn object_versions_in(&self, connection_id: &str, schema: &str, lane: Lane) -> Result<Option<HashMap<String, String>>> {
         let schema = schema.to_string();
-        self.with_meta(connection_id, |s| {
+        self.with_lane(connection_id, lane, |s| {
             let schema = schema.clone();
             async move { s.object_versions(&schema).await }
         })
@@ -130,8 +152,13 @@ impl QueryEngine {
     }
 
     pub async fn list_objects_named(&self, connection_id: &str, schema: &str, names: &[String]) -> Result<Vec<DbObject>> {
+        self.list_objects_named_in(connection_id, schema, names, Lane::User).await
+    }
+
+    /// [`Self::list_objects_named`] on `lane`'s session.
+    pub async fn list_objects_named_in(&self, connection_id: &str, schema: &str, names: &[String], lane: Lane) -> Result<Vec<DbObject>> {
         let (schema, names) = (schema.to_string(), names.to_vec());
-        self.with_meta(connection_id, |s| {
+        self.with_lane(connection_id, lane, |s| {
             let (schema, names) = (schema.clone(), names.clone());
             async move { s.list_objects_named(&schema, &names).await }
         })

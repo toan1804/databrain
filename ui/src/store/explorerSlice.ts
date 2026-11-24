@@ -19,6 +19,17 @@ function once<T>(key: string, f: () => Promise<T>): Promise<T> {
   return p;
 }
 
+/**
+ * When the user's own loads (a click, Refresh) last wrote a schema's objects,
+ * as a count: a background result (a re-check, a listing ahead of time, the
+ * check after connecting) that started before is older, and is dropped. The
+ * background session can now finish after the user's.
+ */
+let writes = 0;
+const userWrote = new Map<string, number>();
+const now = () => ++writes;
+const olderThanUser = (key: string, started: number) => (userWrote.get(key) ?? 0) > started;
+
 /** Background prefetch, one schema at a time so it never competes with clicks much. */
 let prefetchChain: Promise<unknown> = Promise.resolve();
 /** Bumped when a connection's chosen schemas change: older queued loads are dropped. */
@@ -60,7 +71,8 @@ export interface ExplorerSlice {
   openExplorer: (connId: string, force?: boolean) => Promise<void>;
   /** Schemas of one catalog (cache first, then live). */
   loadCatalogSchemas: (connId: string, catalog: string, force?: boolean) => Promise<SchemaInfo[]>;
-  loadObjects: (connId: string, schema: string, force?: boolean) => Promise<DbObject[]>;
+  /** `background`: listed ahead of time, not for a click: the backend's background catalog session, so it never holds up Show DDL, Columns or completion. */
+  loadObjects: (connId: string, schema: string, force?: boolean, background?: boolean) => Promise<DbObject[]>;
   /**
    * Tables of every chosen schema ("Choose schemas/catalogs…"), listed in the
    * background (cache first), so completion knows them without opening each.
@@ -307,7 +319,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       );
       const todo = cachedListed.filter(([, c]) => !c).map(([n]) => n).slice(0, 8);
       for (const name of todo) {
-        prefetchChain = prefetchChain.then(() => (get().explorer[connId]?.offline ? undefined : get().loadObjects(connId, name).catch(() => {})));
+        prefetchChain = prefetchChain.then(() => (get().explorer[connId]?.offline ? undefined : get().loadObjects(connId, name, false, true).catch(() => {})));
       }
       // Chosen schemas: all of them, so completion knows their tables.
       void get().exploreChosen(connId);
@@ -337,7 +349,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     }
     for (const id of ids) {
       if (get().objects[`${connId}|${id}`]) continue;
-      prefetchChain = prefetchChain.then(() => (current() && !get().objects[`${connId}|${id}`] ? get().loadObjects(connId, id).catch(() => {}) : undefined));
+      prefetchChain = prefetchChain.then(() => (current() && !get().objects[`${connId}|${id}`] ? get().loadObjects(connId, id, false, true).catch(() => {}) : undefined));
     }
     await prefetchChain;
   },
@@ -361,18 +373,28 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     put(list);
     return list;
   },
-  loadObjects: async (connId, schema, force = false) => {
+  loadObjects: async (connId, schema, force = false, background = false) => {
     const key = `${connId}|${schema}`;
     const have = get().objects[key];
+    const started = now();
     const put = (objs: DbObject[]) => set((s) => ({ objects: { ...s.objects, [key]: objs } }));
+    // The user's answer: newer than any background one still on its way.
+    const putUser = (objs: DbObject[]) => {
+      userWrote.set(key, now());
+      put(objs);
+    };
+    // A background answer: dropped when the user's came meanwhile.
+    const putBackground = (objs: DbObject[]) => {
+      if (!olderThanUser(key, started)) put(objs);
+    };
     if (have && !force) {
       // In memory, but its check was put off (no fingerprints, or past the
       // per-check cap): check it now, once.
       const ex = get().explorer[connId];
       if (ex && !ex.offline && ex.deferred?.includes(schema)) {
         set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], deferred: s.explorer[connId]?.deferred?.filter((x) => x !== schema) } } }));
-        void once(`refresh|${key}`, () => api.refreshSchema(connId, schema))
-          .then((r) => r.mode !== "unchanged" && put(r.objects))
+        void once(`bgrefresh|${key}`, () => api.refreshSchema(connId, schema, true))
+          .then((r) => r.mode !== "unchanged" && putBackground(r.objects))
           .catch(() => {});
       }
       return have;
@@ -381,7 +403,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       // Refresh button: only changed tables are fetched when the engine has versions.
       const r = await once(`refresh|${key}`, () => api.refreshSchema(connId, schema));
       get().markOnline(connId);
-      put(r.objects);
+      putUser(r.objects);
       if (r.mode !== "unchanged") {
         const pre = `${key}|`;
         set((s) => ({ columns: Object.fromEntries(Object.entries(s.columns).filter(([k]) => !k.startsWith(pre))) }));
@@ -394,15 +416,18 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       const ex = get().explorer[connId];
       // Not covered by the fingerprint check (none on this engine, or deferred): check it now.
       if (ex && !ex.offline && (ex.fingerprints === false || ex.deferred?.includes(schema)))
-        void once(`refresh|${key}`, () => api.refreshSchema(connId, schema))
-          .then((r) => r.mode !== "unchanged" && put(r.objects))
+        void once(`bgrefresh|${key}`, () => api.refreshSchema(connId, schema, true))
+          .then((r) => r.mode !== "unchanged" && putBackground(r.objects))
           .catch(() => {});
       return cached.objects;
     }
-    const objs = await once(`list|${key}`, () => api.listObjects(connId, schema));
+    // Its own dedupe key per session: a click never waits on a listing ahead
+    // of time queued behind the background session's scan.
+    const objs = await once(`${background ? "bglist" : "list"}|${key}`, () => api.listObjects(connId, schema, background));
     get().markOnline(connId);
-    put(objs);
-    return objs;
+    if (background) putBackground(objs);
+    else putUser(objs);
+    return get().objects[key] ?? objs;
   },
   loadColumns: async (connId, schema, name) => {
     const key = `${connId}|${schema}|${name}`;
@@ -429,6 +454,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     const def = withDefault ? known.find((x) => x.is_default)?.name : undefined;
     if (def && !open.includes(def)) open.push(def);
     set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checking: true } } }));
+    const started = now();
     try {
       const r = await api.revalidateExplorer(connId, open, force);
       set((s) => {
@@ -436,6 +462,8 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
         let columns = s.columns;
         for (const x of r.refreshed) {
           if (x.mode === "unchanged") continue;
+          // The user refreshed or opened it while the check ran: theirs is newer.
+          if (olderThanUser(`${connId}|${x.schema}`, started)) continue;
           objects[`${connId}|${x.schema}`] = x.objects;
           // Columns re-read from the cache (changed tables are marked stale there).
           const pre = `${connId}|${x.schema}|`;

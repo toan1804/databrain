@@ -4,6 +4,11 @@ import type { CachedExplorer, DbObject, SchemaInfo } from "./lib/types";
 // Fake backend: a local explorer cache plus a server that can be down or slow.
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const calls: string[] = [];
+// Calls made for the background session (`background: true`), and how much slower they answer.
+const background: string[] = [];
+let backgroundDelay = 0;
+// What a background answer calls its new table ("new_one", as the user's, unless a test tells them apart).
+let bgName = "new_one";
 let online = true;
 let cache: CachedExplorer | null = null;
 const cachedListings: Record<string, DbObject[]> = {};
@@ -30,10 +35,24 @@ vi.mock("./lib/api", () => ({
     listCatalogSchemas: (_id: string, c: string) => live(`listCatalogSchemas:${c}`, c === "main" ? [sch("main", "sales", true), sch("main", "hr")] : [sch("dev", "x")]),
     listSchemas: () => live("listSchemas", [{ name: "public", is_default: true }]),
     reconnect: () => live("reconnect", 1),
-    listObjects: (_id: string, s: string) => live(`listObjects:${s}`, [t(s, "fresh")]),
-    refreshSchema: (_id: string, s: string) => live(`refreshSchema:${s}`, { schema: s, mode: "incremental", added: 1, changed: 0, removed: 0, objects: [t(s, "orders"), t(s, "new_one")] }),
-    revalidateExplorer: (_id: string, open: string[]) =>
-      live(`revalidate:${open.join(",")}`, { refreshed: !cache ? [] : [{ schema: "main.sales", mode: "incremental", added: 1, changed: 0, removed: 0, objects: [t("main.sales", "orders"), t("main.sales", "new_one")] }], unchanged: 3, deferred: [], fingerprints: true, skipped: false }),
+    listObjects: async (_id: string, s: string, bg = false) => {
+      if (bg) {
+        background.push(`listObjects:${s}`);
+        await sleep(backgroundDelay);
+      }
+      return live(`listObjects:${s}`, [t(s, bg && bgName !== "new_one" ? bgName : "fresh")]);
+    },
+    refreshSchema: async (_id: string, s: string, bg = false) => {
+      if (bg) {
+        background.push(`refreshSchema:${s}`);
+        await sleep(backgroundDelay);
+      }
+      return live(`refreshSchema:${s}`, { schema: s, mode: "incremental", added: 1, changed: 0, removed: 0, objects: [t(s, "orders"), t(s, bg ? bgName : "new_one")] });
+    },
+    revalidateExplorer: async (_id: string, open: string[]) => {
+      await sleep(backgroundDelay);
+      return live(`revalidate:${open.join(",")}`, { refreshed: !cache ? [] : [{ schema: "main.sales", mode: "incremental", added: 1, changed: 0, removed: 0, objects: [t("main.sales", "orders"), t("main.sales", bgName)] }], unchanged: 3, deferred: [], fingerprints: true, skipped: false });
+    },
     describeObject: (_id: string, s: string, n: string) => live(`describe:${s}.${n}`, { columns: [{ name: "id" }, { name: "added_col" }] }),
     setSetting: async () => {},
     clearExplorerCache: async (id: string) => {
@@ -48,6 +67,9 @@ const conn = { id: "c", name: "dbx", connected: false, config: { kind: "databric
 
 beforeEach(() => {
   calls.length = 0;
+  background.length = 0;
+  backgroundDelay = 0;
+  bgName = "new_one";
   online = true;
   cache = null;
   for (const k of Object.keys(cachedListings)) delete cachedListings[k];
@@ -182,6 +204,38 @@ describe("explorer cache", () => {
     // Both ran: neither was handed the other's answer (a listing is an array, a refresh is not).
     expect([...calls].sort()).toEqual(["listObjects:main.hr", "refreshSchema:main.hr"]);
     expect(useStore.getState().objects["c|main.hr"]?.length).toBeGreaterThan(0);
+  });
+
+  it("lists ahead of time on the background session; a click and Refresh are the user's", async () => {
+    await useStore.getState().loadObjects("c", "main.hr", false, true);
+    await useStore.getState().loadObjects("c", "main.x");
+    await useStore.getState().loadObjects("c", "main.x", true);
+    expect(background).toEqual(["listObjects:main.hr"]);
+  });
+
+  it("a background listing that ends after the user's Refresh doesn't put the older answer back", async () => {
+    backgroundDelay = 40;
+    bgName = "from_background";
+    const ahead = useStore.getState().loadObjects("c", "main.hr", false, true);
+    await sleep(5);
+    await useStore.getState().loadObjects("c", "main.hr", true);
+    await ahead;
+    expect(useStore.getState().objects["c|main.hr"]?.map((o) => o.name)).toEqual(["orders", "new_one"]);
+  });
+
+  it("the check after connecting doesn't overwrite a schema the user refreshed meanwhile", async () => {
+    cache = { catalogs: null, schemas: null, catalog_schemas: {}, state: { checked_at: null, catalogs_at: null, schemas_at: null, listed_schemas: 1 } };
+    backgroundDelay = 40;
+    bgName = "from_background";
+    const check = useStore.getState().checkForChanges("c", true);
+    await sleep(5);
+    await useStore.getState().loadObjects("c", "main.sales", true);
+    await check;
+    expect(useStore.getState().objects["c|main.sales"]?.map((o) => o.name)).toEqual(["orders", "new_one"]);
+    // Without a newer answer of the user's, the check's is taken.
+    backgroundDelay = 0;
+    await useStore.getState().checkForChanges("c", true);
+    expect(useStore.getState().objects["c|main.sales"]?.map((o) => o.name)).toEqual(["orders", "from_background"]);
   });
 
   it("tells which statements may change what the explorer shows", () => {

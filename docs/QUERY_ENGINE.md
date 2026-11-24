@@ -63,13 +63,14 @@ One `Arc<QueryEngine>` per process (`QueryEngine::new` in `lib.rs`). Every map i
 
 A session is one database connection, found by `(connection_id, tab)`. `session_for` (`sessions.rs`) returns the live one or connects: `Connector::prepare`, `preflight` (`probe.rs`), then tunnel + stored secret + handshake inside the connect timeout (`connect_timeout_for`; not applied to browser sign-in or local files). A refused sign-in refreshes the credential once and tries again.
 
-Keys are built and read as a `SessionRole` (`databrain_workspace::SessionRole`: `parse(key)` / `key()`); what happens to a session is decided by its role: `catalog_only` (Meta, Index: closed by Refresh and the DuckDB sandbox switch at any time), `one_off` (Load, Export, DryRun: closed by their owner, or at the next idle sweep when left over, even with idle disconnect off), `is_ai`.
+Keys are built and read as a `SessionRole` (`databrain_workspace::SessionRole`: `parse(key)` / `key()`); what happens to a session is decided by its role: `catalog_only` (Meta, Index, Scan: closed by Refresh and the DuckDB sandbox switch at any time), `one_off` (Load, Export, DryRun: closed by their owner, or at the next idle sweep when left over, even with idle disconnect off), `is_ai`.
 
 | Role (key) | Used by | Closed by |
 |---|---|---|
 | `Tab` (the editor tab id) | runs of the tab, its plans, grid edits, Commit / Rollback | `close_tab`, idle close |
 | `Notebook` (`nb:{notebook}`, cells `nb:{notebook}:{cell}`) | every cell of a notebook shares `nb:{notebook}` (`RunRequest::session_key`); each cell keeps its own `tab_id` for results | `close_tab` from `api/library.rs` |
 | `Meta` (`__meta__`) | explorer, completion, `check_sql`, `describe`, test data's reads, cost preview while the tab is busy | `reconnect`, idle close |
+| `Scan` (`__scan__`) | the explorer's background catalog work (`Lane::Background`): the fingerprint check after connecting or DDL (`explorer_fingerprints`, the listed schemas only), the refreshes it starts, listings ahead of time and of chosen schemas, re-checks of schemas shown from the cache, the object versions read after a listing. What someone waits for (Show DDL, Columns, completion, a click, Refresh) stays on `Meta` (`Lane::User`), so it never queues behind a scan. Local files use `Meta` (`scan_tab`) | `reconnect`, idle close |
 | `Index` (`__index__`) | `bulk_metadata`: reading columns for the AI, schema compare, related rows. Local files use `Meta` (`index_tab`) | `end_index_session`, `reconnect` |
 | `Ai { chat, part }` (`ai:`, `ai-outputs:`, `ai-sample:` + chat) | AI and MCP tools (`crates/ai/src/tools/query.rs`) | idle close; `close_tab` of each part when the chat is deleted |
 | `JobStep` (`job:{job}:{node}`), `Load`/`Export` of a step, `DryRun` (`dryrun:…`) | job steps (`crates/app/src/jobs.rs`) | `release_sessions`, `close_tab` |

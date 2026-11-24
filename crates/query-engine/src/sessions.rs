@@ -4,6 +4,9 @@
 use super::*;
 use databrain_connector_core::TxState;
 
+/// How long the background catalog session stays open unused.
+pub(crate) const SCAN_IDLE: Duration = Duration::from_secs(120);
+
 impl QueryEngine {
     pub(crate) async fn session(&self, connection_id: &str, tab_id: &str) -> Result<Arc<dyn Session>> {
         self.session_for(connection_id, tab_id, Origin::User).await
@@ -201,7 +204,17 @@ impl QueryEngine {
             .collect();
         self.drop_sessions(|(c, key), live| {
             let in_use = busy.contains(key) || Arc::strong_count(&live.session) > 1;
-            if in_use || live.session.in_transaction() {
+            if in_use {
+                return false;
+            }
+            // The background catalog session goes soon after its work, idle
+            // disconnect or not: on a server with a per-user session limit
+            // it would otherwise hold a slot a query tab needs. It only reads
+            // the catalog, so no transaction of the user's is in it.
+            if SessionRole::parse(key) == SessionRole::Scan {
+                return now.duration_since(*live.last_used.lock()) >= SCAN_IDLE;
+            }
+            if live.session.in_transaction() {
                 return false;
             }
             // A load's or export's session nobody uses any more (its owner
@@ -232,7 +245,7 @@ impl QueryEngine {
     }
 
     /// Sign in again on the next call (the explorer's Refresh): closes the
-    /// connection's metadata and indexing sessions, and its tab sessions
+    /// connection's catalog sessions (the user's and the background's), and its tab sessions
     /// that have no running statement, no open transaction and are not in
     /// use elsewhere (their next statement reconnects, as after an idle
     /// disconnect). Needed for rights the server applies to new sessions
@@ -246,7 +259,7 @@ impl QueryEngine {
                 return false;
             }
             // A catalog call still running keeps its handle; the map forgets it.
-            if SessionRole::parse(key) == SessionRole::Meta {
+            if matches!(SessionRole::parse(key), SessionRole::Meta | SessionRole::Scan) {
                 return true;
             }
             !(busy.contains(key) || Arc::strong_count(&live.session) > 1 || live.session.in_transaction())
@@ -441,6 +454,39 @@ impl QueryEngine {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Session for the explorer's background catalog work ([`Lane::Background`]):
+    /// its own for server databases; local files share the metadata session
+    /// (one handle per file), as indexing does.
+    pub(crate) fn scan_tab(&self, connection_id: &str) -> String {
+        match self.workspace.get_connection(connection_id).map(|p| p.config.kind) {
+            Ok(k) if !k.traits().local => SessionRole::Scan.key(),
+            _ => meta_tab(),
+        }
+    }
+
+    /// The catalog session for `lane`.
+    pub(crate) fn lane_tab(&self, connection_id: &str, lane: Lane) -> String {
+        match lane {
+            Lane::User => meta_tab(),
+            Lane::Background => self.scan_tab(connection_id),
+        }
+    }
+
+    /// [`Self::with_tab`] on `lane`'s catalog session. When the background
+    /// session can't be opened (a server's per-user session limit, say),
+    /// the work runs on the user's, as before there were two.
+    pub(crate) async fn with_lane<T, F, Fut>(&self, connection_id: &str, lane: Lane, f: F) -> Result<T>
+    where
+        F: Fn(Arc<dyn Session>) -> Fut,
+        Fut: std::future::Future<Output = databrain_connector_core::Result<T>>,
+    {
+        let mut tab = self.lane_tab(connection_id, lane);
+        if tab != meta_tab() && self.session(connection_id, &tab).await.is_err() {
+            tab = meta_tab();
+        }
+        self.with_tab(connection_id, &tab, f).await
     }
 
     /// Session used by AI indexing: its own for server databases; local
