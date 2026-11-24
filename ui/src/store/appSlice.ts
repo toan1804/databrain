@@ -1,7 +1,7 @@
 import type { StateCreator } from "zustand";
 import { parseAppearance } from "../lib/appearance";
 import { setSourceTraits } from "../lib/sourceTraits";
-import { type SshHostKeyPrompt, api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "../lib/api";
+import { type PasswordExpired, type SshHostKeyPrompt, api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "../lib/api";
 import { DEFAULT_SLOW_QUERY_SECONDS } from "../queryTips";
 import { uid } from "../lib/util";
 import type { Dashboard } from "../lib/charts";
@@ -19,11 +19,17 @@ export interface AppSlice {
   ready: boolean;
   backendAvailable: boolean;
   init: () => Promise<void>;
+  /** Open the expired-password dialog for a connection: one at a time; not again after Cancel unless a run asks. */
+  askExpiredPassword: (p: PasswordExpired) => void;
 }
 
 export const createAppSlice: StateCreator<State, [], [], AppSlice> = (set, get) => ({
   ready: false,
   backendAvailable: false,
+  askExpiredPassword: ({ connectionId, run }) => {
+    if (get().expiredPassword || (!run && get().expiredDismissed.includes(connectionId))) return;
+    set({ expiredPassword: connectionId });
+  },
   init: async () => {
     // Once per app: React StrictMode runs effects twice in dev, which would
     // register every backend event listener twice.
@@ -102,6 +108,8 @@ export const createAppSlice: StateCreator<State, [], [], AppSlice> = (set, get) 
       await onJobEvent((e) => get().handleJobEvent(e));
       window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
       window.addEventListener("db:ssh-host-key", (e) => set({ sshHostKey: (e as CustomEvent<SshHostKeyPrompt>).detail }));
+      // One dialog at a time: the explorer and a run failing together don't stack two.
+      window.addEventListener("db:password-expired", (e) => get().askExpiredPassword((e as CustomEvent<PasswordExpired>).detail));
       // Thin Oracle driver: downloaded once, on the first Oracle connection.
       let agentToast = false;
       void onOracleAgent((e) => {

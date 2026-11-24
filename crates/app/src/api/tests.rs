@@ -2135,29 +2135,36 @@ async fn change_password_checks_before_the_server() {
         .unwrap()
     };
     let pg = save(ConnectorKind::Postgres, Some("hunter2"));
-    let e = change_password(&st, &pg.id, "guess".into(), "new".into()).await.unwrap_err();
+    let e = change_password(&st, &pg.id, Some("guess".into()), "new".into()).await.unwrap_err();
     assert!(e.message.contains("isn't the one saved"), "{e:?}");
-    assert!(change_password(&st, &pg.id, "hunter2".into(), "".into()).await.unwrap_err().message.contains("new password"));
-    assert!(change_password(&st, &pg.id, "hunter2".into(), "hunter2".into()).await.unwrap_err().message.contains("is the current one"));
+    assert!(change_password(&st, &pg.id, Some("hunter2".into()), "".into()).await.unwrap_err().message.contains("new password"));
+    assert!(change_password(&st, &pg.id, Some("hunter2".into()), "hunter2".into()).await.unwrap_err().message.contains("is the current one"));
     // The current password must sign in first: no server listens here, so
     // that error (not "wrong password") comes back and the saved one stays.
-    let e = change_password(&st, &pg.id, "hunter2".into(), "new".into()).await.unwrap_err();
+    let e = change_password(&st, &pg.id, Some("hunter2".into()), "new".into()).await.unwrap_err();
     assert!(e.kind != "auth" && !e.message.contains("doesn't sign in"), "{e:?}");
     assert_eq!(st.secrets.get(&SecretRef::for_connection(&pg.id)).unwrap().unwrap().expose_secret(), "hunter2");
+    // No current password given: the saved one is used (it goes as far as
+    // the sign-in above), and "is the current one" is checked against it.
+    let e = change_password(&st, &pg.id, None, "new".into()).await.unwrap_err();
+    assert!(e.kind != "invalid" && !e.message.contains("No password is saved"), "{e:?}");
+    assert!(change_password(&st, &pg.id, None, "hunter2".into()).await.unwrap_err().message.contains("is the current one"));
+    let unsaved = save(ConnectorKind::Postgres, None);
+    assert!(change_password(&st, &unsaved.id, None, "new".into()).await.unwrap_err().message.contains("No password is saved"));
     // A read-only connection is refused before anything signs in.
     let mut ro = st.workspace.get_connection(&pg.id).unwrap();
     ro.config.read_only = true;
     st.workspace.save_connection(ro).unwrap();
-    assert_eq!(change_password(&st, &pg.id, "hunter2".into(), "new".into()).await.unwrap_err().kind, "read_only");
+    assert_eq!(change_password(&st, &pg.id, Some("hunter2".into()), "new".into()).await.unwrap_err().kind, "read_only");
     // Another sign-in than a password isn't offered (the engine refuses it).
     let mut cli = st.workspace.get_connection(&pg.id).unwrap();
     cli.config.read_only = false;
     cli.config.auth = databrain_auth::AuthMethod::CloudCli { profile: None };
     st.workspace.save_connection(cli).unwrap();
-    assert!(change_password(&st, &pg.id, "hunter2".into(), "new".into()).await.unwrap_err().message.contains("signs in with a password"));
+    assert!(change_password(&st, &pg.id, Some("hunter2".into()), "new".into()).await.unwrap_err().message.contains("signs in with a password"));
     assert!(st.engine.change_password(&pg.id, "a", "b").await.unwrap_err().message.contains("password"));
     let sf = save(ConnectorKind::Snowflake, Some("pw"));
-    assert_eq!(change_password(&st, &sf.id, "pw".into(), "new".into()).await.unwrap_err().kind, "unsupported");
+    assert_eq!(change_password(&st, &sf.id, Some("pw".into()), "new".into()).await.unwrap_err().kind, "unsupported");
 }
 
 /// After a password change, the other saved connections signing in as the
@@ -2322,7 +2329,7 @@ async fn live_password_change_updates_the_other_connections() {
     assert!(out[0].error.is_none(), "{out:?}");
     let one = save("kb one", "kb_pw2", "Old_pw_1");
     let two = save("kb two", "kb_pw2", "Old_pw_1");
-    let changed = change_password(&st, &one.id, "Old_pw_1".into(), "New_pw_2".into()).await.unwrap();
+    let changed = change_password(&st, &one.id, Some("Old_pw_1".into()), "New_pw_2".into()).await.unwrap();
     assert_eq!(changed.others, [OtherLogin { id: two.id.clone(), name: "kb two".into() }], "only the other one with this login");
     let updated = update_saved_passwords(&st, &one.id, std::slice::from_ref(&two.id), "New_pw_2".into()).await.unwrap();
     assert_eq!(updated[0].error, None, "{updated:?}");
@@ -2334,4 +2341,52 @@ async fn live_password_change_updates_the_other_connections() {
     st.engine.disconnect(&one.id);
     st.engine.disconnect(&two.id);
     let _ = st.engine.run_and_wait(&st.hub, run("drop role kb_pw2"), None).await;
+}
+
+/// Oracle: switching the driver (thin ↔ Instant Client) in the connection's
+/// settings keeps its saved password (the same server and user); a new
+/// server still drops it (it is only sent where it was saved for).
+#[test]
+fn switching_the_oracle_driver_keeps_the_saved_password() {
+    use secrecy::ExposeSecret;
+    let (st, _sink, _dir) = state();
+    let mut cfg = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: "app".into() });
+    cfg.host = Some("ora.example.com".into());
+    cfg.options.insert("service_name".into(), "PDB1".into());
+    let saved = save_profile(&st, "Ora", cfg, Some("hunter2"));
+    let secret = || st.secrets.get(&SecretRef::for_connection(&saved.id)).unwrap().map(|s| s.expose_secret().to_string());
+    for driver in ["instant_client", "thin", ""] {
+        let mut p = st.workspace.get_connection(&saved.id).unwrap();
+        p.config.options.insert("driver".into(), driver.into());
+        let kept = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+        assert!(kept.has_secret, "driver {driver:?}");
+        assert_eq!(secret().as_deref(), Some("hunter2"), "driver {driver:?}");
+    }
+    let mut p = st.workspace.get_connection(&saved.id).unwrap();
+    p.config.host = Some("other.example.com".into());
+    let moved = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+    assert!(!moved.has_secret && secret().is_none(), "another server: typed again");
+}
+
+/// With TLS or wallet settings (read by the thin driver only), switching
+/// to Instant Client would send the saved password without them: it is
+/// asked again, on save and on Test.
+#[tokio::test]
+async fn switching_the_oracle_driver_with_tls_settings_asks_for_the_password() {
+    use secrecy::ExposeSecret;
+    let (st, _sink, _dir) = state();
+    let mut cfg = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: "app".into() });
+    cfg.host = Some("ora.example.com".into());
+    cfg.options.insert("service_name".into(), "PDB1".into());
+    cfg.options.insert("driver_options".into(), "SSL=true".into());
+    let saved = save_profile(&st, "Ora TLS", cfg, Some("hunter2"));
+    let mut edited = st.workspace.get_connection(&saved.id).unwrap().config;
+    edited.options.insert("driver".into(), "instant_client".into());
+    let e = test_connection(&st, edited.clone(), None, Some(saved.id.clone()), None, None).await.unwrap_err();
+    assert!(e.message.contains("type the password"), "{e:?}");
+    let mut p = st.workspace.get_connection(&saved.id).unwrap();
+    p.config = edited;
+    let moved = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+    assert!(!moved.has_secret);
+    assert!(st.secrets.get(&SecretRef::for_connection(&saved.id)).unwrap().map(|s| s.expose_secret().to_string()).is_none());
 }

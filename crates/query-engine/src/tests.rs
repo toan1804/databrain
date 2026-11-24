@@ -1700,3 +1700,42 @@ async fn a_table_is_described_once_for_callers_together() {
     engine.describe(&id, "main.sales", "new_t").await.unwrap();
     assert_eq!(calls.load(SeqCst), 7);
 }
+
+/// An expired password is changed only where a password change is: not on
+/// a read-only connection, another sign-in or a database that can't, all
+/// refused before anything signs in.
+#[tokio::test]
+async fn expired_password_change_is_refused_where_a_change_is() {
+    let f = fixture(EnvTag::None);
+    let save = |kind: ConnectorKind, auth: AuthMethod, read_only: bool| {
+        let mut c = ConnectionConfig::new(kind, auth);
+        c.host = Some("127.0.0.1".into());
+        c.port = Some(1);
+        c.read_only = read_only;
+        f.ws.save_connection(ConnectionProfile {
+            id: String::new(),
+            name: format!("{kind:?} {read_only}"),
+            config: c,
+            color: None,
+            env: EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap()
+        .id
+    };
+    let pw = || AuthMethod::Password { user: "me".into() };
+    let ro = save(ConnectorKind::Oracle, pw(), true);
+    assert_eq!(f.engine.change_expired_password(&ro, "old", "new").await.unwrap_err().kind, "read_only");
+    let cli = save(ConnectorKind::Oracle, AuthMethod::CloudCli { profile: None }, false);
+    assert!(f.engine.change_expired_password(&cli, "old", "new").await.unwrap_err().message.contains("signs in with a password"));
+    let sqlite = f.conn_id.clone();
+    assert_eq!(f.engine.change_expired_password(&sqlite, "old", "new").await.unwrap_err().kind, "unsupported");
+    // Allowed: it goes on to the driver (none registered for Oracle here).
+    let ok = save(ConnectorKind::Oracle, pw(), false);
+    let e = f.engine.change_expired_password(&ok, "old", "new").await.unwrap_err();
+    assert!(e.message.contains("not enabled in this build"), "past every refusal: {e:?}");
+}

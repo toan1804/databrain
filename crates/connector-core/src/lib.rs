@@ -84,6 +84,18 @@ pub trait Connector: Send + Sync {
     /// Open a new session. Credentials are fetched from `creds` right before
     /// connecting and are not retained by the connector.
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>>;
+
+    /// Sign in with an expired password (in `creds`), setting `new` as the
+    /// sign-in happens: once a password expired, that is the only way the
+    /// server takes a new one (it refuses the sign-in, so no session could
+    /// run ALTER USER). Nothing else is done on the connection. `Unsupported`
+    /// where the driver can't.
+    async fn connect_changing_password(&self, _cfg: &ConnectionConfig, _creds: Arc<dyn CredentialSource>, _new: &str) -> Result<()> {
+        Err(ConnectorError::unsupported(format!(
+            "{} can't change an expired password from DataBrain: ask an administrator to set a new one (or change it with the database's own tools)",
+            self.info().display_name
+        )))
+    }
 }
 
 /// Whether a session has an open transaction ([`Session::transaction_state`]).

@@ -4,6 +4,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, isTauri, onOracleInstall, toError } from "../lib/api";
 import type { OracleAgentInfo, OracleClientStatus, OracleInstallProgress } from "../lib/types";
+import { isInstantClient } from "../lib/oracle";
 import { formatBytes } from "../lib/util";
 import { useStore } from "../store";
 import { Modal } from "./ui";
@@ -186,7 +187,7 @@ export function OracleClientDialog() {
 export async function checkOracleClientAtStartup() {
   const st = useStore.getState();
   // Only connections using the Instant Client driver need it (thin is the default).
-  const thick = st.connections.filter((c) => c.config.kind === "oracle" && c.config.options?.driver === "instant_client");
+  const thick = st.connections.filter((c) => c.config.kind === "oracle" && isInstantClient(c.config.options?.driver));
   if (!isTauri() || thick.length === 0) return;
   try {
     const dir = thick.map((c) => c.config.options?.client_lib_dir).find(Boolean) ?? null;

@@ -62,8 +62,9 @@ pub(crate) async fn reconnect(state: State<'_, AppState>, id: String) -> R<usize
     Ok(api::reconnect(&state, &id))
 }
 
+/// `current`: `None` takes the saved password (it never reaches the window).
 #[tauri::command]
-pub(crate) async fn change_password(state: State<'_, AppState>, id: String, current: String, new: String) -> R<api::PasswordChanged> {
+pub(crate) async fn change_password(state: State<'_, AppState>, id: String, current: Option<String>, new: String) -> R<api::PasswordChanged> {
     api::change_password(&state, &id, current, new).await
 }
 

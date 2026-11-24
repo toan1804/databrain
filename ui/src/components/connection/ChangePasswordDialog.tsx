@@ -1,6 +1,6 @@
 // Change a connection's password on the server (ALTER USER / ALTER LOGIN,
 // as each database does it), then the one saved for it.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { KeyRound, Loader2 } from "lucide-react";
 import { api, toError } from "../../lib/api";
 import { traitsOf } from "../../lib/sourceTraits";
@@ -14,7 +14,40 @@ import { Modal } from "../ui";
 /** Not on a read-only connection: it changes the server. */
 export const canChangePassword = (conn: ConnectionView) => traitsOf(conn.config.kind).change_password && conn.config.auth.method === "password" && !conn.config.read_only;
 
-export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; onClose: () => void }) {
+/**
+ * Opened by the app when a connection fails because its password expired
+ * (the server takes nothing else until it is changed).
+ */
+export function ExpiredPasswordDialog() {
+  const connId = useStore((s) => s.expiredPassword);
+  const conn = useStore((s) => s.connections.find((c) => c.id === connId));
+  const changeable = !!conn && canChangePassword(conn);
+  useEffect(() => {
+    if (!connId || changeable) return;
+    // Not one DataBrain can change (read-only, another sign-in, gone): said once.
+    if (conn) useStore.getState().toast(`The password of "${conn.name}" has expired: set a new one with the database's own tools, or ask an administrator`, "error");
+    useStore.setState({ expiredPassword: null });
+  }, [connId, changeable, conn]);
+  if (!connId || !conn || !changeable) return null;
+  return (
+    <ChangePasswordDialog
+      conn={conn}
+      expired
+      onClose={(changed) => {
+        const s = useStore.getState();
+        // Cancelled: the explorer doesn't ask again (a run does). Changed: its tree loads again.
+        useStore.setState({
+          expiredPassword: null,
+          expiredDismissed: changed ? s.expiredDismissed.filter((c) => c !== conn.id) : [...new Set([...s.expiredDismissed, conn.id])],
+        });
+        if (changed) void s.loadSchemas(conn.id, true).catch(() => {});
+      }}
+    />
+  );
+}
+
+/** `onClose(true)` once the password was changed. */
+export function ChangePasswordDialog({ conn, onClose, expired = false }: { conn: ConnectionView; onClose: (changed?: boolean) => void; expired?: boolean }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [again, setAgain] = useState("");
@@ -26,20 +59,26 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
   const [results, setResults] = useState<PasswordUpdate[] | null>(null);
   const user = conn.config.auth.method === "password" ? conn.config.auth.user : "";
   const mismatch = again !== "" && again !== next;
-  const ready = current !== "" && next !== "" && next === again && !busy;
+  // With a password saved, it is the current one (read by the app, never
+  // shown here); asked after all when the keychain doesn't give it.
+  const [useSaved, setUseSaved] = useState(conn.has_secret);
+  const ready = (useSaved || current !== "") && next !== "" && next === again && !busy;
   const submit = async () => {
     if (!ready) return;
     setBusy(true);
     setProblem(null);
     try {
-      const changed = await api.changePassword(conn.id, current, next);
+      const changed = await api.changePassword(conn.id, useSaved ? null : current, next);
       useStore.getState().toast(conn.has_secret ? `Password of ${user} changed on the server and saved for "${conn.name}"` : `Password of ${user} changed on the server`, "success");
       if (changed.others.length) {
         setOthers(changed.others);
         setPicked(new Set(changed.others.map((o) => o.id)));
-      } else onClose();
+      } else onClose(true);
     } catch (e) {
-      setProblem(toError(e).message);
+      const err = toError(e);
+      // The keychain didn't give the saved password: ask for it.
+      if (useSaved && err.message.startsWith("No password is saved")) setUseSaved(false);
+      setProblem(err.message);
     } finally {
       setBusy(false);
     }
@@ -52,10 +91,10 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
       const failed = done.filter((d) => d.error);
       if (!done.length) {
         useStore.getState().toast("Those connections are no longer saved", "info");
-        onClose();
+        onClose(true);
       } else if (!failed.length) {
         useStore.getState().toast(`New password saved for ${done.length} other connection${done.length === 1 ? "" : "s"}`, "success");
-        onClose();
+        onClose(true);
       } else setResults(done);
     } catch (e) {
       setProblem(toError(e).message);
@@ -67,16 +106,16 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
     return (
       <Modal
         title="Update the other connections too?"
-        onClose={() => !busy && onClose()}
+        onClose={() => !busy && onClose(true)}
         width={460}
         footer={
           results ? (
-            <button className="btn-primary" onClick={onClose}>
+            <button className="btn-primary" onClick={() => onClose(true)}>
               Close
             </button>
           ) : (
             <>
-              <button className="btn-ghost" onClick={onClose} disabled={busy}>
+              <button className="btn-ghost" onClick={() => onClose(true)} disabled={busy}>
                 Not now
               </button>
               <button className="btn-primary" disabled={busy || picked.size === 0} onClick={() => void updateOthers()}>
@@ -130,12 +169,12 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
   }
   return (
     <Modal
-      title={`Change the password of ${user}`}
+      title={expired ? `The password of ${user} has expired` : `Change the password of ${user}`}
       onClose={() => !busy && onClose()}
       width={420}
       footer={
         <>
-          <button className="btn-ghost" onClick={onClose} disabled={busy}>
+          <button className="btn-ghost" onClick={() => onClose()} disabled={busy}>
             Cancel
           </button>
           <button className="btn-primary" disabled={!ready} onClick={() => void submit()}>
@@ -151,17 +190,24 @@ export function ChangePasswordDialog({ conn, onClose }: { conn: ConnectionView; 
           void submit();
         }}
       >
+        {expired && (
+          <p role="status">
+            {traitsOf(conn.config.kind).name} refuses &quot;{conn.name}&quot; until {user} has a new password. Set it here: it is changed as DataBrain signs in with the expired one.
+          </p>
+        )}
         <p className="text-muted">
           Changes it on {traitsOf(conn.config.kind).name} for every program that signs in as {user}
-          {conn.has_secret ? `, and saves the new one for "${conn.name}"` : ""}. The current password is checked by signing in with it first. Running queries and open transactions go on; other saved connections signing in as {user} on this server are offered the new password next.
+          {conn.has_secret ? `, and saves the new one for "${conn.name}"` : ""}. {useSaved ? "The password saved for this connection is the current one." : "The current password is checked by signing in with it first."} Running queries and open transactions go on; other saved connections signing in as {user} on this server are offered the new password next.
         </p>
-        <label className="block space-y-1">
-          <span className="text-muted">Current password</span>
-          <input type="password" className="field" autoFocus autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
-        </label>
+        {!useSaved && (
+          <label className="block space-y-1">
+            <span className="text-muted">Current password</span>
+            <input type="password" className="field" autoFocus autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
+          </label>
+        )}
         <label className="block space-y-1">
           <span className="text-muted">New password</span>
-          <input type="password" className="field" autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} />
+          <input type="password" className="field" autoFocus={useSaved} autoComplete="new-password" value={next} onChange={(e) => setNext(e.target.value)} />
         </label>
         <label className="block space-y-1">
           <span className="text-muted">New password again</span>
