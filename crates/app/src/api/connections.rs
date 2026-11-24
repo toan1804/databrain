@@ -213,7 +213,7 @@ pub fn reconnect(state: &AppState, id: &str) -> usize {
 /// and, with a saved password, be it. Idle sessions sign in again with the
 /// new one; running queries, jobs and open transactions go on. Neither
 /// password is logged or kept anywhere else.
-pub async fn change_password(state: &AppState, id: &str, current: String, new: String) -> Result<()> {
+pub async fn change_password(state: &AppState, id: &str, current: String, new: String) -> Result<PasswordChanged> {
     if new.is_empty() {
         return Err(invalid("Type the new password"));
     }
@@ -242,7 +242,7 @@ pub async fn change_password(state: &AppState, id: &str, current: String, new: S
     // A refused sign-in is the wrong password; anything else (unreachable,
     // a timeout, an SSH host key to trust) keeps its own error.
     match state.engine.test_connection(&profile.config, Some(current.clone()), Some(id), None, None).await {
-        Err(e) if e.kind == "auth" => return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}", e.message))),
+        Err(e) if password_refused(&e) => return Err(EngineError::new("invalid", format!("The current password doesn't sign in: {}", e.message))),
         Err(e) => return Err(e),
         Ok(_) => {}
     }
@@ -257,7 +257,122 @@ pub async fn change_password(state: &AppState, id: &str, current: String, new: S
             format!("The password was changed on the server, but the new one couldn't be saved ({e}): type it in the connection's settings."),
         ));
     }
-    Ok(())
+    let others = state
+        .workspace
+        .list_connections()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| same_login(&profile, c))
+        .map(|c| OtherLogin { id: c.id, name: c.name })
+        .collect();
+    Ok(PasswordChanged { others })
+}
+
+/// Whether a sign-in failed on its password (not an unreachable server):
+/// an auth error, or the database's own code or words for a wrong password
+/// (PostgreSQL 28P01, MySQL 1045, SQL Server 18456, Oracle ORA-01017),
+/// which these connectors report as connection errors.
+pub fn password_refused(e: &EngineError) -> bool {
+    let code = e.code.as_deref().unwrap_or("");
+    let m = e.message.to_lowercase();
+    e.kind == "auth"
+        || matches!(code, "28P01" | "28000" | "1045" | "18456" | "1017" | "ORA-01017")
+        || m.contains("password authentication failed")
+        || m.contains("access denied for user")
+        || m.contains("login failed for user")
+        || m.contains("ora-01017")
+}
+
+/// After a password change: the other saved connections that sign in as
+/// the same user ([`same_login`]), whose saved password may want the new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct PasswordChanged {
+    pub others: Vec<OtherLogin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct OtherLogin {
+    pub id: String,
+    pub name: String,
+}
+
+/// Whether `other` is another saved connection signing in as `of`'s user:
+/// the same type, server, port and user with a password saved (and, for
+/// SQL Server, the same instance; for Oracle, the same service or SID, as
+/// a pluggable database has its own users). Users compare case-insensitively
+/// where the database does (SQL Server, Oracle); the host always does.
+pub fn same_login(of: &ConnectionProfile, other: &ConnectionProfile) -> bool {
+    use databrain_auth::AuthMethod;
+    use databrain_connector_core::ConnectorKind;
+    let (AuthMethod::Password { user: a }, AuthMethod::Password { user: b }) = (&of.config.auth, &other.config.auth) else { return false };
+    let (x, y) = (&of.config, &other.config);
+    let host = |h: &Option<String>| h.as_deref().unwrap_or("").trim().to_lowercase();
+    // A port left empty is the database's default.
+    let default_port = match x.kind {
+        ConnectorKind::Postgres => Some(5432),
+        ConnectorKind::Mysql => Some(3306),
+        ConnectorKind::Mssql => Some(1433),
+        ConnectorKind::Oracle => Some(1521),
+        _ => None,
+    };
+    let port = |p: Option<u16>| p.or(default_port);
+    let opt = |c: &databrain_connector_core::ConnectionConfig, k: &str| c.options.get(k).map(|v| v.trim().to_lowercase()).unwrap_or_default();
+    let users = match x.kind {
+        ConnectorKind::Mssql | ConnectorKind::Oracle => a.eq_ignore_ascii_case(b),
+        _ => a == b,
+    };
+    other.id != of.id
+        && other.has_secret
+        && x.kind == y.kind
+        && users
+        && host(&x.host) == host(&y.host)
+        && port(x.port) == port(y.port)
+        && (x.kind != ConnectorKind::Mssql || opt(x, "instance") == opt(y, "instance"))
+        && (x.kind != ConnectorKind::Oracle || (opt(x, "service_name") == opt(y, "service_name") && opt(x, "sid") == opt(y, "sid")))
+}
+
+/// What updating one other connection's saved password did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct PasswordUpdate {
+    pub id: String,
+    pub name: String,
+    /// Why it wasn't updated (`None`: saved).
+    pub error: Option<String>,
+}
+
+/// Save `new` as the password of the connections `ids` after `source`'s
+/// was changed: only those signing in as the same user ([`same_login`]),
+/// and each only once the new password signs in there (a connection that
+/// turns out to be another login, or can't be reached, keeps its own).
+pub async fn update_saved_passwords(state: &AppState, source: &str, ids: &[String], new: String) -> Result<Vec<PasswordUpdate>> {
+    let of = state.workspace.get_connection(source)?;
+    let all = state.workspace.list_connections()?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(c) = all.iter().find(|c| &c.id == id) else { continue };
+        let name = c.name.clone();
+        if !same_login(&of, c) {
+            out.push(PasswordUpdate { id: id.clone(), name, error: Some("It doesn't sign in as the same user".into()) });
+            continue;
+        }
+        let error = match state.engine.test_connection(&c.config, Some(new.clone()), Some(id), None, None).await {
+            Err(e) if password_refused(&e) => Some(format!("The new password doesn't sign in there: {}", e.message)),
+            Err(e) => Some(format!("Couldn't sign in to check the new password: {}", e.message)),
+            Ok(_) => match state.secrets.set(&SecretRef::for_connection(id), &SecretString::from(new.clone())) {
+                Ok(()) => {
+                    state.engine.forget_credentials(id);
+                    state.engine.reconnect(id);
+                    None
+                }
+                Err(e) => Some(format!("The new password couldn't be saved: {e}")),
+            },
+        };
+        out.push(PasswordUpdate { id: id.clone(), name, error });
+    }
+    Ok(out)
 }
 
 /// The user checked an SSH server's key fingerprint and trusts it.

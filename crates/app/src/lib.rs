@@ -236,6 +236,7 @@ pub fn run() {
             commands::connections::test_connection,
             commands::connections::cancel_test_connection,
             commands::connections::change_password,
+            commands::connections::update_saved_passwords,
             commands::connections::connect,
             commands::connections::disconnect,
             commands::connections::reconnect,

@@ -130,6 +130,8 @@ import type {
   TerminalSetting,
 } from "./types";
 import type { RowChange } from "./gridEdits";
+import type { PasswordChanged } from "./bindings/PasswordChanged";
+import type { PasswordUpdate } from "./bindings/PasswordUpdate";
 import type { DbrOpen } from "./bindings/DbrOpen";
 
 export const isTauri = (): boolean =>
@@ -207,7 +209,10 @@ export const api = {
   /** Sign in again on the next call (metadata session and idle tabs), so rights granted since the login apply. */
   reconnect: (id: string) => call<number>("reconnect", { id }),
   /** Change the connection's password on the server, then the saved one. */
-  changePassword: (id: string, current: string, next: string) => call<null>("change_password", { id, current, new: next }),
+  /** Change the password on the server and the saved one; the other connections signing in as the same user. */
+  changePassword: (id: string, current: string, next: string) => call<PasswordChanged>("change_password", { id, current, new: next }),
+  /** Save the new password for those of them that `ids` names, each once it signs in there. */
+  updateSavedPasswords: (source: string, ids: string[], next: string) => call<PasswordUpdate[]>("update_saved_passwords", { source, ids, new: next }),
   /** Pin a checked SSH host key on the saved connections through `host:port` that have none. */
   trustSshHostKey: (host: string, port: number, fingerprint: string) => call<number>("trust_ssh_host_key", { host, port, fingerprint }),
 

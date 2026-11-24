@@ -63,8 +63,15 @@ pub(crate) async fn reconnect(state: State<'_, AppState>, id: String) -> R<usize
 }
 
 #[tauri::command]
-pub(crate) async fn change_password(state: State<'_, AppState>, id: String, current: String, new: String) -> R<()> {
+pub(crate) async fn change_password(state: State<'_, AppState>, id: String, current: String, new: String) -> R<api::PasswordChanged> {
     api::change_password(&state, &id, current, new).await
+}
+
+/// Save the new password for other connections with the same login, each
+/// once it signs in there.
+#[tauri::command]
+pub(crate) async fn update_saved_passwords(state: State<'_, AppState>, source: String, ids: Vec<String>, new: String) -> R<Vec<api::PasswordUpdate>> {
+    api::update_saved_passwords(&state, &source, &ids, new).await
 }
 
 #[tauri::command]
