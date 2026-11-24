@@ -653,9 +653,19 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
             say!("dbr: give a value for {} with -p name=value", missing.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "));
             return BAD_ARGS;
         }
+        // CSV, JSON and TSV are printed as the rows are read (a pipe gets the
+        // first ones while the query still runs): the tab's rows are tapped.
+        let tab_id = format!("cli:{}", uuid::Uuid::new_v4().simple());
+        let (_tap, mut rows_rx) = if format == Format::Table {
+            (None, None)
+        } else {
+            let (tap, rx) = state.engine.tap_rows(&tab_id);
+            (Some(tap), Some(rx))
+        };
+        let mut printer = Printer { format, index: None, columns: Vec::new(), keys: Vec::new(), header: true, broken: false };
         let req = |confirmed: bool| RunRequest {
             connection_id: conn.id.clone(),
-            tab_id: format!("cli:{}", uuid::Uuid::new_v4().simple()),
+            tab_id: tab_id.clone(),
             sql: job.sql.clone(),
             base_offset: 0,
             row_limit: limit,
@@ -666,7 +676,13 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
             params: opts.params.clone(),
             output_masks: None,
         };
-        let mut res = state.engine.run_and_wait(&state.hub, req(false), Some(cancel.clone())).await;
+        let mut res = with_rows(state.engine.run_and_wait(&state.hub, req(false), Some(cancel.clone())), rows_rx.as_mut(), |b| {
+            if !printer.print(out, &b) {
+                // The reader went away (`| head`): stop the query.
+                cancel.cancel();
+            }
+        })
+        .await;
         // Production (or a write the connection asks about): asked here, or --yes.
         if let Err(e) = &res
             && e.code.as_deref() == Some("needs_confirmation")
@@ -685,7 +701,16 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
                 );
                 return BAD_ARGS;
             }
-            res = state.engine.run_and_wait(&state.hub, req(true), Some(cancel.clone())).await;
+            res = with_rows(state.engine.run_and_wait(&state.hub, req(true), Some(cancel.clone())), rows_rx.as_mut(), |b| {
+                if !printer.print(out, &b) {
+                    cancel.cancel();
+                }
+            })
+            .await;
+        }
+        // The reader went away: nothing more to print, and nothing went wrong.
+        if printer.broken {
+            return if failed { FAILED } else { DONE };
         }
         if cancel.is_cancelled() {
             say!("dbr: stopped");
@@ -730,23 +755,9 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
                 }
                 r2
             } else {
-                // Every row, a page at a time: printed as read (a pipe gets the
-                // first rows at once, and the rows are never all in memory).
-                let keys = json_keys(&r.columns);
-                let mut header = true;
-                let mut broken = false;
-                for_each_page(state, &r.id, r.total_rows, &cancel, |page| {
-                    if broken {
-                        return;
-                    }
-                    let text = render_rows(format, &r.columns, &keys, page, header);
-                    header = false;
-                    // The reader went away (`| head`): stop reading.
-                    if out.write_all(text.as_bytes()).is_err() {
-                        broken = true;
-                    }
-                })
-                .await
+                // Printed while the query ran (the tap).
+                let _ = r;
+                Ok(())
             };
             match read {
                 Ok(()) => {}
@@ -763,6 +774,73 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
     }
     let _ = out.flush();
     if failed { FAILED } else { DONE }
+}
+
+/// Run `run`, handing each batch from `rows` (when tapped) to `each` as it
+/// comes; the batches still queued when the run ends are handed on too.
+async fn with_rows<R>(
+    run: impl std::future::Future<Output = R>,
+    rows: Option<&mut tokio::sync::mpsc::Receiver<databrain_query_engine::TappedBatch>>,
+    mut each: impl FnMut(databrain_query_engine::TappedBatch),
+) -> R {
+    let Some(rows) = rows else { return run.await };
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            biased;
+            Some(b) = rows.recv() => each(b),
+            r = &mut run => {
+                while let Ok(b) = rows.try_recv() {
+                    each(b);
+                }
+                return r;
+            }
+        }
+    }
+}
+
+/// Prints tapped rows as CSV, JSON or TSV: a header (CSV, TSV) at each
+/// statement's first rows.
+struct Printer {
+    format: Format,
+    /// The statement whose rows came last.
+    index: Option<usize>,
+    columns: Vec<ColumnMeta>,
+    keys: Vec<String>,
+    header: bool,
+    /// The reader went away: nothing more is printed.
+    broken: bool,
+}
+
+impl Printer {
+    /// Print `b`; false when the reader went away.
+    fn print(&mut self, out: &mut dyn Write, b: &databrain_query_engine::TappedBatch) -> bool {
+        if self.broken {
+            return false;
+        }
+        if self.index != Some(b.index) {
+            self.index = Some(b.index);
+            self.columns = b.batch.schema().fields().iter().map(|f| databrain_result_store::column_meta(f)).collect();
+            self.keys = json_keys(&self.columns);
+            self.header = true;
+        }
+        let text = render_rows(self.format, &self.columns, &self.keys, &batch_rows(&b.batch), self.header);
+        self.header = false;
+        if out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_err() {
+            self.broken = true;
+        }
+        !self.broken
+    }
+}
+
+/// A batch's cells as the grid shows them (NULL as `None`).
+fn batch_rows(batch: &databrain_connector_core::arrow::record_batch::RecordBatch) -> Vec<Vec<Option<String>>> {
+    use databrain_connector_core::arrow::util::display::ArrayFormatter;
+    let opts = databrain_result_store::display::format_options();
+    let Ok(formatters) = batch.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &opts)).collect::<Result<Vec<_>, _>>() else {
+        return Vec::new();
+    };
+    (0..batch.num_rows()).map(|r| formatters.iter().zip(batch.columns()).map(|(f, a)| databrain_result_store::display::cell(f, a, r)).collect()).collect()
 }
 
 /// The name of the DuckDB connection the app reads local files with.

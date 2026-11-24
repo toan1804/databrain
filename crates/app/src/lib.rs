@@ -6,6 +6,7 @@ pub mod background;
 pub mod cli;
 mod commands;
 pub mod conn_io;
+pub mod dbr_install;
 pub mod handoff;
 pub mod jobs;
 pub mod logging;
@@ -31,6 +32,26 @@ pub const JOB_EVENT: &str = "job-event";
 
 /// Said to the UI when `dbr` has handed something to open ([`DbrOpens`]).
 pub const DBR_OPEN_EVENT: &str = "dbr-open";
+
+/// Files the system asked to open before the app had set up (a double-click
+/// that started it): moved into [`DbrOpens`] then.
+static EARLY_OPENS: parking_lot::Mutex<Vec<handoff::DbrOpen>> = parking_lot::Mutex::new(Vec::new());
+
+/// Open `o` (files the system asked to open): queued for the UI, the window
+/// brought to the front.
+#[cfg(target_os = "macos")]
+fn open_files(app: &AppHandle, o: handoff::DbrOpen) {
+    match app.try_state::<DbrOpens>() {
+        Some(q) => q.0.lock().push(o),
+        None => return EARLY_OPENS.lock().push(o),
+    }
+    let _ = app.emit(DBR_OPEN_EVENT, ());
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
 
 /// What `dbr` asked to open, kept until the UI takes it (`take_dbr_opens`):
 /// a request that comes while the app is still starting waits for the UI.
@@ -119,6 +140,23 @@ fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
 }
 
 pub fn run() {
+    // Files given on the command line (Linux and Windows "Open With" start
+    // the app with them): a DataBrain already running opens them, and this
+    // one quits; else this one opens them once it is up.
+    if let Some(open) = handoff::file_opens(std::env::args_os().skip(1).map(std::path::PathBuf::from)) {
+        let req = handoff::OpenRequest { connection: None, items: open.items.clone(), params: Default::default(), run: false };
+        match cli::runtime().map(|rt| rt.block_on(handoff::send(&background::data_dir(), &req))) {
+            // None running (or the runtime couldn't start): this one opens them.
+            Ok(Err(handoff::SendError::NotRunning)) | Err(_) => EARLY_OPENS.lock().push(open),
+            Ok(Ok(handoff::Reply { error: None })) => return,
+            // A running app was reached but refused or didn't answer (it may
+            // have queued them): not a second DataBrain opening them again.
+            Ok(Ok(handoff::Reply { error: Some(e) })) | Ok(Err(handoff::SendError::Failed(e))) => {
+                eprintln!("DataBrain: the running DataBrain didn't open the files: {e}");
+                return;
+            }
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -170,6 +208,8 @@ pub fn run() {
             let (ws, engine) = (state.workspace.clone(), state.engine.clone());
             app.manage(state);
             app.manage(DbrOpens::default());
+            // Files asked for before this point (the double-click that started the app).
+            app.state::<DbrOpens>().0.lock().append(&mut EARLY_OPENS.lock());
             // `dbr` without -i: what it opens here.
             {
                 let h = app.handle().clone();
@@ -383,6 +423,8 @@ pub fn run() {
             commands::ai::ai_provider_sign_in,
             commands::ai::ai_provider_status,
             commands::system::terminal_options,
+            commands::system::dbr_command_status,
+            commands::system::install_dbr_command,
             commands::system::duckdb_engine_status,
             commands::drivers::duckdb_engine_load,
             commands::ai::ai_provider_usage,
@@ -444,6 +486,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building DataBrain")
         .run(|app, event| {
+            // macOS: a file double-clicked or opened with DataBrain.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = &event
+                && let Some(open) = handoff::file_opens(urls.iter().filter_map(|u| u.to_file_path().ok()))
+            {
+                open_files(app, open);
+            }
             if let tauri::RunEvent::Exit = event {
                 // Keep each tab's last result for the next start.
                 if let Some(state) = app.try_state::<AppState>() {

@@ -13,5 +13,73 @@
         "dragDropEnabled": false
       }
     ]
+  },
+  "bundle": {
+    "fileAssociations": [
+      {
+        "ext": [
+          "csv"
+        ],
+        "name": "CSV file",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/csv"
+      },
+      {
+        "ext": [
+          "tsv"
+        ],
+        "name": "TSV file",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/tab-separated-values"
+      },
+      {
+        "ext": [
+          "parquet"
+        ],
+        "name": "Parquet file",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/vnd.apache.parquet"
+      },
+      {
+        "ext": [
+          "json"
+        ],
+        "name": "JSON file",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/json"
+      },
+      {
+        "ext": [
+          "jsonl",
+          "ndjson"
+        ],
+        "name": "JSON lines file",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/x-ndjson"
+      },
+      {
+        "ext": [
+          "xlsx"
+        ],
+        "name": "Excel workbook",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      },
+      {
+        "ext": [
+          "sql"
+        ],
+        "name": "SQL file",
+        "role": "Editor",
+        "rank": "Alternate",
+        "mimeType": "application/sql"
+      }
+    ]
   }
 }

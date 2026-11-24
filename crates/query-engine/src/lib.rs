@@ -32,6 +32,7 @@ use guard::{Guarded, Hold, Intent};
 pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, LoadTarget, NoLoadObserver};
 pub use metadata::DefaultNamespace;
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
+pub use run::{RowTap, TappedBatch};
 
 use databrain_auth::{
     AuthStatus, CredentialSource, ExposeSecret, InlineCredentialSource, Interaction, NonInteractive, SecretRef, SecretStore, credential_source,
@@ -213,6 +214,9 @@ pub struct QueryEngine {
     tests: Mutex<HashMap<String, CancellationToken>>,
     /// Running full exports (query re-run straight to a file), by id.
     exports: Mutex<HashMap<String, CancellationToken>>,
+    /// Rows of the statements run for a tab, handed on as they are read
+    /// (`dbr --csv` prints them while the query runs): [`QueryEngine::tap_rows`].
+    taps: Mutex<HashMap<String, tokio::sync::mpsc::Sender<TappedBatch>>>,
     /// Files written by finished full exports, by id.
     /// Files of the latest exports (export id, path), newest last, at most
     /// [`export::KEPT_EXPORTS`].
@@ -243,6 +247,7 @@ impl QueryEngine {
             jobs: Mutex::new(HashMap::new()),
             tests: Mutex::new(HashMap::new()),
             exports: Mutex::new(HashMap::new()),
+            taps: Mutex::new(HashMap::new()),
             exported: Mutex::new(std::collections::VecDeque::new()),
             outputs: OutputRegistry::new(results.clone(), workspace.clone()),
             manual_commit: Mutex::new(Default::default()),

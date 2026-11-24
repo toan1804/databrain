@@ -7,11 +7,14 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Added
 
 - **Change password updates your other connections too:** after a password change, DataBrain lists the other saved connections that sign in as the same user on that server and offers to save the new password for them, each once it signs in there.
+- **Open files with DataBrain:** on macOS and Linux, DataBrain is under "Open With" for CSV, TSV, Parquet, JSON, Excel and SQL files (never made their default app); a data file opens as a result, a `.sql` file in its tab.
+- **Install the `dbr` command:** Settings → Terminal → "Install the dbr command" puts `dbr` on your PATH (macOS: a link in `/usr/local/bin`, asking for an administrator's password when needed; Windows: the install folder on your PATH; Linux AppImage: a script in `~/.local/bin`), and says where it is when it already is.
 - **`dbr` opens files in the app:** without `-i`, `dbr orders.csv` opens the file's rows in a tab of the running DataBrain (started when it isn't), `dbr -c sales report.sql` opens the `.sql` file there on that connection (`--run` runs it too), and `dbr -c sales "select …"` opens the SQL in a new tab and runs it, as the editor runs it: the read-only setting and the production confirmation apply. `-i` still prints the rows in the terminal.
 - **Stop one step of a background run:** a step's Stop now works on a run the background runner (or `dbr jobs run`) is doing, as on the app's own runs; `dbr jobs stop <job> --step <step>` does it from a terminal. The rest of the run goes on.
 
 ### Changed
 
+- **`dbr --csv`, `--json` and `--tsv` print rows as the query returns them:** the first lines come while it still runs (they waited for the whole result before), a slow reader holds the query up, and `| head` stops it.
 - **`dbr jobs run` exits 130 when its run is stopped** (from the app or `dbr jobs stop`), with why, instead of 1 as for a failure.
 
 ## 0.5.1 - 2026-11-20
