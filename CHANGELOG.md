@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.5.2 - 2026-11-24
+
 ### Added
 
 - **Change password updates your other connections too:** after a password change, DataBrain lists the other saved connections that sign in as the same user on that server and offers to save the new password for them, each once it signs in there.
