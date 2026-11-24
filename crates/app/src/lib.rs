@@ -144,11 +144,17 @@ pub fn run() {
     // one quits; else this one opens them once it is up.
     if let Some(open) = handoff::file_opens(std::env::args_os().skip(1).map(std::path::PathBuf::from)) {
         let req = handoff::OpenRequest { connection: None, items: open.items.clone(), params: Default::default(), run: false };
-        let sent = cli::runtime().ok().map(|rt| rt.block_on(handoff::send(&background::data_dir(), &req)));
-        if matches!(sent, Some(Ok(handoff::Reply { error: None }))) {
-            return;
+        match cli::runtime().map(|rt| rt.block_on(handoff::send(&background::data_dir(), &req))) {
+            // None running (or the runtime couldn't start): this one opens them.
+            Ok(Err(handoff::SendError::NotRunning)) | Err(_) => EARLY_OPENS.lock().push(open),
+            Ok(Ok(handoff::Reply { error: None })) => return,
+            // A running app was reached but refused or didn't answer (it may
+            // have queued them): not a second DataBrain opening them again.
+            Ok(Ok(handoff::Reply { error: Some(e) })) | Ok(Err(handoff::SendError::Failed(e))) => {
+                eprintln!("DataBrain: the running DataBrain didn't open the files: {e}");
+                return;
+            }
         }
-        EARLY_OPENS.lock().push(open);
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

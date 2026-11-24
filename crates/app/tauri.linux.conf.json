@@ -58,6 +58,14 @@
         "role": "Editor",
         "mimeType": "application/sql"
       }
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/databrain.desktop"
+      },
+      "rpm": {
+        "desktopTemplate": "linux/databrain.desktop"
+      }
+    }
   }
 }
