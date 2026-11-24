@@ -1,0 +1,63 @@
+{
+  "bundle": {
+    "fileAssociations": [
+      {
+        "ext": [
+          "csv"
+        ],
+        "name": "CSV file",
+        "role": "Viewer",
+        "mimeType": "text/csv"
+      },
+      {
+        "ext": [
+          "tsv"
+        ],
+        "name": "TSV file",
+        "role": "Viewer",
+        "mimeType": "text/tab-separated-values"
+      },
+      {
+        "ext": [
+          "parquet"
+        ],
+        "name": "Parquet file",
+        "role": "Viewer",
+        "mimeType": "application/vnd.apache.parquet"
+      },
+      {
+        "ext": [
+          "json"
+        ],
+        "name": "JSON file",
+        "role": "Viewer",
+        "mimeType": "application/json"
+      },
+      {
+        "ext": [
+          "jsonl",
+          "ndjson"
+        ],
+        "name": "JSON lines file",
+        "role": "Viewer",
+        "mimeType": "application/x-ndjson"
+      },
+      {
+        "ext": [
+          "xlsx"
+        ],
+        "name": "Excel workbook",
+        "role": "Viewer",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      },
+      {
+        "ext": [
+          "sql"
+        ],
+        "name": "SQL file",
+        "role": "Editor",
+        "mimeType": "application/sql"
+      }
+    ]
+  }
+}
