@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- **`dbr` says when a file isn't there:** `dbr orders.csv` (or with `-i`) for a file not in the current folder ran `orders.csv` as SQL, a syntax error in the app or the terminal; it now says the file isn't there and in which folder (`-e` still runs such a word as SQL).
+
 ## 0.5.2 - 2026-11-24
 
 ### Added

@@ -131,8 +131,25 @@ pub enum Source {
     File(PathBuf),
 }
 
+/// Extensions of the files dbr reads (data files and `.sql`).
+/// (`detect_format`'s, gzipped and zstd ones too; `.xls` to say it isn't there).
+const FILE_EXTENSIONS: [&str; 14] = ["sql", "csv", "tsv", "psv", "txt", "json", "jsonl", "ndjson", "parquet", "pq", "xlsx", "xls", "gz", "zst"];
+
+/// Whether `s` can only be a file's name: one word that is a path
+/// (`./x`, `data/x`, `~/x`) or ends in a file extension dbr reads. Never
+/// SQL: `orders.csv` or `a/b` doesn't parse as a statement.
+pub fn names_a_file(s: &str) -> bool {
+    if s.is_empty() || s.contains(char::is_whitespace) || s.contains(['(', ')', ';', '\'', '"', '*', '=', ',']) {
+        return false;
+    }
+    let path = s.contains('/') || s.contains('\\') || s.starts_with('~');
+    let ext = Path::new(s).extension().and_then(|e| e.to_str()).is_some_and(|e| FILE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)));
+    path || ext
+}
+
 /// Read the command line (`exists`: whether a path names a file, so SQL
-/// that is no file is SQL).
+/// that is no file is SQL; a word that can only be a file, not there, is
+/// an error).
 pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, String> {
     let mut o = Opts::default();
     let mut it = args.iter();
@@ -161,6 +178,11 @@ pub fn parse(args: &[String], exists: impl Fn(&Path) -> bool) -> Result<Opts, St
             // An option is one word: SQL starting with a `--` comment is SQL.
             f if f.starts_with('-') && f.len() > 1 && !f.contains(char::is_whitespace) => return Err(format!("unknown option {f:?}")),
             s if exists(Path::new(s)) => o.sources.push(Source::File(PathBuf::from(s))),
+            // `orders.csv` that isn't there is a file not found, not SQL to run.
+            s if names_a_file(s) => {
+                let here = std::env::current_dir().map(|d| format!(" in {}", d.display())).unwrap_or_default();
+                return Err(format!("{s}: no such file{here} (-e {s:?} runs it as SQL)"));
+            }
             s => o.sources.push(Source::Sql(s.to_string())),
         }
     }
@@ -982,6 +1004,38 @@ mod tests {
         assert!(parse(&args(&["-i", "--limit", "many", "x"]), files).unwrap_err().contains("--limit takes"));
         assert!(parse(&args(&["-i", "-p", "day", "x"]), files).unwrap_err().contains("name=value"));
         assert!(parse(&args(&["-x", "x"]), files).unwrap_err().contains("unknown option"));
+        // A file that isn't there is said so, with and without -i: never run as SQL.
+        let none = |_: &Path| false;
+        for f in [
+            "test.csv",
+            "test.TSV",
+            "a.json",
+            "a.jsonl",
+            "a.ndjson",
+            "a.parquet",
+            "a.pq",
+            "a.psv",
+            "a.csv.gz",
+            "a.json.zst",
+            "a.xlsx",
+            "a.xls",
+            "a.txt",
+            "q.sql",
+            "data/x",
+            "./events",
+            "~/a.csv",
+            r"C:\d\a.csv",
+        ] {
+            for a in [&[f][..], &["-i", f], &["-c", "sales", "-i", "--csv", f]] {
+                let e = parse(&args(a), none).unwrap_err();
+                assert!(e.starts_with(&format!("{f}: no such file")) && e.contains("-e"), "{a:?}: {e}");
+            }
+        }
+        // SQL is SQL, a word with a dot in it too.
+        for s in ["select 1", "select * from 'a.csv'", "show", "select 1/2", "from 'x.parquet'", "read_csv('a.csv')", "t.id"] {
+            assert_eq!(parse(&args(&[s]), none).unwrap().sources, [Source::Sql(s.into())], "{s}");
+        }
+        assert_eq!(parse(&args(&["-e", "a.csv"]), none).unwrap().sources, [Source::Sql("a.csv".into())]);
         // SQL that starts with a `--` comment is SQL, not an option.
         assert_eq!(parse(&args(&["-i", "--x\nselect\n1"]), files).unwrap().sources, [Source::Sql("--x\nselect\n1".into())]);
         assert!(parse(&args(&["--help"]), files).unwrap().help);
@@ -1010,6 +1064,19 @@ mod tests {
         let r = open_request(&o).unwrap();
         assert_eq!(r.items[0], OpenItem::Data { path: s(dir.path()) });
         assert!(matches!(&r.items[1], OpenItem::Data { path } if Path::new(path).is_absolute() && path.ends_with("x.csv")));
+        // Each format dbr reads goes to the app as a file, by the name typed in the current folder.
+        let here = tempfile::tempdir_in(".").unwrap();
+        let rel = |n: &str| here.path().file_name().unwrap().to_string_lossy().into_owned() + "/" + n;
+        let names = ["t.csv", "t.tsv", "t.txt", "t.json", "t.jsonl", "t.ndjson", "t.parquet", "t.xlsx", "T.CSV", "my file.csv"];
+        for n in names {
+            std::fs::write(here.path().join(n), "a\n1\n").unwrap();
+        }
+        let typed: Vec<String> = names.iter().map(|n| rel(n)).collect();
+        let r = open_request(&parse(&typed, |p| p.is_file() || p.is_dir()).unwrap()).unwrap();
+        for (item, n) in r.items.iter().zip(names) {
+            assert!(matches!(item, OpenItem::Data { path } if Path::new(path).is_absolute() && path.ends_with(n)), "{n}: {item:?}");
+        }
+        assert_eq!(r.items.len(), names.len());
         // Printing options are for -i; --yes too (the app asks itself).
         for a in [&["--csv", "x"][..], &["--limit", "5", "x"], &["-y", "x"]] {
             let e = open_request(&parse(&args(a), |_| false).unwrap()).unwrap_err();
