@@ -50,7 +50,8 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
     let live = true;
     setDetail({ status: "loading" });
     api
-      .describeObject(connId, reference.schema, reference.name)
+      // Refresh asks the server again; opening reuses the explorer's description of a moment ago.
+      .describeObject(connId, reference.schema, reference.name, detailSeq > 0)
       .then((d) => live && setDetail({ status: "ready", detail: d }))
       .catch((e) => live && setDetail({ status: "error", message: toError(e).message }));
     return () => {

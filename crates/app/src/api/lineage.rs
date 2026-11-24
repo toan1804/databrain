@@ -111,7 +111,8 @@ pub async fn lineage(
             if !ws.meta_table(id, &schema, &name).ok().flatten().is_some_and(|c| c.stale) {
                 continue;
             }
-            match tokio::time::timeout_at(deadline, describe(state, id, &schema, &name)).await {
+            // Fresh: a description kept from before the change would be the stale one.
+            match tokio::time::timeout_at(deadline, super::explorer::describe_with(state, id, &schema, &name, true)).await {
                 Ok(Ok(d)) if !d.columns.is_empty() => {
                     described.push(format!("{schema}.{name}"));
                     refreshed = true;
@@ -183,7 +184,7 @@ pub async fn lineage(
                 if !matches!(obj.kind, databrain_connector_core::ObjectKind::View | databrain_connector_core::ObjectKind::MaterializedView) {
                     continue;
                 }
-                match tokio::time::timeout_at(deadline, object_ddl(state, id, &schema, &name, obj.kind)).await {
+                match tokio::time::timeout_at(deadline, object_ddl(state, id, &schema, &name, obj.kind, false)).await {
                     Ok(r) => {
                         let ddl = r.ok().flatten().unwrap_or_default();
                         read_views |= !ddl.trim().is_empty();

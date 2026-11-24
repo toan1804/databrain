@@ -580,6 +580,11 @@ impl Session for MssqlSession {
         Ok(l)
     }
 
+    /// Its table DDL is fuller than describe's (constraints, indexes): never answered from a description.
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        false
+    }
+
     /// Tables: columns plus keys, foreign keys, checks and indexes. Views,
     /// procedures and functions: their definition.
     async fn object_ddl(&self, schema: &str, name: &str, _kind: ObjectKind) -> Result<Option<String>> {

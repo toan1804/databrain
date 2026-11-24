@@ -107,8 +107,9 @@ pub(crate) async fn object_ddl(
     schema: String,
     name: String,
     kind: databrain_connector_core::ObjectKind,
+    fresh: Option<bool>,
 ) -> R<Option<String>> {
-    api::object_ddl(&state, &id, &schema, &name, kind).await
+    api::object_ddl(&state, &id, &schema, &name, kind, fresh.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -127,8 +128,8 @@ pub(crate) async fn search_objects(state: State<'_, AppState>, id: String, query
 }
 
 #[tauri::command]
-pub(crate) async fn describe_object(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<ObjectDetail> {
-    api::describe(&state, &id, &schema, &name).await
+pub(crate) async fn describe_object(state: State<'_, AppState>, id: String, schema: String, name: String, fresh: Option<bool>) -> R<ObjectDetail> {
+    api::describe_with(&state, &id, &schema, &name, fresh.unwrap_or(false)).await
 }
 
 #[tauri::command]

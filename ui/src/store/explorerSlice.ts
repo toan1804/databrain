@@ -434,13 +434,14 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     const have = get().columns[key];
     if (have) return have;
     const put = (cols: ColumnInfo[]) => set((s) => ({ columns: withColumns(s.columns, key, cols) }));
-    const live = () =>
-      once(`col|${key}`, () => api.describeObject(connId, schema, name)).then((d) => (get().markOnline(connId), put(d.columns), d.columns));
+    // `fresh`: the cached columns are stale (the schema changed): not a description kept from before.
+    const live = (fresh = false) =>
+      once(`col|${key}`, () => api.describeObject(connId, schema, name, fresh)).then((d) => (get().markOnline(connId), put(d.columns), d.columns));
     const cached = await api.cachedColumns(connId, schema, name).catch(() => null);
     if (cached) {
       put(cached.columns);
       // Changed since: shown now, replaced when the server answers.
-      if (cached.stale && !get().explorer[connId]?.offline) void live().catch(() => {});
+      if (cached.stale && !get().explorer[connId]?.offline) void live(true).catch(() => {});
       return cached.columns;
     }
     return live();

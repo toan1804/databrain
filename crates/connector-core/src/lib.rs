@@ -218,6 +218,15 @@ pub trait Session: Send + Sync {
         self.execute(Statement::internal(sql), ExecOptions::default()).await?.collect().await.map(|_| ())
     }
 
+    /// Whether [`ObjectDetail::ddl`] from [`Session::describe`] is what
+    /// [`Session::object_ddl`] gives for a table or view (the default: it is
+    /// made from it), so the engine can answer the DDL from a description it
+    /// already has instead of asking the server again. `false` where
+    /// `object_ddl` builds a fuller one.
+    fn describe_ddl_is_object_ddl(&self) -> bool {
+        true
+    }
+
     /// Full DDL of an object (explorer "Show DDL"). `None` when the engine
     /// can't produce it. The default uses [`Session::describe`] for tables
     /// and views; engines override it for complete table DDL (constraints,
