@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.5.3 - 2026-11-25
+
 ### Added
 
 - **An expired MySQL/MariaDB password can be changed in DataBrain:** the change-password dialog (which opens by itself when the server refuses the expired password, error 1862, or allows only a password change, 1820, as MariaDB does by default) now sets it, signed in to the session the server allows for that (MySQL's ALTER USER, MariaDB's SET PASSWORD). On MySQL, a new password with a backslash can't be set while the old one has expired: set one without, then change it again.
