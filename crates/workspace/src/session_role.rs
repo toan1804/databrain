@@ -177,6 +177,7 @@ mod tests {
             SessionRole::Notebook { notebook: "n1".into(), cell: Some("c2".into()) },
             SessionRole::Meta,
             SessionRole::Index,
+            SessionRole::Scan,
             SessionRole::Ai { chat: "s9".into(), part: AiPart::Query },
             SessionRole::Ai { chat: "s9".into(), part: AiPart::Outputs },
             SessionRole::Ai { chat: "mcp".into(), part: AiPart::Sample },

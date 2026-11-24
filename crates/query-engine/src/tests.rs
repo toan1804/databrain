@@ -1570,9 +1570,11 @@ async fn expired_password_change_is_refused_where_a_change_is() {
 
 /// A server database stand-in (ClickHouse: not local) whose fingerprint
 /// query is slow, as ALL_OBJECTS is on a large Oracle; it counts them and
-/// answers for schemas `a` and `b`.
-struct SlowScan(Arc<std::sync::atomic::AtomicUsize>);
-struct SlowScanSession(Arc<std::sync::atomic::AtomicUsize>);
+/// answers for schemas `a` and `b`. Each session runs one call at a time,
+/// as a real driver's does. `fail_from`: connections after that many fail
+/// (a server's per-user session limit).
+struct SlowScan(Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>, usize);
+struct SlowScanSession(Arc<std::sync::atomic::AtomicUsize>, tokio::sync::Mutex<()>);
 
 #[async_trait::async_trait]
 impl databrain_connector_core::Connector for SlowScan {
@@ -1590,7 +1592,10 @@ impl databrain_connector_core::Connector for SlowScan {
         }
     }
     async fn connect(&self, _: &ConnectionConfig, _: Arc<dyn CredentialSource>) -> databrain_connector_core::Result<Box<dyn Session>> {
-        Ok(Box::new(SlowScanSession(self.0.clone())))
+        if self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= self.2 {
+            return Err(ConnectorError::connection("ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit"));
+        }
+        Ok(Box::new(SlowScanSession(self.0.clone(), tokio::sync::Mutex::new(()))))
     }
 }
 
@@ -1619,6 +1624,7 @@ impl Session for SlowScanSession {
         Ok(vec![])
     }
     async fn describe(&self, schema: &str, name: &str) -> databrain_connector_core::Result<ObjectDetail> {
+        let _one_at_a_time = self.1.lock().await;
         Ok(ObjectDetail {
             object: DbObject { schema: schema.into(), name: name.into(), kind: databrain_connector_core::ObjectKind::Table, comment: None, row_estimate: None },
             columns: vec![],
@@ -1627,6 +1633,7 @@ impl Session for SlowScanSession {
         })
     }
     async fn explorer_fingerprints(&self) -> databrain_connector_core::Result<Option<HashMap<String, String>>> {
+        let _one_at_a_time = self.1.lock().await;
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(1500)).await;
         Ok(Some([("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())].into_iter().collect()))
@@ -1643,7 +1650,7 @@ async fn background_catalog_work_never_holds_up_the_user() {
     use std::sync::atomic::Ordering::SeqCst;
     let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut reg = ConnectorRegistry::new();
-    reg.register(Arc::new(SlowScan(scans.clone())));
+    reg.register(Arc::new(SlowScan(scans.clone(), Arc::default(), usize::MAX)));
     let ws = Arc::new(Workspace::open_in_memory().unwrap());
     let p = ws
         .save_connection(ConnectionProfile {
@@ -1677,7 +1684,18 @@ async fn background_catalog_work_never_holds_up_the_user() {
     // Nothing listed: nothing to compare, nothing asked.
     assert!(engine.explorer_fingerprints(&id, &[]).await.unwrap().unwrap().is_empty());
     assert_eq!(scans.load(SeqCst), 1);
-    // Refresh (reconnect) closes both catalog sessions.
+    // The background session closes two minutes after its work, idle
+    // disconnect or not; the user's stays.
+    for ((_, key), live) in engine.sessions.lock().iter() {
+        if *key == SessionRole::Scan.key() {
+            *live.last_used.lock() = Instant::now() - crate::sessions::SCAN_IDLE - Duration::from_secs(1);
+        }
+    }
+    assert_eq!(engine.close_idle_with(None), 1);
+    let keys: Vec<String> = engine.sessions.lock().keys().map(|(_, t)| t.clone()).collect();
+    assert_eq!(keys, vec![meta_tab()]);
+    // Refresh (reconnect) closes the catalog sessions.
+    engine.explorer_fingerprints(&id, &listed).await.unwrap();
     engine.reconnect(&id);
     assert!(engine.sessions.lock().is_empty());
     // A local file: one catalog session for both lanes.
@@ -1685,5 +1703,34 @@ async fn background_catalog_work_never_holds_up_the_user() {
     f.engine.list_objects_in(&f.conn_id, "main", Lane::Background).await.unwrap();
     f.engine.list_objects(&f.conn_id, "main").await.unwrap();
     let keys: Vec<String> = f.engine.sessions.lock().keys().map(|(_, t)| t.clone()).collect();
+    assert_eq!(keys, vec![meta_tab()]);
+}
+
+/// A server that refuses a second session (a per-user session limit): the
+/// background work runs on the user's catalog session, as before there were two.
+#[tokio::test]
+async fn background_work_falls_back_when_its_session_cant_open() {
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(SlowScan(Arc::default(), Arc::default(), 1)));
+    let ws = Arc::new(Workspace::open_in_memory().unwrap());
+    let p = ws
+        .save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "Capped".into(),
+            config: ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::None),
+            color: None,
+            env: EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    let engine = QueryEngine::new(reg, ws, Arc::new(MemoryStore::default()), Arc::new(ResultStore::new()), Arc::new(CollectingSink::default()));
+    engine.object_ddl(&p.id, "a", "t", databrain_connector_core::ObjectKind::Table).await.unwrap();
+    let fps = engine.explorer_fingerprints(&p.id, &["a".to_string()]).await.unwrap().unwrap();
+    assert_eq!(fps.len(), 1);
+    let keys: Vec<String> = engine.sessions.lock().keys().map(|(_, t)| t.clone()).collect();
     assert_eq!(keys, vec![meta_tab()]);
 }

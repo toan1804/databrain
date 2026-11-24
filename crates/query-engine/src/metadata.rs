@@ -31,7 +31,7 @@ impl QueryEngine {
     /// [`Self::list_objects`] on `lane`'s session.
     pub async fn list_objects_in(&self, connection_id: &str, schema: &str, lane: Lane) -> Result<Vec<DbObject>> {
         let schema = schema.to_string();
-        self.with_tab(connection_id, &self.lane_tab(connection_id, lane), |s| {
+        self.with_lane(connection_id, lane, |s| {
             let schema = schema.clone();
             async move { s.list_objects(&schema).await }
         })
@@ -124,7 +124,7 @@ impl QueryEngine {
             return Ok(Some(HashMap::new()));
         }
         let schemas = schemas.to_vec();
-        self.with_tab(connection_id, &self.lane_tab(connection_id, Lane::Background), |s| {
+        self.with_lane(connection_id, Lane::Background, |s| {
             let schemas = schemas.clone();
             async move { s.explorer_fingerprints_of(&schemas).await }
         })
@@ -144,7 +144,7 @@ impl QueryEngine {
     /// [`Self::object_versions`] on `lane`'s session.
     pub async fn object_versions_in(&self, connection_id: &str, schema: &str, lane: Lane) -> Result<Option<HashMap<String, String>>> {
         let schema = schema.to_string();
-        self.with_tab(connection_id, &self.lane_tab(connection_id, lane), |s| {
+        self.with_lane(connection_id, lane, |s| {
             let schema = schema.clone();
             async move { s.object_versions(&schema).await }
         })
@@ -158,7 +158,7 @@ impl QueryEngine {
     /// [`Self::list_objects_named`] on `lane`'s session.
     pub async fn list_objects_named_in(&self, connection_id: &str, schema: &str, names: &[String], lane: Lane) -> Result<Vec<DbObject>> {
         let (schema, names) = (schema.to_string(), names.to_vec());
-        self.with_tab(connection_id, &self.lane_tab(connection_id, lane), |s| {
+        self.with_lane(connection_id, lane, |s| {
             let (schema, names) = (schema.clone(), names.clone());
             async move { s.list_objects_named(&schema, &names).await }
         })
