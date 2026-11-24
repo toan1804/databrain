@@ -17,7 +17,8 @@ test.describe("explorer", () => {
     await tree.filter({ hasText: /^orders/ }).click();
     await expect(tree.filter({ hasText: "customer_id" })).toBeVisible();
     await expect(tree.filter({ hasText: "amount" })).toBeVisible();
-    expect(await calls(page, "describe_object")).toContainEqual({ id: "conn-shop", schema: "public", name: "orders" });
+    // Not fresh: a description made a moment ago (by the tab opening it) is reused.
+    expect(await calls(page, "describe_object")).toContainEqual({ id: "conn-shop", schema: "public", name: "orders", fresh: false });
   });
 
   test("a schema's context menu opens its ER diagram", async ({ page }) => {
