@@ -22,4 +22,9 @@ statement_start: number, } | { "type": "job_finished", job_id: string, tab_id: s
 /**
  * The run's session has a transaction open afterwards.
  */
-in_transaction: boolean, } | { "type": "part_finished", job_id: string, tab_id: string, index: number, part: string, connection_name: string, output: OutputInfo, } | { "type": "outputs_changed", job_id: string, tab_id: string, };
+in_transaction: boolean, } | { "type": "part_finished", job_id: string, tab_id: string, index: number, part: string, connection_name: string, 
+/**
+ * What pushdown added to it (the output's SQL is what was sent);
+ * empty: it ran as written.
+ */
+pushed: Array<string>, output: OutputInfo, } | { "type": "outputs_changed", job_id: string, tab_id: string, };

@@ -156,6 +156,7 @@ async fn rows(st: &AppState, conn: &str, sql: &str) -> Vec<Vec<String>> {
                 params: Default::default(),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             },
             None,
         )
@@ -996,6 +997,7 @@ async fn step_names_own_their_output_names() {
                     params: Default::default(),
                     output_masks: None,
                     part_rows: None,
+                    pushdown: None,
                 },
                 None,
             )
@@ -1022,6 +1024,7 @@ async fn step_names_own_their_output_names() {
             params: Default::default(),
             output_masks: None,
             part_rows: None,
+            pushdown: None,
         };
         let err = st.engine.run(run("tab2")).unwrap_err().message;
         assert!(err.contains("only that step can produce it"), "{err}");
@@ -1470,6 +1473,7 @@ async fn step_still_held_by_a_try_left_behind_fails_clearly() {
                 params: Default::default(),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             };
             let _ = engine.run_and_wait(&hub, req, Some(stop)).await;
         });
@@ -2707,6 +2711,7 @@ async fn live_postgres_copy_columns_dry_run_and_stop() {
                             params: Default::default(),
                             output_masks: None,
                             part_rows: None,
+                            pushdown: None,
                         },
                         None,
                     )
@@ -2801,6 +2806,7 @@ async fn job_outputs_have_their_own_memory() {
                 params: Default::default(),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             };
             let out = st.engine.run_and_wait(&st.hub, req, None).await.unwrap();
             assert!(out.iter().all(|o| o.error.is_none()));

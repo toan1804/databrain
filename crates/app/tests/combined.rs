@@ -69,6 +69,7 @@ fn req(conn: &str, tab: &str, sql: &str) -> RunRequest {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     }
 }
 
@@ -325,4 +326,48 @@ async fn many_parts_and_a_transaction_opened_in_the_same_script() {
     let e = out[1].error.as_ref().expect("refused");
     assert!(e.message.contains("open transaction"), "{e:?}");
     s.run(req(&s.sales, "t12", "rollback")).await.unwrap();
+}
+
+/// Pushdown (phase 2): a filter of the outer query is also sent to the part's
+/// server, which then sends fewer rows; the answer is the same either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushdown_asks_for_less_and_changes_no_answer() {
+    let s = setup().await;
+    let q = "with o as (@\"Sales DB\" select * from orders) select id from o where total > 5 order by id";
+    let on = s.run(req(&s.sales, "p1", q)).await.unwrap();
+    assert_eq!(s.rows(&on[0]), vec!["1", "3"]);
+    let part = s
+        .events
+        .0
+        .lock()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            JobEvent::PartFinished { tab_id, pushed, output, .. } if tab_id == "p1" => Some((pushed.clone(), output.sql.clone(), output.rows)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(part.0.iter().any(|w| w == "\"total\" > 5"), "{:?}", part.0);
+    assert!(part.1.contains("databrain_part") && part.1.contains("WHERE \"total\" > 5"), "{}", part.1);
+    assert_eq!(part.2, 2, "the server sent only the rows that pass");
+    // The same rows with it off, the part as written.
+    let queries = [
+        q,
+        JOIN,
+        "with o as (@\"Sales DB\" select * from orders), c as (@crm select * from customers) select c.name, o.id from c left join o on o.customer_id = c.id where o.id is null order by 1",
+        "with o as (@\"Sales DB\" select * from orders), c as (@crm select * from customers) select c.name, o.total from o join c on c.id = o.customer_id and c.name in ('Ann', 'Cy') where o.total between 4 and 6 order by 2",
+        "with c as (@crm select * from customers) select name from c where name = 'Bo' or id = 30 order by 1",
+        "with o as (@\"Sales DB\" select * from orders) select id from o where id <> 2 limit 1",
+    ];
+    for q in queries {
+        let mut off = req(&s.sales, "p2", q);
+        off.pushdown = Some(false);
+        let a = s.rows(&s.run(req(&s.sales, "p1", q)).await.unwrap()[0]);
+        let b = s.rows(&s.run(off).await.unwrap()[0]);
+        assert_eq!(a, b, "{q}");
+    }
+    // The left join's IS NULL on the nullable side: Cy has no order.
+    let mut off = req(&s.sales, "p2", queries[2]);
+    off.pushdown = Some(false);
+    assert_eq!(s.rows(&s.run(off).await.unwrap()[0]), vec!["Cy|"]);
 }

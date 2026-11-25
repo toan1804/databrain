@@ -40,6 +40,7 @@ async fn run(st: &AppState, conn: &str, sql: &str) -> databrain_query_engine::St
                 params: Default::default(),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             },
             None,
         )

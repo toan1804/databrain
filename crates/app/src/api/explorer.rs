@@ -560,6 +560,7 @@ pub async fn explore_query(state: &AppState, connection_id: &str, key: &str, sql
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     let outcomes = state.engine.run_and_wait(&state.hub, req, None).await?;
     let [o] = outcomes.as_slice() else {

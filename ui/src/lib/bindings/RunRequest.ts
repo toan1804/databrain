@@ -41,4 +41,9 @@ params: { [key in string]?: ParamValue },
  * Rows a part of a combined query may have (0: no limit); `None`: the
  * setting ([`PART_ROWS_SETTING`]). "Run again without the limit" sends 0.
  */
-part_rows?: number | null, };
+part_rows?: number | null, 
+/**
+ * Push the outer query's columns, filters and limit into the parts;
+ * `None`: the setting ([`PUSHDOWN_SETTING`], on by default).
+ */
+pushdown?: boolean | null, };

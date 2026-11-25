@@ -82,6 +82,7 @@ async fn run(st: &AppState, conn: &str, sql: &str) {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     let out = st.engine.run_and_wait(&st.hub, r, None).await.unwrap();
     if let Some(e) = out.iter().find_map(|o| o.error.as_ref()) {

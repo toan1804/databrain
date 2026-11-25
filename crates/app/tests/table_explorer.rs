@@ -146,6 +146,7 @@ async fn explorer_reads_return_rows_and_refuse_writes() {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+    pushdown: None,
     };
     for o in st.engine.run_and_wait(&st.hub, setup, None).await.unwrap() {
         assert!(o.error.is_none(), "{:?}", o.error);

@@ -935,6 +935,7 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
             params: opts.params.clone(),
             output_masks: None,
             part_rows: None,
+            pushdown: None,
         };
         let mut res = with_rows(state.engine.run_and_wait(&state.hub, req(false), Some(cancel.clone())), rows_rx.as_mut(), |b| {
             if !printer.print(out, &b) {

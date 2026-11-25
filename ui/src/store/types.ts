@@ -112,7 +112,7 @@ export interface StatementRun {
   /** Another tab's result added to this one's (+ in the result tabs): read-only, in `kept`, while its own tab keeps it. */
   added?: boolean;
   /** A part of a combined query (its rows, read on `connection`): in `parts`, read-only. */
-  part?: { name: string; connection: string };
+  part?: { name: string; connection: string; pushed: string[] };
 }
 
 /** A result added to a tab from another tab (by its output), shown while that tab keeps it. */

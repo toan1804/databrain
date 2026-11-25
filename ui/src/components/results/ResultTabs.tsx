@@ -138,7 +138,15 @@ export function ResultTabs({
               aria-selected={isActive}
               tabIndex={isActive || (active === null && s === statements[0]) ? 0 : -1}
               onClick={() => select(s.plan.index)}
-              title={s.added && s.output ? `Added from ${s.output.connection_name} (read-only):\n${s.plan.sql}` : carried ? `Kept from an earlier run:\n${s.plan.sql}` : s.plan.sql}
+              title={
+                s.part
+                  ? `Part ${s.part.name}, read on ${s.part.connection}${s.part.pushed.length ? ` (also asked there: ${s.part.pushed.join("; ")})` : ""}. Sent:\n${s.plan.sql}`
+                  : s.added && s.output
+                    ? `Added from ${s.output.connection_name} (read-only):\n${s.plan.sql}`
+                    : carried
+                      ? `Kept from an earlier run:\n${s.plan.sql}`
+                      : s.plan.sql
+              }
               className={`flex h-7 max-w-[220px] shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] ${
                 isActive ? "bg-hover text-fg" : "text-muted hover:text-fg"
               }`}

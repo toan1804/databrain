@@ -82,6 +82,9 @@ pub enum JobEvent {
         index: usize,
         part: String,
         connection_name: String,
+        /// What pushdown added to it (the output's SQL is what was sent);
+        /// empty: it ran as written.
+        pushed: Vec<String>,
         output: Box<OutputInfo>,
     },
     /// Outputs were added, renamed, pinned or evicted (job/tab ids empty).

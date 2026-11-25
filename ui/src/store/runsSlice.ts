@@ -647,7 +647,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           break;
         }
         case "part_finished":
-          next.parts = [...(run.parts ?? []), { ...outputRun(e.output, keptIndex()), part: { name: e.part, connection: e.connection_name } }];
+          next.parts = [...(run.parts ?? []), { ...outputRun(e.output, keptIndex()), part: { name: e.part, connection: e.connection_name, pushed: e.pushed } }];
           break;
         case "job_finished":
           next = {
