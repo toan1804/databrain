@@ -7,6 +7,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Added
 
 - **An expired SQL Server password can be changed in DataBrain:** the change-password dialog (which opens by itself when the server refuses an expired password, error 18487, or one that must be changed, 18488) now sets the new one as DataBrain signs in, the only way SQL Server takes it. SQL Server logins only: a Windows or Entra ID password is changed with their own tools. Through a small addition to the tiberius driver (`vendor/tiberius`).
+- **An expired Oracle password can be changed with the thin driver too:** the change-password dialog (which opens by itself on ORA-28001) now sets the new password as DataBrain signs in with the default thin driver, not only with Instant Client. Through a small addition to the go-ora driver in the Oracle helper (`crates/connectors/oracle/agent/go-ora`); the helper is downloaded again (0.1.10).
 
 ## 0.5.3 - 2026-11-25
 

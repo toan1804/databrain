@@ -670,6 +670,57 @@ mod tests {
         Some(open(&cfg, creds).await.unwrap())
     }
 
+    /// Live, thin driver: an expired password (ORA-28001) is refused as
+    /// expired, and gets a new one as the user signs in (AUTH_NEWPASSWORD):
+    /// with the current password only; then the new one signs in and the
+    /// old one doesn't.
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST and DATABRAIN_ORACLE_AGENT (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_thin_change_expired_password() {
+        change_expired_password("thin").await;
+    }
+
+    /// Live, Instant Client driver: the same (DATABRAIN_ORACLE_LIB_DIR).
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST and DATABRAIN_ORACLE_LIB_DIR (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_instant_client_change_expired_password() {
+        let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") else {
+            panic!("live test: DATABRAIN_ORACLE_LIB_DIR not set (run with --ignored)");
+        };
+        init_client(Some(&d)).unwrap();
+        change_expired_password("instant_client").await;
+    }
+
+    async fn change_expired_password(driver: &str) {
+        use crate::OracleConnector;
+        use databrain_auth::InlineCredentialSource;
+        use databrain_connector_core::Connector;
+        let admin = live_session("thin", false).await.expect("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
+        let _ = admin.execute(databrain_connector_core::Statement::internal("drop user db_exp cascade"), ExecOptions::default()).await;
+        run(&admin, "create user db_exp identified by \"Old_pw_1\"").await;
+        run(&admin, "grant create session to db_exp").await;
+        run(&admin, "alter user db_exp password expire").await;
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: "db_exp".into() });
+        cfg.host = std::env::var("DATABRAIN_ORACLE_HOST").ok();
+        cfg.port = std::env::var("DATABRAIN_ORACLE_PORT").ok().and_then(|p| p.parse().ok());
+        cfg.options.insert("service_name".into(), std::env::var("DATABRAIN_ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".into()));
+        cfg.options.insert("driver".into(), driver.into());
+        let creds = |pw: &str| -> Arc<dyn databrain_auth::CredentialSource> {
+            Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "db_exp".into() }, Some(secrecy::SecretString::from(pw.to_string()))))
+        };
+        let Err(e) = open(&cfg, creds("Old_pw_1")).await else { panic!("an expired password signed in") };
+        assert!(e.is_password_expired(), "{e:?}");
+        let refused = |e: databrain_connector_core::ConnectorError| e.code.as_deref() == Some("ORA-01017");
+        let Err(e) = OracleConnector.connect_changing_password(&cfg, creds("Wrong_pw_9"), "New'pw_2").await else { panic!("a wrong password changed it") };
+        assert!(refused(e.clone()), "the current password is checked: {e:?}");
+        OracleConnector.connect_changing_password(&cfg, creds("Old_pw_1"), "New'pw_2").await.unwrap();
+        let s = open(&cfg, creds("New'pw_2")).await.expect("the new password signs in");
+        drop(s);
+        let Err(e) = open(&cfg, creds("Old_pw_1")).await else { panic!("the old password still signs in") };
+        assert!(refused(e.clone()), "the old one no longer does: {e:?}");
+        run(&admin, "drop user db_exp cascade").await;
+    }
+
     /// Live, thin driver (needs a built helper: `node scripts/build-oracle-agent.mjs --host`).
     #[ignore = "live: needs DATABRAIN_ORACLE_HOST (cargo test -- --ignored)"]
     #[tokio::test]
