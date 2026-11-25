@@ -138,6 +138,11 @@ fn sql_text(s: &mut Suite) {
     s.add("combined_not", "a statement that isn't a combined query is told apart", 1, None, || {
         sql::parse_combined(std::hint::black_box(QUERY), &mut |_| Ok(Postgres))
     });
+    // The slower "not combined": a WITH list with `@` in it (Postgres `@>`).
+    let at = format!("with a as (select * from t where tags @> '{{x}}'), b as ({QUERY}) select * from a join b using (id)");
+    s.add("combined_not_with_at", "a WITH query with `@` in it that isn't combined", 1, None, move || {
+        sql::parse_combined(std::hint::black_box(&at), &mut |_| Ok(Postgres))
+    });
     let combined = format!(
         "with orders as (@\"Sales PG\" {QUERY}), customers as (@crm select id, name, country from customers where name <> ')'), \
          x as (select 1) select c.country, count(*) from orders o join customers c on c.id = o.id group by 1"

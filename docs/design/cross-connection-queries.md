@@ -58,9 +58,9 @@ connection := identifier | "quoted name"         -- a saved connection's name (a
   quoted with `"`.
 - **The part's SQL** runs from after the connection to the CTE's closing
   parenthesis, and is one statement in that connection's own dialect. The
-  closing parenthesis is found with that connection's lexer (`split_with` and
-  its `SourceTraits` already know each dialect's strings, comments and dollar
-  quotes), so a `)` in a string or a MongoDB / Cypher body doesn't end it.
+  closing parenthesis is found with that connection's lexer (`skip_token`, the
+  splitter's: each dialect's strings, comments and dollar quotes), read from
+  after the connection's name, so a `)` in a string or comment doesn't end it.
 - **Column lists** on a part (`orders(id, cust)`) rename the part's columns,
   as in a CTE.
 - **Parameters** (`:name`) are one set for the whole statement: the same value
@@ -360,7 +360,7 @@ The planner pushes nothing into a part (it runs as written, as in phase 1) when:
 
 | Area | Change |
 |---|---|
-| `connector-core/src/sql/combined.rs` (new) | `parse_combined`, the rewrite of the outer query; unit tests per dialect (strings, comments, nested parentheses, dollar quotes, MongoDB and Cypher bodies) |
+| `connector-core/src/sql/combined.rs` (new) | `parse_combined`, the rewrite of the outer query; unit tests per dialect (strings, comments, nested parentheses, dollar quotes; MongoDB and Cypher parts refused) |
 | `query-engine/src/combined/` (new: `plan.rs`, `run.rs`) | `plan_combined` and `CombinedPlan` (§3); check, run parts, run the outer query; cancellation; the reuse of §5. Phase 2: the planner of §7 in `plan.rs` |
 | `query-engine` events | Per-part progress and results (`JobEvent` gains the part's name) |
 | `workspace` `SessionRole` | `Part { tab, name }` |

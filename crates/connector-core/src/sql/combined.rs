@@ -113,8 +113,11 @@ pub fn parse_combined(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Res
     let mut i = trivia(text, 0, syn);
     let Some((_, after_with)) = word(text, i).filter(|(w, _)| w.eq_ignore_ascii_case("with")) else { return Ok(None) };
     i = trivia(text, after_with, syn);
+    // RECURSIVE, unless it is the first CTE's name (`with recursive as (…)`).
     if let Some((w, e)) = word(text, i)
         && w.eq_ignore_ascii_case("recursive")
+        && !word(text, trivia(text, e, syn)).is_some_and(|(n, _)| n.eq_ignore_ascii_case("as"))
+        && !text[trivia(text, e, syn)..].starts_with('(')
     {
         i = trivia(text, e, syn);
     }
@@ -124,6 +127,18 @@ pub fn parse_combined(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Res
         i = trivia(text, e, syn);
         if text[i..].starts_with('(') {
             let Some(close) = close_paren(text, i, syn) else { return fail(&parts, format!("The column list of `{name}` isn't closed"), i) };
+            i = trivia(text, close + 1, syn);
+        }
+        // DuckDB: `name USING KEY (columns) AS (…)`.
+        if let Some((w, e)) = word(text, i)
+            && w.eq_ignore_ascii_case("using")
+            && let Some((k, e)) = word(text, trivia(text, e, syn))
+            && k.eq_ignore_ascii_case("key")
+        {
+            i = trivia(text, e, syn);
+            let Some(close) = text[i..].starts_with('(').then(|| close_paren(text, i, syn)).flatten() else {
+                return fail(&parts, format!("Expected the key columns of `{name}` in parentheses"), i);
+            };
             i = trivia(text, close + 1, syn);
         }
         let Some((_, e)) = word(text, i).filter(|(w, _)| w.eq_ignore_ascii_case("as")) else {
@@ -162,7 +177,7 @@ pub fn parse_combined(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Res
     if parts.is_empty() {
         return Ok(None);
     }
-    if text[i..].trim().is_empty() {
+    if text[i..].trim_matches(|c: char| c.is_whitespace() || c == ';').is_empty() {
         return Err(CombinedError { message: "The query that reads the parts is missing after the WITH list".into(), position: i });
     }
     Ok(Some(Combined { parts }))
@@ -184,7 +199,9 @@ fn part(
     if traits.language != QueryLanguage::Sql {
         return Err(err(format!("Part `{name}`: {} connections can't be parts yet, only SQL ones", traits.name), at));
     }
-    let close = close_paren(text, open, &traits.syntax).ok_or_else(|| err(format!("Part `{name}`: its closing parenthesis is missing"), open))?;
+    // From after the name (DuckDB text, read already): the part's own lexer
+    // reads only the part's SQL.
+    let close = close_paren_from(text, ref_end, 1, &traits.syntax).ok_or_else(|| err(format!("Part `{name}`: its closing parenthesis is missing"), open))?;
     let raw = &text[ref_end..close];
     let lead = raw.len() - raw.trim_start().len();
     let sql = raw.trim();
@@ -202,11 +219,14 @@ fn connection_ref(text: &str, i: usize) -> Option<(ConnectionRef, usize)> {
         let (name, end) = quoted(text, i)?;
         return (!name.trim().is_empty()).then_some((ConnectionRef::Name(name), end));
     }
-    let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ';' | ',' | '"')).unwrap_or(rest.len());
-    let token = &rest[..len];
-    if let Some(id) = token.strip_prefix("id:") {
-        return (!id.is_empty()).then(|| (ConnectionRef::Id(id.to_string()), i + len));
+    // An id: `id:` (any case) and what ids are made of.
+    if rest.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("id:")) {
+        let len = rest[3..].find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-'))).unwrap_or(rest.len() - 3);
+        return (len > 0).then(|| (ConnectionRef::Id(rest[3..3 + len].to_string()), i + 3 + len));
     }
+    // A name: letters, digits and `_ - . $` (others: quote it).
+    let len = rest.find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '$'))).unwrap_or(rest.len());
+    let token = &rest[..len];
     (!token.is_empty()).then(|| (ConnectionRef::Name(token.to_string()), i + len))
 }
 
@@ -265,9 +285,12 @@ fn trivia(text: &str, mut i: usize, syn: &SqlSyntax) -> usize {
 /// The `)` matching the `(` at `open`, skipping strings, quoted names and
 /// comments as `syn` reads them.
 fn close_paren(text: &str, open: usize, syn: &SqlSyntax) -> Option<usize> {
+    close_paren_from(text, open, 0, syn)
+}
+
+/// [`close_paren`] from `i`, `depth` parentheses already open.
+fn close_paren_from(text: &str, mut i: usize, mut depth: usize, syn: &SqlSyntax) -> Option<usize> {
     let b = text.as_bytes();
-    let mut depth = 0usize;
-    let mut i = open;
     while i < b.len() {
         if let Some((end, _)) = skip_token(text, i, syn) {
             i = end;
@@ -334,8 +357,9 @@ mod tests {
 
     #[test]
     fn a_closing_parenthesis_in_a_parts_own_strings_and_comments() {
-        // Each dialect's own quoting: Postgres dollar quotes and E'', MySQL
-        // backticks and #, SQL Server brackets, Oracle q'[…]'.
+        // Each dialect's own quoting: MySQL backticks, `\'` and #, SQL
+        // Server brackets, Oracle q'[…]' (which DuckDB reads otherwise), and
+        // Postgres' own (as DuckDB's).
         let cases = [
             ("pg", "select $$ ) $$, E'\\') ', \"a)\" from t -- )\n"),
             ("my", "select `a)`, 'it\\'s )' from t # )\n"),
@@ -381,7 +405,11 @@ mod tests {
             "with a as (select '@pg' as x) select * from a",
             "select * from t where x = '@pg'",
             "with a as (select 1) select @pg",
-            // A word, not a WITH list: SQL Server's variables, Snowflake stages.
+            "WITH a AS (SELECT 1) SELECT @@ROWCOUNT",
+            // `@` inside a CTE, not first: operators, variables, stages.
+            "with a as (select * from t where tags @> '{x}') select * from a",
+            "with a as (select @x := 1) select * from a",
+            "with a as (select $1 from @stage) select * from a",
             "declare @x int; with a as (select @x as y) select * from a",
             "with",
             "",
@@ -406,6 +434,26 @@ mod tests {
         assert_eq!(err("with a as (@pg select 1)").message, "The query that reads the parts is missing after the WITH list");
         assert_eq!(err("with a as (@pg select 1), b as select 2 select 1").message, "Expected ( after `b AS`");
         assert_eq!(err("with a as (@id:zz select 1) select 1").message, "Part `a`: no connection with id zz");
+    }
+
+    /// What DuckDB allows around a CTE, and connection names that would
+    /// mean something in the part's dialect.
+    #[test]
+    fn duckdb_ctes_and_names_read_as_duckdb() {
+        assert_eq!(parts("with recursive as (@pg select 1) select * from recursive")[0].name, "recursive");
+        assert_eq!(parts("with recursive r as (@pg select 1) select * from r")[0].name, "r");
+        let p = parts("with a as (@pg select 1), b using key (x) as (select 1 as x) select 1");
+        assert_eq!(p.len(), 1);
+        assert_eq!(parts("with a as (@ID:c-42 select 1) select 1")[0].connection, ConnectionRef::Id("c-42".into()));
+        // `#` is MySQL's comment, `'` a string start: the name ends before
+        // them, and the part's own lexer reads them.
+        assert_eq!(parts("with a as (@my#1\n select 1) select * from a")[0].sql, "#1\n select 1");
+        assert_eq!(parse("with a as (@pg's select 1) select * from a").unwrap_err().message, "Part `a`: its closing parenthesis is missing");
+        // A quoted name with a backslash, before a part MySQL reads.
+        let q = r#"with a as (@"C:" select 'x)') select * from a"#;
+        let r = parse_combined(q, &mut |_| Ok(ConnectorKind::Mysql)).unwrap().unwrap();
+        assert_eq!(r.parts[0].sql, "select 'x)'");
+        assert_eq!(parse("with a as (@pg select 1);").unwrap_err().message, "The query that reads the parts is missing after the WITH list");
     }
 
     #[test]
