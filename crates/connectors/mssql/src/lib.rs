@@ -27,6 +27,7 @@ use databrain_auth::OAuthConfig;
 use databrain_connector_core::Capabilities;
 use databrain_connector_core::ConnectionConfig;
 use databrain_connector_core::Connector;
+use databrain_connector_core::ConnectorError;
 use databrain_connector_core::ConnectorInfo;
 use databrain_connector_core::ConnectorKind;
 use databrain_connector_core::FieldSpec;
@@ -114,54 +115,12 @@ impl Connector for MssqlConnector {
     }
 
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
-        let mut c = Config::new();
-        c.host(cfg.host_or_default());
-        if let Some(p) = cfg.port {
-            c.port(p);
-        }
-        if let Some(db) = cfg.database.as_deref().filter(|d| !d.is_empty()) {
-            c.database(db);
-        }
-        if let Some(i) = cfg.opt("instance") {
-            c.instance_name(i);
-        }
-        c.application_name("DataBrain");
-        let trust = cfg.opt("trust_cert").is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
-        match cfg.ssl_mode {
-            SslMode::Disable => c.encryption(EncryptionLevel::NotSupported),
-            SslMode::Prefer => {
-                c.encryption(EncryptionLevel::On);
-                c.trust_cert();
-            }
-            SslMode::Require => {
-                c.encryption(EncryptionLevel::Required);
-                c.trust_cert();
-            }
-            SslMode::VerifyFull => {
-                c.encryption(EncryptionLevel::Required);
-                if trust {
-                    c.trust_cert();
-                }
-            }
-        }
-        if trust {
-            c.trust_cert();
-        }
-        let use_browser = cfg.opt("instance").is_some() && cfg.port.is_none();
+        let (c, use_browser) = tds_config(cfg);
         let all_dbs = cfg.database.as_deref().is_none_or(|d| d.trim().is_empty());
         // The login is asked for at each connection (reconnects too): a kept
         // Entra token would expire after about an hour.
         let mut opener = Opener { config: c, use_browser, creds };
-        let conn = match opener.open().await {
-            Ok(conn) => conn,
-            // A server that can't encrypt: Prefer means a plain connection
-            // (as encrypt=false in other drivers); reconnects keep it.
-            Err(e) if error::prefer_falls_back(cfg.ssl_mode, &e) => {
-                opener.config.encryption(EncryptionLevel::NotSupported);
-                opener.open().await?
-            }
-            Err(e) => return Err(e),
-        };
+        let conn = open_or_plain(&mut opener, cfg.ssl_mode).await?;
         Ok(Box::new(MssqlSession {
             opener: Arc::new(opener),
             conn: Arc::new(Mutex::new(Some(conn))),
@@ -170,5 +129,93 @@ impl Connector for MssqlConnector {
             all_dbs,
             db_cache: Default::default(),
         }))
+    }
+
+    /// SQL Server takes a new password for an expired one (18487) or one
+    /// that must be changed (18488) only as part of the sign-in: LOGIN7's
+    /// ChangePassword (vendor/tiberius/DATABRAIN.md). SQL Server logins only:
+    /// a Windows or Entra ID password is changed with their own tools. It
+    /// signs in to the login's default database: a connection's database
+    /// it can't open would fail the sign-in after the server had changed
+    /// the password, which then wouldn't be saved. It is never sent without
+    /// encryption unless the connection's SSL mode is Disable: under Prefer
+    /// a server that can't encrypt is refused (the new password is the one
+    /// kept, and the login's obfuscation is trivially reversed).
+    async fn connect_changing_password(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>, new: &str) -> Result<()> {
+        match creds.get().await? {
+            databrain_auth::Credential::Password { user, .. } if !user.contains('\\') => {}
+            databrain_auth::Credential::Password { .. } => {
+                return Err(ConnectorError::unsupported("A Windows login's password is changed in Windows (or by an administrator), not from DataBrain"));
+            }
+            _ => return Err(ConnectorError::unsupported("Only a SQL Server login's password can be changed from DataBrain")),
+        }
+        let mut cfg = cfg.clone();
+        cfg.database = None;
+        let (mut c, use_browser) = tds_config(&cfg);
+        c.new_password(new);
+        let opener = Opener { config: c, use_browser, creds };
+        match opener.open().await {
+            Ok(conn) => {
+                drop(conn);
+                Ok(())
+            }
+            Err(e) if error::prefer_falls_back(cfg.ssl_mode, &e) => Err(ConnectorError::connection(
+                "The server can't encrypt the connection, so the new password isn't sent: set the connection's SSL mode to Disable to send it anyway",
+            )),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The server settings for a connection (everything but the login), and
+/// whether SQL Browser finds the port (a named instance without one).
+fn tds_config(cfg: &ConnectionConfig) -> (Config, bool) {
+    let mut c = Config::new();
+    c.host(cfg.host_or_default());
+    if let Some(p) = cfg.port {
+        c.port(p);
+    }
+    if let Some(db) = cfg.database.as_deref().filter(|d| !d.is_empty()) {
+        c.database(db);
+    }
+    if let Some(i) = cfg.opt("instance") {
+        c.instance_name(i);
+    }
+    c.application_name("DataBrain");
+    let trust = cfg.opt("trust_cert").is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+    match cfg.ssl_mode {
+        SslMode::Disable => c.encryption(EncryptionLevel::NotSupported),
+        SslMode::Prefer => {
+            c.encryption(EncryptionLevel::On);
+            c.trust_cert();
+        }
+        SslMode::Require => {
+            c.encryption(EncryptionLevel::Required);
+            c.trust_cert();
+        }
+        SslMode::VerifyFull => {
+            c.encryption(EncryptionLevel::Required);
+            if trust {
+                c.trust_cert();
+            }
+        }
+    }
+    if trust {
+        c.trust_cert();
+    }
+    let use_browser = cfg.opt("instance").is_some() && cfg.port.is_none();
+    (c, use_browser)
+}
+
+/// A connection; a server that can't encrypt gets a plain one under
+/// Prefer (as encrypt=false in other drivers), which reconnects keep.
+async fn open_or_plain(opener: &mut Opener, ssl: SslMode) -> Result<config::Conn> {
+    match opener.open().await {
+        Ok(conn) => Ok(conn),
+        Err(e) if error::prefer_falls_back(ssl, &e) => {
+            opener.config.encryption(EncryptionLevel::NotSupported);
+            opener.open().await
+        }
+        Err(e) => Err(e),
     }
 }
