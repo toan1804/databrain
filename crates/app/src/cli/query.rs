@@ -324,83 +324,10 @@ pub fn row_limit(format: Format, limit: Option<usize>) -> Result<Option<usize>, 
     }
 }
 
-/// The saved connection `name` names: its name in any case (spaces around
-/// it ignored) or its id, nothing else. A part of a name or a typo picks
-/// none, so a command never runs on a connection that wasn't meant: the
-/// error offers the names close to it (`dbr --connections` lists them all).
+/// The saved connection `name` names ([`databrain_workspace::find_connection`]),
+/// the error pointing to `dbr --connections`.
 pub fn find_connection<'a>(all: &'a [ConnectionProfile], name: &str) -> Result<&'a ConnectionProfile, String> {
-    let typed = name.trim();
-    let low = typed.to_lowercase();
-    // The id first (what can't be two), then the name as spelled, then in any case.
-    if let Some(c) = all.iter().find(|c| c.id == typed) {
-        return Ok(c);
-    }
-    for same in
-        [all.iter().filter(|c| c.name.trim() == typed).collect::<Vec<_>>(), all.iter().filter(|c| c.name.trim().to_lowercase() == low).collect::<Vec<_>>()]
-    {
-        match same.as_slice() {
-            [] => {}
-            [one] => return Ok(one),
-            many => {
-                return Err(format!(
-                    "several connections are named {name:?}: give one's id ({})",
-                    many.iter().map(|c| format!("{:?} is {}", c.name, c.id)).collect::<Vec<_>>().join(", ")
-                ));
-            }
-        }
-    }
-    if all.is_empty() {
-        return Err(format!("no connection named {name:?}: none is saved (add one in DataBrain)"));
-    }
-    let close = close_names(all.iter().map(|c| c.name.as_str()), &low);
-    let hint = match close.as_slice() {
-        [] => String::new(),
-        [one] => format!("; did you mean {one:?}?"),
-        many => format!("; did you mean one of {}?", many.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(", ")),
-    };
-    Err(format!("no connection named {name:?}{hint} (dbr --connections lists them)"))
-}
-
-/// Up to 5 of `names` close to `typed` (lower case): holding it or held in
-/// it, or a few letters off; the closest first.
-fn close_names<'a>(names: impl Iterator<Item = &'a str>, typed: &str) -> Vec<&'a str> {
-    let mut scored: Vec<(usize, &str)> = names
-        .filter_map(|n| {
-            let low = n.trim().to_lowercase();
-            let d = edit_distance(&low, typed);
-            // Held in what was typed only when not a letter or two (`a` is in most words).
-            let part = !typed.is_empty() && (low.contains(typed) || (low.chars().count() >= 3 && typed.contains(&low)));
-            (part || d <= (typed.chars().count() / 3).max(1)).then_some((if part { 0 } else { d }, n))
-        })
-        .collect();
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-    scored.into_iter().take(5).map(|(_, n)| n).collect()
-}
-
-/// Letters to add, remove, change or swap with the next to turn `a` into
-/// `b` (Damerau-Levenshtein, optimal string alignment: `saels` is one from
-/// `sales`).
-fn edit_distance(a: &str, b: &str) -> usize {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    // d[i][j]: the distance between a[..i] and b[..j].
-    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in d.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, v) in d[0].iter_mut().enumerate() {
-        *v = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                v = v.min(d[i - 2][j - 2] + 1);
-            }
-            d[i][j] = v;
-        }
-    }
-    d[a.len()][b.len()]
+    databrain_workspace::find_connection(all, name, " (dbr --connections lists them)")
 }
 
 /// Columns `s` takes on screen (East Asian wide characters take two).
@@ -837,6 +764,25 @@ pub struct Io<'a> {
     pub cancel: databrain_connector_core::CancellationToken,
 }
 
+/// Whether a statement of `sql` is a combined query (or meant as one: a
+/// part naming a connection that isn't there is too).
+fn has_combined(sql: &str, all: &[ConnectionProfile]) -> bool {
+    use databrain_connector_core::sql::{ConnectionRef, looks_combined, parse_combined, split_statements};
+    split_statements(sql, databrain_connector_core::ConnectorKind::Duckdb).iter().any(|s| {
+        looks_combined(&s.sql)
+            && !matches!(
+                parse_combined(&s.sql, &mut |r| {
+                    let c = match r {
+                        ConnectionRef::Id(id) => all.iter().find(|c| c.id == *id).ok_or_else(String::new)?,
+                        ConnectionRef::Name(n) => databrain_workspace::find_connection(all, n, "")?,
+                    };
+                    Ok(c.config.kind)
+                }),
+                Ok(None)
+            )
+    })
+}
+
 /// Exit codes.
 const DONE: u8 = 0;
 const FAILED: u8 = 1;
@@ -920,6 +866,12 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
                 }
             },
         };
+        // A combined query names its connections itself (`@name`): `-c` would
+        // say one where it runs no SQL.
+        if named.is_some() && !job.local && has_combined(&job.sql, &all) {
+            say!("dbr: {}: a query with parts on other connections (@connection) names its connections itself: leave out -c", job.label);
+            return BAD_ARGS;
+        }
         // A `:name` with no value is a bad command line, found before anything runs.
         let missing: Vec<String> = databrain_connector_core::sql::find_parameters(&job.sql, conn.config.kind)
             .into_iter()
@@ -982,6 +934,7 @@ pub async fn run_with(state: &AppState, opts: Opts, io: Io<'_>, terminal: Termin
             output_name: None,
             params: opts.params.clone(),
             output_masks: None,
+            part_rows: None,
         };
         let mut res = with_rows(state.engine.run_and_wait(&state.hub, req(false), Some(cancel.clone())), rows_rx.as_mut(), |b| {
             if !printer.print(out, &b) {
@@ -1535,9 +1488,6 @@ mod tests {
         assert!(e.contains("\"Archive PG\", \"Sales PG\""), "{e}");
         assert_eq!(find_connection(&all, "crm").unwrap_err(), "no connection named \"crm\" (dbr --connections lists them)");
         assert!(find_connection(&[], "x").unwrap_err().contains("none is saved"));
-        assert_eq!(edit_distance("kitten", "sitting"), 3);
-        assert_eq!(edit_distance("", "ab"), 2);
-        assert_eq!(edit_distance("saels", "sales"), 1);
         // The same name in two spellings: the exact one wins, any other is
         // refused with their ids (never one picked by the list's order).
         let mut two = vec![p("Prod"), p("prod"), p("Prod2")];

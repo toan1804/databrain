@@ -36,4 +36,9 @@ output_name?: string | null,
 /**
  * Values of `:name` parameters in `sql` (editor parameter boxes).
  */
-params: { [key in string]?: ParamValue }, };
+params: { [key in string]?: ParamValue }, 
+/**
+ * Rows a part of a combined query may have (0: no limit); `None`: the
+ * setting ([`PART_ROWS_SETTING`]). "Run again without the limit" sends 0.
+ */
+part_rows?: number | null, };

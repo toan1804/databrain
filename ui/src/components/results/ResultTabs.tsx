@@ -14,7 +14,7 @@ function statusLabel(s: StatementRun) {
 }
 
 /** A result kept from an earlier run (its `plan.index` is negative). */
-export const isCarried = (s: StatementRun) => s.plan.index < 0;
+export const isCarried = (s: StatementRun) => s.plan.index < 0 && !s.part;
 
 /**
  * The run's results as tabs: a strip that scrolls sideways (wheel, the
@@ -40,7 +40,7 @@ export function ResultTabs({
   const goal = useRef<number | null>(null);
   const [edges, setEdges] = useState({ left: false, right: false });
   const [list, setList] = useState<{ x: number; y: number; height: number } | null>(null);
-  const many = statements.filter((s) => !isCarried(s)).length > 1;
+  const many = statements.filter((s) => !isCarried(s) && !s.part).length > 1;
 
   const measure = () => {
     const el = strip.current;
@@ -150,7 +150,15 @@ export function ResultTabs({
               ) : (
                 <StatusIcon s={s} />
               )}
-              <span className="truncate">{s.added && s.output ? s.output.connection_name : carried ? sqlPreview(s.plan.sql, 28) : `${many ? `${s.plan.index + 1}. ` : ""}${statusLabel(s)}`}</span>
+              <span className="truncate">
+                {s.part
+                  ? `${s.part.name} · ${s.part.connection}`
+                  : s.added && s.output
+                    ? s.output.connection_name
+                    : carried
+                      ? sqlPreview(s.plan.sql, 28)
+                      : `${many ? `${s.plan.index + 1}. ` : ""}${statusLabel(s)}`}
+              </span>
               {s.result && <span className="text-[11px] text-muted">{formatCount(s.result.total_rows)}</span>}
               {s.output && <span className="font-mono text-[10.5px] text-muted">{outputLabel(s.output)}</span>}
             </button>

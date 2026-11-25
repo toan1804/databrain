@@ -127,6 +127,7 @@ async fn end_to_end_sqlite() {
             output_name: None,
             params: Default::default(),
             output_masks: None,
+            part_rows: None,
         },
     )
     .unwrap();
@@ -201,6 +202,7 @@ async fn end_to_end_sqlite() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     let RunResponse::Started { job_id, .. } = run_query(&st, again("select count(*) from people")).unwrap() else { panic!() };
     let latest = finished_results(&sink, &job_id).await[0].id.clone();
@@ -1777,6 +1779,7 @@ async fn run_query_on_duckdb_checks_output_sources() {
                     output_name: Some(name.into()),
                     params: Default::default(),
                     output_masks: None,
+                    part_rows: None,
                 },
                 None,
             )
@@ -2077,6 +2080,7 @@ async fn a_conversation_left_during_a_turn_lets_late_outputs_go() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     let active = || st.engine.outputs().list().into_iter().filter(|o| o.tab_id == key && o.active).count();
     st.engine.run_and_wait(&st.hub, run("select 1"), None).await.unwrap();
@@ -2323,6 +2327,7 @@ async fn live_password_change_updates_the_other_connections() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     let _ = st.engine.run_and_wait(&st.hub, run("drop role if exists kb_pw2"), None).await;
     let out = st.engine.run_and_wait(&st.hub, run("create role kb_pw2 login password 'Old_pw_1'"), None).await.unwrap();

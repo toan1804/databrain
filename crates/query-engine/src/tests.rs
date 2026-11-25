@@ -65,6 +65,7 @@ fn req(f: &Fixture, sql: &str) -> RunRequest {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     }
 }
 
@@ -424,7 +425,13 @@ fn prod_confirmation_covers_admin_statements() {
         let plan: Vec<PlannedStatement> = databrain_connector_core::sql::split_statements(sql, kind)
             .into_iter()
             .enumerate()
-            .map(|(index, s)| PlannedStatement { index, checked: databrain_connector_core::Checked::new(s.sql, kind), start: s.start, end: s.end })
+            .map(|(index, s)| PlannedStatement {
+                index,
+                checked: databrain_connector_core::Checked::new(s.sql, kind),
+                start: s.start,
+                end: s.end,
+                combined: false,
+            })
             .collect();
         !QueryEngine::safety_reasons(&p, &plan).is_empty()
     };
@@ -635,7 +642,7 @@ async fn unfinished_statement_results_are_removed_from_the_store() {
             }
         });
         let (engine, r, stmt) = (f.engine.clone(), r.clone(), stmt.clone());
-        async move { engine.collect_stream(job, &r, &stmt, None, CancellationToken::new(), stream, Instant::now(), None).await }
+        async move { engine.collect_stream(job, &r, &stmt, None, CancellationToken::new(), stream, Instant::now(), None, None).await }
     };
 
     let ok = run("done", Some(Ok(StreamEvent::Done(ExecSummary::default())))).await.unwrap();
@@ -654,7 +661,8 @@ async fn unfinished_statement_results_are_removed_from_the_store() {
     tx.send(StreamEvent::Schema(schema.clone())).await;
     let engine = f.engine.clone();
     let (r2, s2) = (r.clone(), stmt.clone());
-    let reading = tokio::spawn(async move { engine.collect_stream("dropped", &r2, &s2, None, CancellationToken::new(), stream, Instant::now(), None).await });
+    let reading =
+        tokio::spawn(async move { engine.collect_stream("dropped", &r2, &s2, None, CancellationToken::new(), stream, Instant::now(), None, None).await });
     for _ in 0..100 {
         if f.engine.results().contains("dropped:0") {
             break;
@@ -1655,6 +1663,7 @@ async fn a_table_is_described_once_for_callers_together() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     let hub = crate::EventHub::new(Arc::new(CollectingSink::default()));
     assert!(engine.run_and_wait(&hub, r("select 1"), None).await.unwrap().iter().all(|o| o.error.is_none()));

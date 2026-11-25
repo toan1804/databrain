@@ -95,6 +95,7 @@ async fn query_view(st: &AppState, conn: &str, sql: &str, view: ViewSpec) -> (St
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )
@@ -218,6 +219,7 @@ async fn sqlite_explorer_and_queries() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     });
     assert!(blocked.is_err(), "write on a read-only connection must be rejected");
 }
@@ -429,6 +431,7 @@ async fn run_named(
                 output_name: name.map(str::to_string),
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )
@@ -702,6 +705,7 @@ async fn compare_reads_time_zone_values_in_utc() {
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )

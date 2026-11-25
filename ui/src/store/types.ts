@@ -111,6 +111,8 @@ export interface StatementRun {
   serverMs?: number;
   /** Another tab's result added to this one's (+ in the result tabs): read-only, in `kept`, while its own tab keeps it. */
   added?: boolean;
+  /** A part of a combined query (its rows, read on `connection`): in `parts`, read-only. */
+  part?: { name: string; connection: string };
 }
 
 /** A result added to a tab from another tab (by its output), shown while that tab keeps it. */
@@ -129,6 +131,8 @@ export interface TabRun {
    * before this run's. Their `plan.index` is negative, so it never clashes
    * with a statement of this run. */
   kept?: StatementRun[];
+  /** The parts of the run's combined queries, after its statements (negative `plan.index`). */
+  parts?: StatementRun[];
   /** `plan.index` of the result shown in the grid (negative: a kept one). */
   activeIndex: number | null;
   errorRange?: { from: number; to: number };

@@ -29,7 +29,7 @@ export function ResultsPanel({ tabId, connectionId, title, compact, noEditor = f
   const [showMessages, setShowMessages] = useState(false);
   const [picker, setPicker] = useState<{ x: number; y: number } | null>(null);
   // Outputs already in this tab (its own and added ones): not offered again.
-  const shown = useMemo(() => new Set([...(run?.statements ?? []), ...(run?.kept ?? [])].flatMap((s) => (s.output ? [s.output.handle] : []))), [run]);
+  const shown = useMemo(() => new Set([...(run?.statements ?? []), ...(run?.kept ?? []), ...(run?.parts ?? [])].flatMap((s) => (s.output ? [s.output.handle] : []))), [run]);
   const openPicker = (e: MouseEvent<HTMLElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     setPicker({ x: r.left, y: r.bottom + 4 });
@@ -70,7 +70,8 @@ export function ResultsPanel({ tabId, connectionId, title, compact, noEditor = f
     );
   }
 
-  const withOutput = [...(run.kept ?? []), ...run.statements.filter((s) => s.result || s.error || s.status === "running")];
+  // A combined query's parts follow the run's own results.
+  const withOutput = [...(run.kept ?? []), ...run.statements.filter((s) => s.result || s.error || s.status === "running"), ...(run.parts ?? [])];
   const active = shownStatement(run);
 
   return (
@@ -115,10 +116,10 @@ export function ResultsPanel({ tabId, connectionId, title, compact, noEditor = f
             stmt={active}
             info={active.result}
             tabId={tabId}
-            // An added result is another connection's maybe: its own.
-            connectionId={active.added && active.output ? active.output.connection_id : connectionId}
-            title={active.added && active.output ? (active.output.name ?? active.output.handle) : title}
-            readOnly={!!active.added}
+            // An added result (or a part) is another connection's maybe: its own.
+            connectionId={(active.added || active.part) && active.output ? active.output.connection_id : connectionId}
+            title={active.part ? active.part.name : active.added && active.output ? (active.output.name ?? active.output.handle) : title}
+            readOnly={!!active.added || !!active.part}
           />
         ) : active?.error ? (
           <ErrorView stmt={active} tabId={tabId} connectionId={connectionId} count={run.statements.length} noEditor={noEditor} />

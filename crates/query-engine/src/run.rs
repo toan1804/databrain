@@ -26,7 +26,7 @@ impl QueryEngine {
         split_statements(sql, kind)
             .into_iter()
             .enumerate()
-            .map(|(index, s)| PlannedStatement { index, checked: Checked::new(s.sql, kind), start: s.start, end: s.end })
+            .map(|(index, s)| PlannedStatement { index, checked: Checked::new(s.sql, kind), start: s.start, end: s.end, combined: false })
             .collect()
     }
 
@@ -38,7 +38,8 @@ impl QueryEngine {
         params: &HashMap<String, databrain_connector_core::sql::ParamValue>,
     ) -> Result<()> {
         let mut missing: Vec<String> = Vec::new();
-        for p in plan.iter_mut() {
+        // A combined query's pieces were bound in their own dialects.
+        for p in plan.iter_mut().filter(|p| !p.combined) {
             match p.checked.clone().bind(kind, params) {
                 Ok(bound) => p.checked = bound,
                 Err(names) => missing.extend(names.into_iter().filter(|n| !missing.contains(n)).collect::<Vec<_>>()),
@@ -49,6 +50,25 @@ impl QueryEngine {
         }
         let list = missing.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", ");
         Err(EngineError { code: Some("missing_parameters".into()), ..EngineError::new("invalid", format!("Enter a value for {list}")) })
+    }
+
+    /// Statements of `plan` that are combined queries, checked now (before
+    /// anything runs; a refusal names the part and where it is in the
+    /// editor), become reads the tab's connection lets through: none of
+    /// their text runs there.
+    fn mark_combined(&self, req: &RunRequest, plan: &mut [PlannedStatement]) -> Result<()> {
+        for p in plan.iter_mut() {
+            let text = &req.sql[p.start..p.end];
+            let planned = self.plan_combined(text, &req.params, req.origin, &req.connection_id, req.session_key()).map_err(|e| {
+                // Positions are in the statement (as the editor maps them).
+                EngineError { message: if plan_len_hint(req, p) { format!("Statement {}: {}", p.index + 1, e.message) } else { e.message }, ..e }
+            })?;
+            if let Some(c) = planned {
+                p.checked = Checked::combined(text, c.parts.iter().map(|x| &x.sent)).ok_or_else(|| EngineError::new("internal", "a part isn't a read"))?;
+                p.combined = true;
+            }
+        }
+        Ok(())
     }
 
     /// Reasons the user must confirm before running, if any.
@@ -95,6 +115,7 @@ impl QueryEngine {
         if plan.is_empty() {
             return Err(EngineError::new("invalid", "Nothing to run"));
         }
+        self.mark_combined(&req, &mut plan)?;
         Self::bind_parameters(&mut plan, profile.config.kind, &req.params)?;
         // The table explorer's sample: one read, whatever its `where` box
         // held (a `;` in it would start another statement). Its Delta
@@ -304,9 +325,13 @@ impl QueryEngine {
             }
             let started_at = now_ms();
             let t0 = Instant::now();
-            let outcome = match self.begin_if_manual(&req, conn_kind, stmt, &cancel).await {
-                Ok(()) => self.run_statement(&job_id, &req, stmt, limit, cancel.child_token(), waiter.as_ref()).await,
-                Err(e) => Err(e),
+            let outcome = if stmt.combined {
+                self.run_combined(&job_id, &req, stmt, limit, cancel.child_token(), waiter.as_ref()).await
+            } else {
+                match self.begin_if_manual(&req, conn_kind, stmt, &cancel).await {
+                    Ok(()) => self.run_statement(&job_id, &req, stmt, limit, cancel.child_token(), waiter.as_ref(), None).await,
+                    Err(e) => Err(e),
+                }
             };
             let duration_ms = t0.elapsed().as_millis() as u64;
             // What may have changed a table (DDL; a call or block we can't
@@ -318,12 +343,19 @@ impl QueryEngine {
                 self.forget_descriptions(&req.connection_id);
             }
 
+            // A combined query's result is the outer query's, on Results (DuckDB).
+            // (Asked for only then: asking makes it.)
+            let results = if stmt.combined { self.results_connection().ok() } else { None };
+            let (out_id, out_name, out_kind) = match results {
+                Some(r) => (r.id, r.name, databrain_connector_core::ConnectorKind::Duckdb),
+                None => (req.connection_id.clone(), conn_name.clone(), conn_kind),
+            };
             let output = match &outcome {
                 Ok(StatementOutcome { result: Some(r), .. }) => Some(Box::new(self.outputs.add(NewOutput {
                     result: r.clone(),
-                    connection_id: req.connection_id.clone(),
-                    connection_name: conn_name.clone(),
-                    kind: conn_kind,
+                    connection_id: out_id.clone(),
+                    connection_name: out_name.clone(),
+                    kind: out_kind,
                     sql: stmt.sql().to_string(),
                     tab_id: req.tab_id.clone(),
                     statement_index: stmt.index,
@@ -344,7 +376,7 @@ impl QueryEngine {
             let _ = crate::blocking(|| {
                 self.workspace.add_history(NewHistory {
                     origin: req.origin,
-                    connection_id: Some(req.connection_id.clone()),
+                    connection_id: Some(out_id.clone()),
                     sql: stmt.sql().to_string(),
                     started_at,
                     duration_ms: duration_ms as i64,
@@ -374,7 +406,7 @@ impl QueryEngine {
                     status = if e.kind == "cancelled" { RunStatus::Cancelled } else { RunStatus::Error };
                     // Lost, or ended to stop a statement its driver couldn't:
                     // the next statement opens a new session.
-                    if matches!(e.kind.as_str(), "connection") || e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED) {
+                    if !stmt.combined && (matches!(e.kind.as_str(), "connection") || e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED)) {
                         self.drop_session(&req.connection_id, req.session_key());
                     }
                     emit(JobEvent::StatementFailed {
@@ -452,6 +484,7 @@ impl QueryEngine {
         low
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_statement(
         &self,
         job_id: &str,
@@ -460,6 +493,7 @@ impl QueryEngine {
         limit: Option<usize>,
         cancel: CancellationToken,
         waiter: Option<&Waiter>,
+        part: Option<&crate::combined::PartRun>,
     ) -> Result<StatementOutcome> {
         let started = Instant::now();
         let session = tokio::select! {
@@ -479,7 +513,7 @@ impl QueryEngine {
                 },
             )
             .await?;
-        self.collect_stream(job_id, req, stmt, limit, cancel, stream, started, waiter).await
+        self.collect_stream(job_id, req, stmt, limit, cancel, stream, started, waiter, part).await
     }
 
     /// Reads a statement's result stream into the result store. Every way
@@ -498,6 +532,8 @@ impl QueryEngine {
         started: Instant,
         // Gets the progress too (a job step waiting on the run).
         waiter: Option<&Waiter>,
+        // A combined query's part: where it reports.
+        part: Option<&crate::combined::PartRun>,
     ) -> Result<StatementOutcome> {
         let mut server_ms = None;
         let result_id = format!("{job_id}:{}", stmt.index);
@@ -625,7 +661,8 @@ impl QueryEngine {
                             too_big = true;
                         }
                     }
-                    rows += batch.num_rows();
+                    let batch_rows = batch.num_rows();
+                    rows += batch_rows;
                     if !on_disk {
                         bytes += databrain_connector_core::memory_size([&batch]);
                     }
@@ -633,7 +670,8 @@ impl QueryEngine {
                     // the rows kept after the row limit and the cuts above (a
                     // later failed write to disk can still drop some from the
                     // result). A slow reader slows the query.
-                    let tap = self.taps.lock().get(&req.tab_id).cloned();
+                    // A part's rows aren't the tab's result (the join is).
+                    let tap = if part.is_some() { None } else { self.taps.lock().get(&req.tab_id).cloned() };
                     if let Some(tap) = tap
                         && batch.num_rows() > 0
                     {
@@ -655,13 +693,15 @@ impl QueryEngine {
                         cancel.cancel();
                         break;
                     }
+                    // A part counts towards its combined statement's rows.
+                    let total = part.as_ref().map(|p| p.rows.fetch_add(batch_rows, std::sync::atomic::Ordering::Relaxed) + batch_rows);
                     if last_progress.elapsed() >= PROGRESS_INTERVAL {
                         last_progress = Instant::now();
                         let ev = JobEvent::Progress {
-                            job_id: job_id.to_string(),
+                            job_id: part.as_ref().map_or_else(|| job_id.to_string(), |p| p.job_id.clone()),
                             tab_id: req.tab_id.clone(),
-                            index: stmt.index,
-                            rows,
+                            index: part.as_ref().map_or(stmt.index, |p| p.index),
+                            rows: total.unwrap_or(rows),
                             elapsed_ms: t0.elapsed().as_millis() as u64,
                         };
                         if let Some(w) = waiter {
@@ -676,6 +716,10 @@ impl QueryEngine {
                     server_ms = Some(ms); // last one: a fallback re-runs the statement
                     if let Some(n) = &notice {
                         notices.push(n.clone());
+                    }
+                    // Not a part's: the tab shows the combined statement's own.
+                    if part.is_some() {
+                        continue;
                     }
                     self.events.emit(JobEvent::Downloading {
                         job_id: job_id.to_string(),
@@ -757,6 +801,11 @@ impl QueryEngine {
         let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;
         Ok(StatementOutcome { result: info, rows_affected: None, notices, server_ms })
     }
+}
+
+/// A refusal of statement `p` says which statement when the run has others.
+fn plan_len_hint(req: &RunRequest, p: &PlannedStatement) -> bool {
+    p.start > 0 || p.end < req.sql.trim_end().len()
 }
 
 /// What [`QueryEngine::run_and_wait`] returns when the run ends. Failed

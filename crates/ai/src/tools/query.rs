@@ -121,6 +121,7 @@ impl ToolContext {
                     session_key: None,
                     output_name: None,
                     params: Default::default(),
+                    part_rows: None,
                 },
                 Some(self.cancel.clone()),
             )
@@ -580,6 +581,7 @@ impl ToolContext {
                     session_key: None,
                     output_name: None,
                     params: Default::default(),
+                    part_rows: None,
                 },
                 Some(self.cancel.clone()),
             )
@@ -660,6 +662,7 @@ impl ToolContext {
                     output_name: None,
                     params: Default::default(),
                     output_masks: None,
+                    part_rows: None,
                 },
                 Some(self.cancel.clone()),
             )

@@ -74,6 +74,22 @@ impl Checked {
         Statement { sql: &self.sql }
     }
 
+    /// A combined query ([`super::parse_combined`]), whose own text never
+    /// runs: its parts run on their connections and the outer query in
+    /// DuckDB, each checked there (`checked`). A read when every one of them
+    /// is, so the tab's connection (where none of it runs) lets it through;
+    /// `None` otherwise.
+    pub fn combined<'c>(sql: impl Into<String>, checked: impl IntoIterator<Item = &'c Checked>) -> Option<Self> {
+        let mut any = false;
+        for c in checked {
+            if c.kind() != StatementKind::Read {
+                return None;
+            }
+            any = true;
+        }
+        any.then(|| Self { sql: sql.into(), classification: Classification { kind: StatementKind::Read, missing_where: false, keyword: "WITH".into() } })
+    }
+
     /// As the table explorer runs it: Databricks' `DESCRIBE HISTORY` and
     /// `DESCRIBE DETAIL` of a table ([`super::delta_describe`]), which
     /// [`classify`] leaves unknown for the AI and MCP, are reads there
@@ -105,6 +121,18 @@ mod tests {
         assert_ne!(w.unwrap().kind(), StatementKind::Read);
         assert_eq!(c.bind(pg, &HashMap::new()).unwrap_err(), vec!["id".to_string()]);
         assert_eq!(Statement::internal("select 1").sql(), "select 1");
+    }
+
+    /// A combined query is a read only when every part (and the outer
+    /// query) checked is one.
+    #[test]
+    fn a_combined_query_reads_only_when_every_piece_does() {
+        let pg = ConnectorKind::Postgres;
+        let (read, write) = (Checked::new("select 1", pg), Checked::new("delete from t", pg));
+        let q = "with a as (@pg select 1) select * from a";
+        assert_eq!(Checked::combined(q, [&read, &read]).unwrap().kind(), StatementKind::Read);
+        assert!(Checked::combined(q, [&read, &write]).is_none());
+        assert!(Checked::combined(q, []).is_none());
     }
 
     /// The table explorer's Delta reads: a read there, asked elsewhere.

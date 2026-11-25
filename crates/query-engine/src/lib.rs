@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod combined;
 pub mod compare;
 mod connect;
 mod describe_cache;
@@ -28,6 +29,7 @@ pub mod schema_diff;
 mod sessions;
 pub mod testdata;
 
+pub use combined::{PART_ROWS_DEFAULT, PART_ROWS_SETTING, PART_TOO_LARGE};
 pub use error::*;
 pub use events::*;
 use guard::{Guarded, Hold, Intent};
@@ -90,6 +92,10 @@ pub struct RunRequest {
     #[serde(skip)]
     #[ts(skip)]
     pub output_masks: Option<std::sync::Arc<databrain_connector_core::external::OutputMasks>>,
+    /// Rows a part of a combined query may have (0: no limit); `None`: the
+    /// setting ([`PART_ROWS_SETTING`]). "Run again without the limit" sends 0.
+    #[serde(default)]
+    pub part_rows: Option<usize>,
 }
 
 impl RunRequest {
@@ -109,6 +115,11 @@ pub struct PlannedStatement {
     #[serde(flatten)]
     #[ts(flatten)]
     pub checked: Checked,
+    /// A combined query: its parts and outer query run elsewhere
+    /// ([`QueryEngine::run_combined`]).
+    #[serde(skip)]
+    #[ts(skip)]
+    pub(crate) combined: bool,
 }
 
 impl PlannedStatement {

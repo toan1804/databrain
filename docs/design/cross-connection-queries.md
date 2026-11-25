@@ -1,6 +1,6 @@
 # Design: one query over several connections
 
-Status: phase 1 in progress (2026-11-25): the parser is in (`connector-core/src/sql/combined.rs`); the run, `dbr` and the result tabs follow. The decisions are in §12; nothing is open.
+Status: phase 1 built (2026-11-25): the parser (`connector-core/src/sql/combined.rs`), the run (`query-engine/src/combined.rs`), part result tabs and `dbr`; what it leaves is in docs/TODO.md (Combined queries). The decisions are in §12; nothing is open.
 
 ## 1. Problem
 

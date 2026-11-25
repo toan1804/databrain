@@ -38,6 +38,7 @@ async fn run(st: &AppState, conn: &str, sql: &str) -> databrain_query_engine::St
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )
@@ -397,6 +398,7 @@ async fn run_as(
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )
@@ -575,6 +577,7 @@ async fn results_larger_than_memory_continue_on_disk() {
                 output_name: None,
                 params: Default::default(),
                 output_masks: Some(Arc::new(masks)),
+                part_rows: None,
             },
             None,
         )

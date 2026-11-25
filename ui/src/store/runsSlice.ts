@@ -93,7 +93,11 @@ export interface RunsSlice {
     replaces?: string,
     /** Who runs it, for the history (default: the user); `explorer` runs one read only. */
     origin?: Origin,
+    /** Rows a part of a combined query may have (0: no limit; default: the setting). */
+    partRows?: number,
   ) => Promise<boolean>;
+  /** Run a combined query again with no limit on its parts' rows ("Run again without the limit"). */
+  runWithoutPartLimit: (tabId: string, sql: string, base: number) => Promise<void>;
   /** Run the statement of result `index` of the run again, as that result only. */
   refreshResult: (runKey: string, index: number) => Promise<boolean>;
   cancelTab: (tabId: string) => Promise<void>;
@@ -325,7 +329,18 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values);
   },
 
-  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params, rowLimit, replaces, origin) => {
+  runWithoutPartLimit: async (tabId, sql, base) => {
+    const s = get();
+    const tab = s.tabs.find((t) => t.id === tabId);
+    if (!isQueryTab(tab) || s.runs[tabId]?.running) return;
+    const conn = s.connections.find((c) => c.id === tab.connection_id);
+    if (!conn) return;
+    const values = await get().paramsFor(tabId, conn.config.kind, sql);
+    if (!values) return;
+    await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values, undefined, undefined, undefined, 0);
+  },
+
+  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params, rowLimit, replaces, origin, partRows) => {
     const conn = get().connections.find((c) => c.id === connectionId);
     // Closed while the run was starting (connecting, a confirmation, a
     // sign-in): what started is stopped and nothing is shown for it.
@@ -345,6 +360,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           output_name: outputName ?? null,
           params: params ?? {},
           ...(origin ? { origin } : {}),
+          ...(partRows !== undefined ? { part_rows: partRows } : {}),
         };
         const resp = replaces ? await api.rerunOutput(req, replaces) : await api.runQuery(req);
         if (resp.status === "started" && closed()) {
@@ -626,6 +642,9 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           if (next.activeIndex === null || !cancelled) next.activeIndex = e.index;
           break;
         }
+        case "part_finished":
+          next.parts = [...(run.parts ?? []), { ...outputRun(e.output, keptIndex()), part: { name: e.part, connection: e.connection_name } }];
+          break;
         case "job_finished":
           next = {
             ...next,

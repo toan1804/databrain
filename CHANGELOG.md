@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **One query over several connections:** a `WITH` part that starts with `@connection` runs on that connection, and the query around the parts joins them in DuckDB, in any tab: `WITH orders AS (@"Sales PG" SELECT …), customers AS (@crm SELECT …) SELECT … FROM orders JOIN customers …`. Only reads run (each part checked on its connection, before anything runs); parts are read whole, and one past 1,000,000 rows fails rather than being cut ("Run again without the limit"). Each part's rows show as a result of their own. `dbr -i` runs one without `-c`. Not yet in the assistant, notebooks or jobs.
+
 ## 0.5.3 - 2026-11-25
 
 ### Added
