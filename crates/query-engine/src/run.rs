@@ -362,6 +362,7 @@ impl QueryEngine {
                     row_limit: limit,
                     origin: req.origin,
                     session_key: req.session_key().to_string(),
+                    part: None,
                 }))),
                 _ => None,
             };

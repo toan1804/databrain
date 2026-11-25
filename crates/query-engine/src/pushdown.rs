@@ -24,8 +24,8 @@ use databrain_connector_core::quote_ident;
 use databrain_connector_core::sql::quote_string;
 use databrain_connector_core::traits::RowLimit;
 use sqlparser::ast::{
-    BinaryOperator, DataType as SqlType, Expr, GroupByExpr, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, UnaryOperator, Value,
+    BinaryOperator, DataType as SqlType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, LimitClause,
+    ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, UnaryOperator, Value,
 };
 use sqlparser::parser::Parser;
 
@@ -57,6 +57,37 @@ impl TypeClass {
             Utf8 | LargeUtf8 | Utf8View => TypeClass::Text,
             Float16 | Float32 | Float64 => TypeClass::Float,
             _ => TypeClass::Other,
+        }
+    }
+
+    /// A column's class from its Arrow type and, for text, the server's type
+    /// name: drivers deliver other types as text too (json, uuid, enums,
+    /// numerics), where the server's `=` errors or compares otherwise, so
+    /// text is text only when the server says it is characters.
+    pub(crate) fn of_column(t: &DataType, db_type: Option<&str>) -> TypeClass {
+        match TypeClass::of(t) {
+            TypeClass::Text => {
+                let name = db_type.unwrap_or("").trim().to_ascii_lowercase();
+                let base = name.split(['(', ' ']).next().unwrap_or("");
+                let chars = matches!(
+                    base,
+                    "text"
+                        | "varchar"
+                        | "char"
+                        | "character"
+                        | "nvarchar"
+                        | "nchar"
+                        | "varchar2"
+                        | "nvarchar2"
+                        | "string"
+                        | "bpchar"
+                        | "tinytext"
+                        | "mediumtext"
+                        | "longtext"
+                );
+                if chars { TypeClass::Text } else { TypeClass::Other }
+            }
+            c => c,
         }
     }
 
@@ -111,8 +142,12 @@ pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
     }
     // Each part's CTE: its outer column names (a column list renames them).
     let mut outer_cols: Vec<Option<OuterColumns>> = Vec::with_capacity(parts.len());
+    // Its CTE names its columns (`c(a, b) AS (…)`): the output must keep
+    // every one of them, so none is left out.
+    let mut renamed: Vec<bool> = Vec::with_capacity(parts.len());
     for p in parts {
         let cte = with.cte_tables.iter().find(|c| same_name(&c.alias.name, p.name));
+        renamed.push(cte.is_some_and(|c| !c.alias.columns.is_empty()));
         let cols = match (cte, p.columns) {
             (Some(cte), Some(cols)) if unique(cols) => {
                 if cte.alias.columns.is_empty() {
@@ -164,13 +199,47 @@ pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
             _ => {}
         }
     }
+    // A use the scan can't tie to columns (a struct field, a longer path, a
+    // relation's whole row, DuckDB's COLUMNS(…), a qualified wildcard
+    // argument, a USING or NATURAL join): every part keeps every column.
+    let mut unsure = sel.from.iter().flat_map(|t| &t.joins).any(|j| match &j.join_operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => matches!(c, JoinConstraint::Using(_) | JoinConstraint::Natural),
+        _ => false,
+    });
     let _ = sqlparser::ast::visit_expressions(&q, |e| {
         let path: Option<Vec<&Ident>> = match e {
             Expr::Identifier(i) => Some(vec![i]),
             Expr::CompoundIdentifier(v) => Some(v.iter().collect()),
+            Expr::Function(f) => {
+                let columns = matches!(f.name.0.last(), Some(ObjectNamePart::Identifier(i)) if i.value.eq_ignore_ascii_case("columns"));
+                let star = match &f.args {
+                    FunctionArguments::List(l) => l.args.iter().any(|a| match a {
+                        FunctionArg::Unnamed(x) | FunctionArg::Named { arg: x, .. } => matches!(x, FunctionArgExpr::QualifiedWildcard(_)),
+                        _ => false,
+                    }),
+                    _ => false,
+                };
+                unsure |= columns || star;
+                None
+            }
             _ => None,
         };
         if let Some(path) = path {
+            let alias = |a: &Ident| rels.iter().any(|r| same_name(a, &r.alias));
+            match path.as_slice() {
+                // A relation's name alone: its whole row.
+                [a] if alias(a) => unsure = true,
+                // `x.f` where x is no relation: a struct field of column x.
+                [a, _] if !alias(a) => unsure = true,
+                [_, _, _, ..] => unsure = true,
+                _ => {}
+            }
             for (i, c) in ctx.uses_of(&path) {
                 if let Some(u) = used[i].as_mut()
                     && !u.contains(&c)
@@ -181,6 +250,11 @@ pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
         }
         std::ops::ControlFlow::<()>::Continue(())
     });
+    for (i, u) in used.iter_mut().enumerate() {
+        if unsure || renamed[i] {
+            *u = None;
+        }
+    }
 
     // Terms: the top-level AND terms of WHERE and of inner joins' ON.
     let mut terms: Vec<&Expr> = Vec::new();
@@ -196,21 +270,18 @@ pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
         }
     }
     let mut filters: Vec<Vec<String>> = vec![Vec::new(); parts.len()];
-    let mut where_pushed = 0;
-    for (k, t) in terms.iter().enumerate() {
+    for t in &terms {
         if let Some((i, text)) = ctx.term(t, parts)
             && pushable[i]
             && !rels.iter().any(|r| r.part == Some(i) && r.nullable)
         {
             filters[i].push(text);
-            if k < where_terms {
-                where_pushed += 1;
-            }
         }
     }
     // The row limit: `SELECT cols FROM one_part [WHERE pushed] LIMIT n` and nothing else.
-    let limit =
-        (rels.len() == 1 && where_pushed == where_terms && plain_select(sel) && q.order_by.is_none() && q.fetch.is_none()).then(|| plain_limit(&q)).flatten();
+    // Only without WHERE: a pushed term may keep rows DuckDB then drops (a
+    // case-insensitive `=`), which would take places in the limit.
+    let limit = (rels.len() == 1 && where_terms == 0 && plain_select(sel) && q.order_by.is_none() && q.fetch.is_none()).then(|| plain_limit(&q)).flatten();
 
     parts
         .iter()
@@ -341,12 +412,11 @@ impl Ctx<'_> {
                     BinaryOperator::GtEq => ">=",
                     _ => return None,
                 };
-                let range = !matches!(sym, "=" | "<>");
                 let ok = match t {
                     TypeClass::Integer | TypeClass::Decimal | TypeClass::Bool | TypeClass::Date | TypeClass::Timestamp => true,
                     TypeClass::Text => sym == "=",
-                    TypeClass::Float => range,
-                    TypeClass::Other => false,
+                    // A single-precision column compares its stored value, not the one that arrives.
+                    TypeClass::Float | TypeClass::Other => false,
                 } && (sym != "<>" && !negated || t.negation_safe());
                 if !ok {
                     return None;
@@ -369,12 +439,8 @@ impl Ctx<'_> {
             }
             Expr::Between { expr, negated: not_between, low, high } => {
                 let (i, name, t) = col(expr)?;
-                let neg = *not_between || negated;
-                let ok = match t {
-                    TypeClass::Integer | TypeClass::Decimal | TypeClass::Date | TypeClass::Timestamp => true,
-                    TypeClass::Float => !neg,
-                    _ => false,
-                };
+                // Numbers and dates only (negated too): no text, no floats.
+                let ok = matches!(t, TypeClass::Integer | TypeClass::Decimal | TypeClass::Date | TypeClass::Timestamp);
                 if !ok {
                     return None;
                 }
@@ -418,7 +484,12 @@ fn literal(v: &Expr, t: TypeClass, kind: ConnectorKind) -> Option<String> {
                 ConnectorKind::Mssql | ConnectorKind::Oracle => None,
                 _ => Some(if *b { "TRUE" } else { "FALSE" }.into()),
             },
-            (Value::SingleQuotedString(s), TypeClass::Text) => Some(quote_string(s, kind)),
+            (Value::SingleQuotedString(s), TypeClass::Text) => Some(match kind {
+                // National text: outside the database's code page a plain literal loses characters.
+                ConnectorKind::Mssql => format!("N{}", quote_string(s, kind)),
+                ConnectorKind::Oracle if !s.is_ascii() => format!("N{}", quote_string(s, kind)),
+                _ => quote_string(s, kind),
+            }),
             (Value::SingleQuotedString(s), TypeClass::Date | TypeClass::Timestamp) => typed(s, t, kind),
             _ => None,
         },
@@ -451,7 +522,11 @@ fn typed(s: &str, t: TypeClass, kind: ConnectorKind) -> Option<String> {
     if !ok {
         return None;
     }
-    let s = s.replace('T', " ");
+    let mut s = s.replace('T', " ");
+    // A timestamp literal needs its time (Oracle refuses one without).
+    if t == TypeClass::Timestamp && s.len() == 10 {
+        s.push_str(" 00:00:00");
+    }
     use ConnectorKind::*;
     Some(match (t, kind) {
         (TypeClass::Date, Postgres | Duckdb | Mysql | Oracle | Snowflake | Databricks | Bigquery) => format!("DATE '{s}'"),
@@ -604,10 +679,10 @@ fn plain_limit(q: &Query) -> Option<u64> {
     }
 }
 
-/// An identifier as DuckDB compares it with a name: quoted exactly, else
-/// in any case.
+/// An identifier as DuckDB compares it with a name.
 fn same_name(id: &Ident, name: &str) -> bool {
-    if id.quote_style.is_some() { id.value == name } else { id.value.eq_ignore_ascii_case(name) }
+    // DuckDB matches names in any case, quoted ones too.
+    id.value.to_lowercase() == name.to_lowercase()
 }
 
 fn unique(cols: &[(String, TypeClass)]) -> bool {
@@ -668,7 +743,6 @@ mod tests {
             "total between 1 and -2.5",
             "note in ('a', 'b')",
             "note is null",
-            "score > 1.5",
             "ok = true",
             "not (id = 1)",
             "(id = 1 or total > 2)",
@@ -677,14 +751,17 @@ mod tests {
         ] {
             assert!(one(w).is_some(), "{w}");
         }
-        // Not: text ranges and negations (collations), float equality, functions, LIKE,
-        // two columns, a text compared with a number, a malformed date, NOT on text.
+        // Not: text ranges and negations (collations), floats (a single-precision
+        // column compares its stored value), functions, LIKE, two columns, a text
+        // compared with a number, a malformed date, NOT on text.
         for w in [
             "note > 'a'",
             "note <> 'a'",
             "note not in ('a')",
             "not (note = 'a')",
             "score = 1.5",
+            "score > 1.5",
+            "score between 1 and 2",
             "lower(note) = 'a'",
             "note like 'a%'",
             "id = total",
@@ -725,9 +802,10 @@ mod tests {
     fn the_row_limit_only_for_one_plain_part() {
         let o = orders();
         let one = |q: &str, kind| run(q, &[("o", kind, "select * from orders", Some(&o))])[0].clone();
-        assert!(
-            one("with o as (select * from results.r1) select id from o where id > 1 limit 10", Postgres).unwrap().sent.ends_with("WHERE \"id\" > 1\nLIMIT 10")
-        );
+        assert!(one("with o as (select * from results.r1) select id from o limit 10", Postgres).unwrap().sent.ends_with(") databrain_part\nLIMIT 10"));
+        // With a WHERE: no limit (a pushed term may keep rows DuckDB drops, which would fill it).
+        let w = one("with o as (select * from results.r1) select id from o where id > 1 limit 10", Postgres).unwrap();
+        assert!(w.sent.ends_with("WHERE \"id\" > 1") && !w.what.iter().any(|x| x.starts_with("limit")), "{w:?}");
         assert!(one("with o as (select * from results.r1) select id from o limit 10", Mssql).unwrap().sent.starts_with("SELECT TOP (10) [id] FROM"));
         assert!(one("with o as (select * from results.r1) select id from o limit 10", Oracle).unwrap().sent.ends_with("FETCH FIRST 10 ROWS ONLY"));
         for q in [
@@ -776,8 +854,49 @@ mod tests {
         );
         // Both are used (`who`, and `cid` in WHERE): every column, filtered on the part's own name.
         assert_eq!(p[0].as_ref().unwrap().sent, "SELECT * FROM (\nselect id, name from customers\n) databrain_part\nWHERE \"id\" = 7");
+        // Its CTE names both columns: both stay, even when one isn't used.
         let p = run("with c(cid, who) as (select * from results.r2) select who from c", &[("c", Postgres, "select id, name from customers", Some(&c))]);
-        assert_eq!(p[0].as_ref().unwrap().what, vec!["columns name"]);
+        assert_eq!(p, vec![None]);
+    }
+
+    /// Uses the scan can't tie to columns keep every column.
+    #[test]
+    fn every_column_stays_when_a_use_is_unclear() {
+        let o = orders();
+        let c = cols(&[("id", Integer), ("name", Text), ("country", Text)]);
+        let two = [("o", Postgres, "select * from orders", Some(o.as_slice())), ("c", Mysql, "select * from customers", Some(c.as_slice()))];
+        let pruned = |p: &[Option<Pushed>]| p.iter().flatten().any(|x| x.what.iter().any(|w| w.starts_with("columns")));
+        for q in [
+            "with o as (select * from results.r1), c as (select * from results.r2) select o.total, c.name from o join c using (id)",
+            "with o as (select * from results.r1), c as (select * from results.r2) select total, name from o natural join c",
+        ] {
+            assert!(!pruned(&run(q, &two)), "{q}");
+        }
+        let one = [("o", Postgres, "select * from orders", Some(o.as_slice()))];
+        for q in [
+            "with o as (select * from results.r1) select o from o",
+            "with o as (select * from results.r1) select max(columns(*)) from o",
+            "with o as (select * from results.r1) select note.x from o",
+            "with o as (select * from results.r1) select o.note.x from o",
+        ] {
+            assert!(!pruned(&run(q, &one)), "{q}");
+        }
+        // A quoted name in another case is still that column (DuckDB ignores case).
+        let p = run("with o as (select * from results.r1) select \"ID\", total from o", &one);
+        assert_eq!(p[0].as_ref().unwrap().what, vec!["columns id, total"]);
+    }
+
+    /// Text is text only when the server says so.
+    #[test]
+    fn text_only_for_character_types() {
+        use databrain_connector_core::arrow::datatypes::DataType::Utf8;
+        for t in ["text", "character varying(20)", "VARCHAR2(50)", "nvarchar(max)", "STRING", "varchar"] {
+            assert_eq!(TypeClass::of_column(&Utf8, Some(t)), Text, "{t}");
+        }
+        for t in [Some("json"), Some("uuid"), Some("numeric(10,2)"), Some("enum"), Some("clob"), Some("uniqueidentifier"), None] {
+            assert_eq!(TypeClass::of_column(&Utf8, t), Other, "{t:?}");
+        }
+        assert_eq!(TypeClass::of_column(&DataType::Int64, None), Integer);
     }
 
     #[test]
@@ -795,5 +914,16 @@ mod tests {
         assert!(one(Mysql).contains("`note` = 'a\\'b'") || one(Mysql).contains("`note` = 'a''b'"), "{}", one(Mysql));
         assert!(one(Mssql).contains("[day] = CAST('2024-02-29' AS date)"), "{}", one(Mssql));
         assert!(one(Postgres).contains("\"day\" = DATE '2024-02-29'"));
+        // National text on SQL Server (and on Oracle past ASCII); a date-only
+        // value for a timestamp gets its time (Oracle refuses one without).
+        assert!(one(Mssql).contains("[note] = N'a''b'"), "{}", one(Mssql));
+        let ts = cols(&[("id", Integer), ("created", Timestamp), ("city", Text)]);
+        let ora = run(
+            "with o as (select * from results.r1) select id from o where created >= '2024-01-01' and city = 'Hà Nội'",
+            &[("o", Oracle, "select * from t", Some(&ts))],
+        );
+        let sent = &ora[0].as_ref().unwrap().sent;
+        assert!(sent.contains(">= TIMESTAMP '2024-01-01 00:00:00'"), "{sent}");
+        assert!(sent.contains("= N'Hà Nội'"), "{sent}");
     }
 }

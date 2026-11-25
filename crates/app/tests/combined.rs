@@ -333,9 +333,9 @@ async fn many_parts_and_a_transaction_opened_in_the_same_script() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pushdown_asks_for_less_and_changes_no_answer() {
     let s = setup().await;
-    let q = "with o as (@\"Sales DB\" select * from orders) select id from o where total > 5 order by id";
+    let q = "with o as (@\"Sales DB\" select * from orders) select id, total from o where id > 1 and total > 5 order by id";
     let on = s.run(req(&s.sales, "p1", q)).await.unwrap();
-    assert_eq!(s.rows(&on[0]), vec!["1", "3"]);
+    assert_eq!(s.rows(&on[0]), vec!["3|7.0"]);
     let part = s
         .events
         .0
@@ -347,8 +347,9 @@ async fn pushdown_asks_for_less_and_changes_no_answer() {
             _ => None,
         })
         .unwrap();
-    assert!(part.0.iter().any(|w| w == "\"total\" > 5"), "{:?}", part.0);
-    assert!(part.1.contains("databrain_part") && part.1.contains("WHERE \"total\" > 5"), "{}", part.1);
+    // The integer filter goes to the server; the float one (SQLite REAL) stays in DuckDB.
+    assert!(part.0.iter().any(|w| w == "\"id\" > 1") && !part.0.iter().any(|w| w.contains("total >")), "{:?}", part.0);
+    assert!(part.1.contains("databrain_part") && part.1.contains("WHERE \"id\" > 1"), "{}", part.1);
     assert_eq!(part.2, 2, "the server sent only the rows that pass");
     // The same rows with it off, the part as written.
     let queries = [
@@ -370,4 +371,29 @@ async fn pushdown_asks_for_less_and_changes_no_answer() {
     let mut off = req(&s.sales, "p2", queries[2]);
     off.pushdown = Some(false);
     assert_eq!(s.rows(&s.run(off).await.unwrap()[0]), vec!["Cy|"]);
+}
+
+/// Part outputs say they are parts: a kept join refreshed stays kept (a part
+/// never takes its place), and the parts aren't statements of their own.
+#[tokio::test(flavor = "multi_thread")]
+async fn parts_are_marked_as_parts() {
+    let s = setup().await;
+    let out = s.run(req(&s.sales, "k1", JOIN)).await.unwrap();
+    let rid = out[0].result.as_ref().unwrap().id.clone();
+    let of_tab = || s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "k1" && o.active).collect::<Vec<_>>();
+    let join = of_tab().into_iter().find(|o| o.result_id == rid).unwrap();
+    assert!(join.part.is_none());
+    let mut names: Vec<String> = of_tab().into_iter().filter_map(|o| o.part).collect();
+    names.sort();
+    assert_eq!(names, ["c", "o"]);
+    s.st.engine.outputs().set_kept(&join.handle, true).unwrap();
+    let started = s.st.engine.rerun_output(req(&s.sales, "k1", JOIN), &join.handle).unwrap();
+    let databrain_query_engine::RunResponse::Started { job_id, .. } = started else { panic!("not started") };
+    while s.st.engine.is_running(&job_id) {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let now = of_tab();
+    let new_join = now.iter().find(|o| o.part.is_none() && o.handle != join.handle).expect("a new join result");
+    assert!(new_join.kept, "the refreshed join is kept");
+    assert!(now.iter().filter(|o| o.part.is_some()).all(|o| !o.kept), "no part took the keep");
 }

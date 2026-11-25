@@ -278,7 +278,15 @@ impl QueryEngine {
         let schema = self.results.get(&r.id).ok().map(|rs| rs.lock().schema());
         self.results.remove(&r.id);
         let schema = schema?;
-        Some(schema.fields().iter().map(|f| (f.name().clone(), crate::pushdown::TypeClass::of(f.data_type()))).collect())
+        // The server's type name (as the grid shows it) tells text from what arrives as text.
+        let db: HashMap<&str, Option<&str>> = r.columns.iter().map(|c| (c.name.as_str(), c.db_type.as_deref())).collect();
+        Some(
+            schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), crate::pushdown::TypeClass::of_column(f.data_type(), db.get(f.name().as_str()).copied().flatten())))
+                .collect(),
+        )
     }
 
     /// The rows a part may have: the run's own (`part_rows`, 0 = no
@@ -451,6 +459,7 @@ impl QueryEngine {
                 // tab's runs hold too (never the part's session, which a
                 // run of the tab may be using).
                 session_key: req.session_key().to_string(),
+                part: Some(p.name.clone()),
             })
         });
         let (status, rows, error) = match &outcome {

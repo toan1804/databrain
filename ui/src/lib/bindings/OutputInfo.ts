@@ -35,4 +35,9 @@ kept: boolean,
  * Database session the statement ran on, when not `tab_id` (a
  * notebook's cells share `nb:{notebook}`).
  */
-session_key?: string, };
+session_key?: string, 
+/**
+ * A part of a combined query (its name), read for statement
+ * `statement_index`: never that statement's own result.
+ */
+part?: string, };
