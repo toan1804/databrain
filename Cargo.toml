@@ -48,7 +48,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# mysql_async 0.36.1 with one opt-in addition: CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS
-# (vendor/mysql_async/DATABRAIN.md), so an expired MySQL password can be changed.
+# Drivers with one opt-in addition each, so an expired password can be changed:
+# mysql_async 0.36.1, CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS (vendor/mysql_async/DATABRAIN.md);
+# tiberius 0.13.0, LOGIN7 ChangePassword (vendor/tiberius/DATABRAIN.md).
 [patch.crates-io]
 mysql_async = { path = "vendor/mysql_async" }
+tiberius = { path = "vendor/tiberius" }

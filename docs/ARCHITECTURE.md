@@ -164,8 +164,8 @@ The UI keeps a copy in `ui/src/lib/sourceTraits.json` for its tests and pure hel
 | Engine | Crate and protocol | Cancel |
 |---|---|---|
 | PostgreSQL, Amazon Redshift | `connectors/postgres`: `tokio-postgres`. The statement is prepared for column types, then rows come over the simple (text) protocol, so every type displays as `psql` shows it. Redshift is a flavor of this connector (`redshift.rs`) with its own catalog queries and IAM sign-in through the AWS CLI | `CancelToken` |
-| MySQL / MariaDB | `connectors/mysql`: `mysql_async` 0.36, text protocol | `KILL QUERY` from a second connection |
-| SQL Server | `connectors/mssql`: `tiberius` 0.12 with rustls (TLS 1.2/1.3 on every OS); SQL login, NTLM, Entra ID | drops the connection; the next statement reconnects |
+| MySQL / MariaDB | `connectors/mysql`: `mysql_async` 0.36 (a vendored copy, `vendor/mysql_async`), text protocol | `KILL QUERY` from a second connection |
+| SQL Server | `connectors/mssql`: `tiberius` 0.13 (a vendored copy, `vendor/tiberius`) with rustls (TLS 1.2/1.3 on every OS); SQL login, NTLM, Entra ID | drops the connection; the next statement reconnects |
 | Oracle | `connectors/oracle`: thin driver by default, Instant Client optional (below) | `agent.cancel` / `break_execution` |
 | Snowflake | `connectors/cloud/snowflake.rs`: the driver REST protocol (login request, query request, result chunks) | abort request |
 | Databricks | `connectors/cloud/databricks.rs`: SQL Statement Execution API 2.0, chunks and external links | statement cancel |
@@ -180,7 +180,7 @@ Notes that apply across engines:
 
 - Native types map to Arrow. Types Arrow can't hold become `Utf8`, and the database's type name is kept in field metadata (the grid shows it on hover). Exact decimals (Postgres `numeric`, MySQL `DECIMAL`) stay text so no precision is lost; filters and sorts treat them as numbers, and they are cast back to `DECIMAL` when DuckDB reads them as outputs.
 - The cloud connectors call the vendors' HTTP APIs directly. No ADBC or native driver is bundled.
-- **Oracle drivers.** The default is a thin driver: `databrain-oracle-agent`, a small Go program using go-ora (`crates/connectors/oracle/agent`). `agent.rs` downloads it on first use into `<app data>/oracle-agent/`, checks it against the SHA-256 sums compiled in from `agent/SHA256SUMS`, and starts one per session. A file downloaded by hand is accepted only if it matches the same sums. The "Oracle Instant Client" driver uses the `oracle` crate (ODPI-C) on blocking threads, for features only the thick client has. `client.rs` installs Instant Client's Basic package after checking the SHA-256 Oracle publishes, records a SHA-256 manifest of the folder's libraries, and checks the libraries against it before they are loaded into the process.
+- **Oracle drivers.** The default is a thin driver: `databrain-oracle-agent`, a small Go program using go-ora (`crates/connectors/oracle/agent`; a vendored copy with one addition, `agent/go-ora/DATABRAIN.md`). `agent.rs` downloads it on first use into `<app data>/oracle-agent/`, checks it against the SHA-256 sums compiled in from `agent/SHA256SUMS`, and starts one per session. A file downloaded by hand is accepted only if it matches the same sums. The "Oracle Instant Client" driver uses the `oracle` crate (ODPI-C) on blocking threads, for features only the thick client has. `client.rs` installs Instant Client's Basic package after checking the SHA-256 Oracle publishes, records a SHA-256 manifest of the folder's libraries, and checks the libraries against it before they are loaded into the process.
 
 ### 5.4 Adding a database type
 

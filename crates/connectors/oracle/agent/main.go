@@ -61,6 +61,8 @@ type request struct {
 	ConnectString string            `json:"connect_string,omitempty"`
 	Options       map[string]string `json:"options,omitempty"`
 	ReadOnly      bool              `json:"read_only,omitempty"`
+	// change_password: set as the password as the user signs in.
+	NewPassword string `json:"new_password,omitempty"`
 
 	// query / exec / text
 	SQL       string             `json:"sql,omitempty"`
@@ -708,6 +710,37 @@ func (s *session) connect(ctx context.Context, r *request) error {
 	return nil
 }
 
+// changePassword signs in with the (expired) password and sets
+// r.NewPassword as it does (AUTH_NEWPASSWORD, go-ora/DATABRAIN.md): once
+// a password has expired (ORA-28001) that is the only way Oracle takes a
+// new one. The connection is closed right after; nothing else runs on it.
+func changePassword(ctx context.Context, r *request) error {
+	if r.NewPassword == "" {
+		return errors.New("no new password")
+	}
+	url, err := dsn(r)
+	if err != nil {
+		return err
+	}
+	cfg, err := go_ora.ParseConfig(url)
+	if err != nil {
+		return err
+	}
+	cfg.NewPassword = r.NewPassword
+	conn, err := go_ora.NewConnection("", cfg)
+	if err != nil {
+		return err
+	}
+	if err := conn.OpenWithContext(ctx); err != nil {
+		return err
+	}
+	// Signed in: the password has changed. A failure to sign out (the
+	// network gone just after) must not say otherwise, or the app wouldn't
+	// save the new password.
+	_ = conn.Close()
+	return nil
+}
+
 func (s *session) close() {
 	if s.tx != nil {
 		_ = s.tx.Rollback()
@@ -1130,6 +1163,11 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		return w.json(map[string]any{"id": r.ID, "type": "ok", "version": Version})
 	case "connect":
 		if err := s.connect(ctx, r); err != nil {
+			return err
+		}
+		return w.json(map[string]any{"id": r.ID, "type": "ok"})
+	case "change_password":
+		if err := changePassword(ctx, r); err != nil {
 			return err
 		}
 		return w.json(map[string]any{"id": r.ID, "type": "ok"})
