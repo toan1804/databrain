@@ -33,7 +33,10 @@ pub const PROTOCOL: &str = "1";
 ///        tables of VARCHAR2(4000) columns: about 1,000 rows/s over a network).
 /// 0.1.7: an XMLTYPE table column (go-ora: "invalid size for GetInt64")
 ///        is read as text, as other object types are.
-pub const RELEASE: &str = "0.1.9";
+/// 0.1.10: `change_password`, signing in with an expired password and
+///        setting a new one (AUTH_NEWPASSWORD, a small addition to a vendored
+///        go-ora: `agent/go-ora/DATABRAIN.md`).
+pub const RELEASE: &str = "0.1.10";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].

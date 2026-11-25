@@ -44,20 +44,7 @@ pub(crate) async fn open(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource
         if !uses_instant_client(cfg) {
             let path = agent::ensure().await?;
             let a = agent::Agent::spawn(&path).await?;
-            let options: serde_json::Map<String, serde_json::Value> =
-                parse_driver_options(cfg.opt("driver_options").unwrap_or("")).into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
-            a.call(serde_json::json!({
-                "op": "connect",
-                "user": user,
-                "password": password,
-                "host": cfg.host_or_default(),
-                "port": cfg.port.unwrap_or(1521),
-                "service": cfg.opt("service_name").or(cfg.database.as_deref().filter(|d| !d.is_empty())).unwrap_or("FREEPDB1"),
-                "connect_string": cfg.opt("connect_string").unwrap_or(""),
-                "options": options,
-                "read_only": cfg.read_only,
-            }))
-            .await?;
+            a.call(thin_sign_in(cfg, "connect", &user, &password)).await?;
             return Ok(OracleSession { backend: Backend::Thin(a) });
         }
         let cs = connect_string(cfg);
@@ -83,18 +70,38 @@ pub(crate) async fn open(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource
     }
 }
 
-/// Sign in with the expired password in `creds`, setting `new` (OCI's
-/// password change at logon, which an expired password allows), then sign
-/// out. Instant Client only: the thin driver can't yet.
+/// The thin helper's sign-in request (`op`: connect, change_password).
+fn thin_sign_in(cfg: &ConnectionConfig, op: &str, user: &str, password: &str) -> serde_json::Value {
+    let options: serde_json::Map<String, serde_json::Value> =
+        parse_driver_options(cfg.opt("driver_options").unwrap_or("")).into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
+    serde_json::json!({
+        "op": op,
+        "user": user,
+        "password": password,
+        "host": cfg.host_or_default(),
+        "port": cfg.port.unwrap_or(1521),
+        "service": cfg.opt("service_name").or(cfg.database.as_deref().filter(|d| !d.is_empty())).unwrap_or("FREEPDB1"),
+        "connect_string": cfg.opt("connect_string").unwrap_or(""),
+        "options": options,
+        "read_only": cfg.read_only,
+    })
+}
+
+/// Sign in with the expired password in `creds`, setting `new` as it
+/// signs in (an expired password allows that, and nothing else), then sign
+/// out: OCI's password change at logon with Instant Client; the thin
+/// helper's `change_password` (AUTH_NEWPASSWORD, helper 0.1.10).
 pub(crate) async fn change_expired_password(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>, new: &str) -> Result<()> {
     let (user, password) = match creds.get().await? {
         Credential::Password { user, password } => (user, password.expose_secret().to_string()),
         _ => return Err(ConnectorError::config("Oracle requires user/password authentication")),
     };
     if !uses_instant_client(cfg) {
-        return Err(ConnectorError::unsupported(
-            "The thin Oracle driver can't change an expired password yet: use the Instant Client driver (the connection's Driver setting), or ask an administrator",
-        ));
+        let a = agent::Agent::spawn(&agent::ensure().await?).await?;
+        let mut req = thin_sign_in(cfg, "change_password", &user, &password);
+        req["new_password"] = serde_json::Value::String(new.to_string());
+        a.call(req).await?;
+        return Ok(());
     }
     let cs = connect_string(cfg);
     let lib = cfg.opt("client_lib_dir").map(str::to_string);

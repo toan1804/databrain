@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **An expired Oracle password can be changed with the thin driver too:** the change-password dialog (which opens by itself on ORA-28001) now sets the new password as DataBrain signs in with the default thin driver, not only with Instant Client. Through a small addition to the go-ora driver in the Oracle helper (`crates/connectors/oracle/agent/go-ora`); the helper is downloaded again (0.1.10).
+
 ## 0.5.3 - 2026-11-25
 
 ### Added
