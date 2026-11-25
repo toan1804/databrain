@@ -301,8 +301,8 @@ function ResultList({
             }`}
           >
             <StatusIcon s={s} />
-            <span className="w-8 shrink-0 text-right tabular-nums">{isCarried(s) ? <Pin size={11} className="ml-auto text-accent" aria-label="Kept" /> : `${s.plan.index + 1}.`}</span>
-            <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-fg">{sqlPreview(s.plan.sql, 90)}</span>
+            <span className="w-8 shrink-0 text-right tabular-nums">{isCarried(s) ? <Pin size={11} className="ml-auto text-accent" aria-label="Kept" /> : s.part ? "" : `${s.plan.index + 1}.`}</span>
+            <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-fg">{s.part ? `${s.part.name} · ${s.part.connection}: ` : ""}{sqlPreview(s.plan.sql, 90)}</span>
             {s.result && <span className="shrink-0 text-[11px]">{formatCount(s.result.total_rows)} rows</span>}
             {!s.result && <span className="shrink-0 text-[11px]">{statusLabel(s)}</span>}
             {s.output && <span className="shrink-0 font-mono text-[10.5px]">{outputLabel(s.output)}</span>}

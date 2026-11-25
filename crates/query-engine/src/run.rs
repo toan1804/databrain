@@ -356,7 +356,7 @@ impl QueryEngine {
                     connection_id: out_id.clone(),
                     connection_name: out_name.clone(),
                     kind: out_kind,
-                    sql: stmt.sql().to_string(),
+                    sql: outcome.as_ref().ok().and_then(|o| o.ran_sql.clone()).unwrap_or_else(|| stmt.sql().to_string()),
                     tab_id: req.tab_id.clone(),
                     statement_index: stmt.index,
                     row_limit: limit,
@@ -752,7 +752,7 @@ impl QueryEngine {
                         notices.push(format!("Showing the first {} rows: writing the last of the result to disk failed ({e}).", i.total_rows));
                     }
                     unfinished.armed = false;
-                    return Ok(StatementOutcome { result: info, rows_affected: summary.rows_affected, notices, server_ms });
+                    return Ok(StatementOutcome { result: info, rows_affected: summary.rows_affected, notices, server_ms, ran_sql: None });
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -799,7 +799,7 @@ impl QueryEngine {
         // Wait for the connector to finish cancelling before the session is
         // reused; otherwise a server-side cancel could hit the next statement.
         let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;
-        Ok(StatementOutcome { result: info, rows_affected: None, notices, server_ms })
+        Ok(StatementOutcome { result: info, rows_affected: None, notices, server_ms, ran_sql: None })
     }
 }
 

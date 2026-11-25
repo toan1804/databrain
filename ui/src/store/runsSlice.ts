@@ -186,11 +186,14 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       const gone = new Set(handles);
       const runs = { ...s.runs };
       for (const [k, r] of Object.entries(runs)) {
-        const keptGone = r.kept?.some((x) => x.output && gone.has(x.output.handle));
-        if (!r.statements.some((x) => x.output && gone.has(x.output.handle)) && !keptGone) continue;
-        // A dropped kept result leaves the tab; the shown one moves on if it was that.
-        const kept = r.kept?.filter((x) => !(x.output && gone.has(x.output.handle)));
-        const shownGone = r.activeIndex !== null && r.activeIndex < 0 && !kept?.some((x) => x.plan.index === r.activeIndex);
+        const isGone = (x: StatementRun) => !!x.output && gone.has(x.output.handle);
+        const keptGone = r.kept?.some(isGone) || r.parts?.some(isGone);
+        if (!r.statements.some(isGone) && !keptGone) continue;
+        // A dropped kept result (or part) leaves the tab; the shown one moves on if it was that.
+        const kept = r.kept?.filter((x) => !isGone(x));
+        const parts = r.parts?.filter((x) => !isGone(x));
+        const shownGone =
+          r.activeIndex !== null && r.activeIndex < 0 && !kept?.some((x) => x.plan.index === r.activeIndex) && !parts?.some((x) => x.plan.index === r.activeIndex);
         // Only added results there, all gone: the tab is as before anything ran.
         if (!r.statements.length && !kept?.length && !r.running && r.kept?.every((x) => x.added)) {
           delete runs[k];
@@ -199,6 +202,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         runs[k] = {
           ...r,
           kept,
+          parts,
           activeIndex: shownGone ? (lastShown(r.statements) ?? kept?.at(-1)?.plan.index ?? null) : r.activeIndex,
           statements: r.statements.map((x) =>
             x.output && gone.has(x.output.handle) ? { ...x, output: undefined, result: undefined, notices: [...x.notices, `Output ${x.output.handle} was dropped. Run again to see rows.`] } : x,

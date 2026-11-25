@@ -45,6 +45,9 @@ pub(crate) struct PartPlan {
     pub pushed: Vec<String>,
     /// The part's SQL in the statement (byte range): error positions.
     pub span: Range<usize>,
+    /// `sent` is the text as written (no parameter changed it): a
+    /// server's position in it is one in the statement.
+    pub as_written: bool,
 }
 
 /// A combined statement, checked: its parts and how the outer query reads them.
@@ -104,6 +107,23 @@ impl QueryEngine {
         if !looks_combined(text) {
             return Ok(None);
         }
+        // Who may run one is decided before any connection is looked up: a
+        // refusal names none (the assistant sees no connection's name).
+        let elsewhere = match origin {
+            Origin::User | Origin::Cli => {
+                let notebook = matches!(SessionRole::parse(session_key), SessionRole::Notebook { .. });
+                (notebook || session_key.starts_with("dash:")).then_some(if notebook { "a notebook" } else { "a dashboard" })
+            }
+            o => Some(o.as_str()),
+        };
+        if let Some(from) = elsewhere
+            && parse_combined(text, &mut |_| Ok(ConnectorKind::Postgres)).is_ok_and(|c| c.is_some())
+        {
+            return Err(EngineError::new(
+                "unsupported",
+                format!("A query with parts on other connections (@connection) runs from a query tab or `dbr` for now, not from {from}"),
+            ));
+        }
         let all = self.workspace.list_connections()?;
         let mut found: HashMap<ConnectionRef, ConnectionProfile> = HashMap::new();
         let parsed = parse_combined(text, &mut |r| {
@@ -116,11 +136,8 @@ impl QueryEngine {
         })
         .map_err(|e| refused(text, e.position, e.message))?;
         let Some(parsed) = parsed else { return Ok(None) };
-        if !matches!(origin, Origin::User | Origin::Cli) {
-            return Err(EngineError::new(
-                "unsupported",
-                format!("A query with parts on other connections (@connection) runs from a query tab or `dbr` for now, not from {}", origin.as_str()),
-            ));
+        if elsewhere.is_some() {
+            return Err(EngineError::new("unsupported", "A query with parts on other connections (@connection) runs from a query tab or `dbr` for now"));
         }
         let mut missing: Vec<String> = Vec::new();
         let mut parts = Vec::with_capacity(parsed.parts.len());
@@ -152,6 +169,7 @@ impl QueryEngine {
                     format!("{on} runs on a session of its own, which wouldn't see this tab's open transaction: commit or roll it back first"),
                 ));
             }
+            let as_written = sent.sql() == p.sql;
             parts.push(PartPlan {
                 name: p.name.clone(),
                 connection_id: profile.id.clone(),
@@ -160,6 +178,7 @@ impl QueryEngine {
                 sent,
                 pushed: Vec::new(),
                 span: p.sql_span.clone(),
+                as_written,
             });
         }
         let plan = CombinedPlan { parts, parsed, text: text.to_string() };
@@ -278,9 +297,21 @@ impl QueryEngine {
             return Err(EngineError::new("invalid", "The query that reads the parts must only read (it runs in DuckDB)"));
         }
         let mut on_results = req.clone();
-        on_results.connection_id = results.id;
+        on_results.connection_id = results.id.clone();
+        let ran = outer.sql().to_string();
         let outer_stmt = PlannedStatement { index: stmt.index, start: stmt.start, end: stmt.end, checked: outer, combined: false };
-        self.run_statement(job_id, &on_results, &outer_stmt, limit, cancel, waiter, None).await
+        match self.run_statement(job_id, &on_results, &outer_stmt, limit, cancel, waiter, None).await {
+            // What ran, reading each part as `results.<handle>`: the output's
+            // SQL, so whatever reads the join later (the assistant's policy
+            // and masks, an export of every row) traces it to the parts.
+            Ok(o) => Ok(StatementOutcome { ran_sql: Some(ran), ..o }),
+            Err(e) => {
+                if e.kind == "connection" || e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED) {
+                    self.drop_session(&results.id, req.session_key());
+                }
+                Err(e)
+            }
+        }
     }
 
     /// One part: read whole on its connection's session for this tab
@@ -336,7 +367,10 @@ impl QueryEngine {
                 statement_index: run.index,
                 row_limit: None,
                 origin: req.origin,
-                session_key: key.clone(),
+                // Loading every row later takes the tab's key, which the
+                // tab's runs hold too (never the part's session, which a
+                // run of the tab may be using).
+                session_key: req.session_key().to_string(),
             })
         });
         let (status, rows, error) = match &outcome {
@@ -371,7 +405,7 @@ fn part_error(text: &str, p: &PartPlan, e: EngineError) -> EngineError {
     let before = text.get(..p.span.start).map_or(0, |t| t.chars().count()) as u32;
     EngineError {
         message: format!("Part `{}` (on \"{}\"): {}", p.name, p.connection_name, e.message),
-        position: Some(e.position.map_or(before + 1, |pos| before + pos)),
+        position: Some(e.position.filter(|_| p.as_written).map_or(before + 1, |pos| before + pos)),
         ..e
     }
 }

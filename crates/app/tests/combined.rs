@@ -234,3 +234,95 @@ async fn a_part_on_the_tabs_connection_waits_for_its_transaction() {
     let out = s.run(req(&s.sales, "t6", JOIN)).await.unwrap();
     assert_eq!(s.rows(&out[0]), vec!["Ann|10.0", "Bo|7.0", "Cy|1.0"]);
 }
+
+/// The join's output is the SQL that ran, reading each part as
+/// `results.<handle>`: what reads the join later (the assistant's policy and
+/// masks, which follow `results.<name>` to the parts' connections; an export
+/// of every row) traces it to the parts.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_joins_output_reads_the_parts_outputs() {
+    let s = setup().await;
+    let out = s.run(req(&s.sales, "t8", JOIN)).await.unwrap();
+    let join = s.st.engine.outputs().list().into_iter().find(|o| o.result_id == out[0].result.as_ref().unwrap().id).unwrap();
+    assert!(!join.sql.contains('@') && join.sql.contains("results.r"), "{}", join.sql);
+    let inputs = s.st.engine.outputs().referenced(&join.sql);
+    let mut conns: Vec<&str> = inputs.iter().map(|o| o.connection_name.as_str()).collect();
+    conns.sort();
+    assert_eq!(conns, ["Sales DB", "crm"]);
+    // Every row again, from the outputs (a cut join can be exported whole).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("j.csv");
+    let n = databrain_app::api::export_full_result(
+        &s.st,
+        &out[0].result.as_ref().unwrap().id,
+        databrain_export::ExportOptions::new(databrain_export::ExportFormat::Csv),
+        path.to_string_lossy().into_owned(),
+        "x1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn who_and_where_may_run_one() {
+    let s = setup().await;
+    // Not the assistant, MCP or a job: refused before any connection is
+    // looked up, so the refusal names none.
+    for origin in [databrain_workspace::Origin::Ai, databrain_workspace::Origin::Mcp, databrain_workspace::Origin::Job] {
+        let mut r = req(&s.sales, "t9", "with a as (@cmr select 1) select * from a");
+        r.origin = origin;
+        let e = s.run(r).await.unwrap_err();
+        assert_eq!(e.kind, "unsupported", "{origin:?}");
+        assert!(!e.message.contains("crm") && !e.message.contains("Sales"), "{}", e.message);
+    }
+    // Not in a notebook or a dashboard yet.
+    for key in ["nb:n1:c1", "dash:d1:c1"] {
+        let e = s.run(req(&s.sales, key, JOIN)).await.unwrap_err();
+        assert_eq!(e.kind, "unsupported", "{key}");
+    }
+    // The assistant's ordinary WITH query with `@` in it is no part of this.
+    let mut r = req(&s.st.engine.results_connection().unwrap().id, "t9", "with a as (select 1 as x) select x from a where '@pg' <> ''");
+    r.origin = databrain_workspace::Origin::Ai;
+    assert!(s.run(r).await.unwrap()[0].error.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outer_query_and_every_part_only_read() {
+    let s = setup().await;
+    for (sql, why) in [
+        ("with a as (@crm select 1 as x) select * from a; copy (select 1) to '/tmp/x.csv'", "statement"),
+        ("with a as (@crm select 1 as x) copy (select * from a) to '/tmp/x.csv'", "must only read"),
+        ("with a as (@\"Sales DB\" vacuum) select * from a", "must be a query that only reads"),
+        ("with a as (@crm select 1; delete from customers) select * from a", "must be a query that only reads"),
+    ] {
+        match s.run(req(&s.sales, "t10", sql)).await {
+            Err(e) => assert!(e.message.contains(why) || e.kind == "invalid", "{sql}: {e:?}"),
+            Ok(out) => assert!(out.iter().any(|o| o.error.is_some()), "{sql} ran"),
+        }
+    }
+    let out = s.ok(&s.crm, "select count(*) from customers").await;
+    assert_eq!(s.rows(&out[0]), vec!["3"]);
+    // A production connection's reads need no confirmation, as in a tab.
+    let mut p = s.st.workspace.get_connection(&s.sales).unwrap();
+    p.env = EnvTag::Prod;
+    s.st.workspace.save_connection(p).unwrap();
+    let mut r = req(&s.crm, "t10", JOIN);
+    r.confirmed = false;
+    assert_eq!(s.rows(&s.run(r).await.unwrap()[0]), vec!["Ann|10.0", "Bo|7.0"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn many_parts_and_a_transaction_opened_in_the_same_script() {
+    let s = setup().await;
+    // More parts than run at once.
+    let parts: Vec<String> = (0..6).map(|i| format!("p{i} as (@crm select {i} as n)")).collect();
+    let union = (0..6).map(|i| format!("select n from p{i}")).collect::<Vec<_>>().join(" union all ");
+    let sql = format!("with {} select sum(n) from ({union})", parts.join(", "));
+    assert_eq!(s.rows(&s.run(req(&s.sales, "t11", &sql)).await.unwrap()[0]), vec!["15"]);
+    // BEGIN in the same run: the part is refused when it comes to run.
+    let out = s.run(req(&s.sales, "t12", &format!("begin; {JOIN}"))).await.unwrap();
+    let e = out[1].error.as_ref().expect("refused");
+    assert!(e.message.contains("open transaction"), "{e:?}");
+    s.run(req(&s.sales, "t12", "rollback")).await.unwrap();
+}

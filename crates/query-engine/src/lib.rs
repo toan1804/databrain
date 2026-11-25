@@ -345,6 +345,9 @@ struct StatementOutcome {
     rows_affected: Option<u64>,
     notices: Vec<String>,
     server_ms: Option<u64>,
+    /// What ran when it isn't the statement's own text (a combined query:
+    /// its outer query over the parts' outputs), for its output.
+    ran_sql: Option<String>,
 }
 
 #[cfg(test)]
