@@ -134,7 +134,13 @@ impl Connector for MssqlConnector {
     /// SQL Server takes a new password for an expired one (18487) or one
     /// that must be changed (18488) only as part of the sign-in: LOGIN7's
     /// ChangePassword (vendor/tiberius/DATABRAIN.md). SQL Server logins only:
-    /// a Windows or Entra ID password is changed with their own tools.
+    /// a Windows or Entra ID password is changed with their own tools. It
+    /// signs in to the login's default database: a connection's database
+    /// it can't open would fail the sign-in after the server had changed
+    /// the password, which then wouldn't be saved. It is never sent without
+    /// encryption unless the connection's SSL mode is Disable: under Prefer
+    /// a server that can't encrypt is refused (the new password is the one
+    /// kept, and the login's obfuscation is trivially reversed).
     async fn connect_changing_password(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>, new: &str) -> Result<()> {
         match creds.get().await? {
             databrain_auth::Credential::Password { user, .. } if !user.contains('\\') => {}
@@ -143,11 +149,21 @@ impl Connector for MssqlConnector {
             }
             _ => return Err(ConnectorError::unsupported("Only a SQL Server login's password can be changed from DataBrain")),
         }
-        let (mut c, use_browser) = tds_config(cfg);
+        let mut cfg = cfg.clone();
+        cfg.database = None;
+        let (mut c, use_browser) = tds_config(&cfg);
         c.new_password(new);
-        let mut opener = Opener { config: c, use_browser, creds };
-        drop(open_or_plain(&mut opener, cfg.ssl_mode).await?);
-        Ok(())
+        let opener = Opener { config: c, use_browser, creds };
+        match opener.open().await {
+            Ok(conn) => {
+                drop(conn);
+                Ok(())
+            }
+            Err(e) if error::prefer_falls_back(cfg.ssl_mode, &e) => Err(ConnectorError::connection(
+                "The server can't encrypt the connection, so the new password isn't sent: set the connection's SSL mode to Disable to send it anyway",
+            )),
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -787,7 +787,11 @@ mod tests {
             MssqlConnector.connect_changing_password(&cfg, creds("kb_exp", "Wrong_pw_9x!"), "New'pw_2x!").await.is_err(),
             "the current password is checked"
         );
-        MssqlConnector.connect_changing_password(&cfg, creds("kb_exp", "Old_pw_1x!"), "New'pw_2x!").await.unwrap();
+        // Through a connection naming a database the login can't open: the
+        // change signs in to its default database.
+        let mut elsewhere = cfg.clone();
+        elsewhere.database = Some("db_kb_none".into());
+        MssqlConnector.connect_changing_password(&elsewhere, creds("kb_exp", "Old_pw_1x!"), "New'pw_2x!").await.unwrap();
         assert!(MssqlConnector.connect(&cfg, creds("kb_exp", "New'pw_2x!")).await.is_ok(), "the new password signs in");
         assert!(MssqlConnector.connect(&cfg, creds("kb_exp", "Old_pw_1x!")).await.is_err(), "the old one no longer does");
         // A Windows login is refused before anything is sent.
