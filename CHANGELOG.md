@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **An expired SQL Server password can be changed in DataBrain:** the change-password dialog (which opens by itself when the server refuses an expired password, error 18487, or one that must be changed, 18488) now sets the new one as DataBrain signs in, the only way SQL Server takes it. SQL Server logins only: a Windows or Entra ID password is changed with their own tools. Through a small addition to the tiberius driver (`vendor/tiberius`).
+
 ## 0.5.3 - 2026-11-25
 
 ### Added

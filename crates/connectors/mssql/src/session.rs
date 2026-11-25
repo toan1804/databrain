@@ -752,6 +752,58 @@ mod tests {
         }
     }
 
+    /// Live: a login whose password must be changed (MUST_CHANGE: 18488,
+    /// as an expired one, 18487) is refused, and gets a new password as it
+    /// signs in (LOGIN7 ChangePassword): with its current one only.
+    #[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_change_expired_password() {
+        let Ok(host) = std::env::var("DATABRAIN_MSSQL_HOST") else {
+            panic!("live test: DATABRAIN_MSSQL_HOST not set (run with --ignored)");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let cfg_for = |user: &str| {
+            let mut cfg = ConnectionConfig::new(ConnectorKind::Mssql, AuthMethod::Password { user: user.into() });
+            cfg.host = Some(host.clone());
+            cfg.port = std::env::var("DATABRAIN_MSSQL_PORT").ok().and_then(|p| p.parse().ok());
+            if std::env::var("DATABRAIN_MSSQL_SSL").as_deref() == Ok("disable") {
+                cfg.ssl_mode = databrain_connector_core::SslMode::Disable;
+            }
+            cfg.options.insert("trust_cert".into(), "true".into());
+            cfg
+        };
+        let creds = |user: &str, pw: &str| -> Arc<dyn databrain_auth::CredentialSource> {
+            Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: user.into() }, Some(secrecy::SecretString::from(pw.to_string()))))
+        };
+        let admin_user = std::env::var("DATABRAIN_MSSQL_USER").unwrap_or_else(|_| "sa".into());
+        let admin =
+            MssqlConnector.connect(&cfg_for(&admin_user), creds(&admin_user, &std::env::var("DATABRAIN_MSSQL_PASSWORD").unwrap_or_default())).await.unwrap();
+        let _ = admin.run_internal("IF SUSER_ID('kb_exp') IS NOT NULL DROP LOGIN kb_exp").await;
+        admin.run_internal("CREATE LOGIN kb_exp WITH PASSWORD = 'Old_pw_1x!' MUST_CHANGE, CHECK_EXPIRATION = ON, CHECK_POLICY = ON").await.unwrap();
+        let cfg = cfg_for("kb_exp");
+        let Err(e) = MssqlConnector.connect(&cfg, creds("kb_exp", "Old_pw_1x!")).await else { panic!("an expired password signed in") };
+        assert!(e.is_password_expired(), "{e:?}");
+        assert!(
+            MssqlConnector.connect_changing_password(&cfg, creds("kb_exp", "Wrong_pw_9x!"), "New'pw_2x!").await.is_err(),
+            "the current password is checked"
+        );
+        MssqlConnector.connect_changing_password(&cfg, creds("kb_exp", "Old_pw_1x!"), "New'pw_2x!").await.unwrap();
+        assert!(MssqlConnector.connect(&cfg, creds("kb_exp", "New'pw_2x!")).await.is_ok(), "the new password signs in");
+        assert!(MssqlConnector.connect(&cfg, creds("kb_exp", "Old_pw_1x!")).await.is_err(), "the old one no longer does");
+        // A Windows login is refused before anything is sent.
+        let w = MssqlConnector.connect_changing_password(&cfg_for("DOM\\u"), creds("DOM\\u", "x"), "y").await.expect_err("refused");
+        assert_eq!(w.kind, databrain_connector_core::ErrorKind::Unsupported, "{w:?}");
+        let mut tries = 0;
+        while let Err(e) = admin.run_internal("DROP LOGIN kb_exp").await {
+            tries += 1;
+            assert!(tries < 20, "{e:?}");
+            let _ = admin
+                .run_internal("DECLARE @k nvarchar(max) = N''; SELECT @k += N'KILL ' + CAST(session_id AS nvarchar(10)) + N'; ' FROM sys.dm_exec_sessions WHERE login_name = N'kb_exp'; EXEC (@k)")
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// Live: DATABRAIN_MSSQL_HOST, _USER, _PASSWORD (e.g. the mcr.microsoft.com/mssql/server image).
     #[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
     #[tokio::test]
