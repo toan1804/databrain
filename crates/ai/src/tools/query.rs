@@ -225,7 +225,18 @@ impl ToolContext {
             }
         }
         if depth < 5 && src.config.kind == databrain_connector_core::ConnectorKind::Duckdb {
-            for input in self.engine.outputs().referenced(&o.sql) {
+            // An input that is no longer kept (dropped, not saved at quit,
+            // trimmed) can't be checked: its rows' connection is unknown, so
+            // the output isn't shared (a combined query's join reads its parts so).
+            let names = databrain_connector_core::external::referenced_results(&o.sql);
+            let inputs = self.engine.outputs().referenced(&o.sql);
+            if inputs.len() < names.len() {
+                return Err(AiError::Policy(format!(
+                    "{} is built on a result that is no longer kept, so where its rows came from can't be checked; run its query again",
+                    o.handle
+                )));
+            }
+            for input in inputs {
                 if input.result_id != o.result_id {
                     self.check_output_tables(&input, depth + 1)?;
                 }

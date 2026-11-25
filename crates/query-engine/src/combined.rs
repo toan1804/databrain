@@ -118,13 +118,17 @@ impl QueryEngine {
             }
             o => Some(o.as_str()),
         };
-        if let Some(from) = elsewhere
-            && parse_combined(text, &mut |_| Ok(ConnectorKind::Postgres)).is_ok_and(|c| c.is_some())
-        {
-            return Err(EngineError::new(
-                "unsupported",
-                format!("A query with parts on other connections (@connection) runs from a query tab or `dbr` for now, not from {from}"),
-            ));
+        // A stand-in for every name, so the answer never depends on which
+        // connections exist: an error comes only once a part was found, so
+        // it is a part too. Not one: nothing is looked up.
+        if let Some(from) = elsewhere {
+            return match parse_combined(text, &mut |_| Ok(ConnectorKind::Postgres)) {
+                Ok(None) => Ok(None),
+                _ => Err(EngineError::new(
+                    "unsupported",
+                    format!("A query with parts on other connections (@connection) runs from a query tab or `dbr` for now, not from {from}"),
+                )),
+            };
         }
         let all = self.workspace.list_connections()?;
         let mut found: HashMap<ConnectionRef, ConnectionProfile> = HashMap::new();
@@ -138,8 +142,11 @@ impl QueryEngine {
         })
         .map_err(|e| refused(text, e.position, e.message))?;
         let Some(parsed) = parsed else { return Ok(None) };
-        if elsewhere.is_some() {
-            return Err(EngineError::new("unsupported", "A query with parts on other connections (@connection) runs from a query tab or `dbr` for now"));
+        // Two parts of one name would share a session (and DuckDB refuses the duplicate).
+        for (k, p) in parsed.parts.iter().enumerate() {
+            if parsed.parts[..k].iter().any(|q| q.name.to_lowercase() == p.name.to_lowercase()) {
+                return Err(refused(text, p.body_span.start, format!("Two parts are named `{}`: give each its own name", p.name)));
+            }
         }
         let mut missing: Vec<String> = Vec::new();
         let mut parts = Vec::with_capacity(parsed.parts.len());
@@ -220,14 +227,26 @@ impl QueryEngine {
     /// as a read on its connection; a part whose types aren't known, or
     /// whose sent SQL isn't a read there, runs as written.
     async fn push_down(self: &Arc<Self>, job_id: &str, req: &RunRequest, plan: &mut CombinedPlan, cancel: &CancellationToken) {
-        let mut types: Vec<Option<Vec<(String, crate::pushdown::TypeClass)>>> = Vec::with_capacity(plan.parts.len());
-        for p in &plan.parts {
-            types.push(self.part_types(job_id, req, p, cancel).await);
-        }
         let outer = match Checked::new(plan.outer(&vec!["r0".to_string(); plan.parts.len()]), ConnectorKind::Duckdb).bind(ConnectorKind::Duckdb, &req.params) {
             Ok(o) => o.sql().to_string(),
             Err(_) => return,
         };
+        // Nothing the outer query could push: no part is asked for its types.
+        if !crate::pushdown::may_push(&outer) {
+            return;
+        }
+        // The parts' types, asked for at once.
+        let mut asks = tokio::task::JoinSet::new();
+        for (i, p) in plan.parts.iter().enumerate() {
+            let (engine, job, req, p, cancel) = (self.clone(), job_id.to_string(), req.clone(), p.clone(), cancel.clone());
+            asks.spawn(async move { (i, engine.part_types(&job, &req, &p, &cancel).await) });
+        }
+        let mut types: Vec<Option<Vec<(String, crate::pushdown::TypeClass)>>> = vec![None; plan.parts.len()];
+        while let Some(done) = asks.join_next().await {
+            if let Ok((i, t)) = done {
+                types[i] = t;
+            }
+        }
         let inputs: Vec<crate::pushdown::PartInput> = plan
             .parts
             .iter()
@@ -284,7 +303,7 @@ impl QueryEngine {
             schema
                 .fields()
                 .iter()
-                .map(|f| (f.name().clone(), crate::pushdown::TypeClass::of_column(f.data_type(), db.get(f.name().as_str()).copied().flatten())))
+                .map(|f| (f.name().clone(), crate::pushdown::TypeClass::of_field(f, db.get(f.name().as_str()).copied().flatten(), p.kind)))
                 .collect(),
         )
     }

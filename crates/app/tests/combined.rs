@@ -271,12 +271,24 @@ async fn who_and_where_may_run_one() {
     // Not the assistant, MCP or a job: refused before any connection is
     // looked up, so the refusal names none.
     for origin in [databrain_workspace::Origin::Ai, databrain_workspace::Origin::Mcp, databrain_workspace::Origin::Job] {
-        let mut r = req(&s.sales, "t9", "with a as (@cmr select 1) select * from a");
-        r.origin = origin;
-        let e = s.run(r).await.unwrap_err();
-        assert_eq!(e.kind, "unsupported", "{origin:?}");
-        assert!(!e.message.contains("crm") && !e.message.contains("Sales"), "{}", e.message);
+        // A part that doesn't parse (an unclosed parenthesis) answers the
+        // same, whether its name is a connection or not.
+        for sql in [
+            "with a as (@cmr select 1) select * from a",
+            "with a as (@cmr select (1) select * from a",
+            "with a as (@crm select (1) select * from a",
+            "with a as (@nothing_like_it select (1) select * from a",
+        ] {
+            let mut r = req(&s.sales, "t9", sql);
+            r.origin = origin;
+            let e = s.run(r).await.unwrap_err();
+            assert_eq!(e.kind, "unsupported", "{origin:?} {sql}");
+            assert!(!e.message.contains("crm") && !e.message.contains("Sales") && !e.message.contains("parenthesis"), "{}", e.message);
+        }
     }
+    // Two parts of one name.
+    let e = s.run(req(&s.sales, "t9", "with a as (@crm select 1), A as (@crm select 2) select * from a")).await.unwrap_err();
+    assert!(e.message.contains("Two parts are named `A`"), "{}", e.message);
     // Not in a notebook or a dashboard yet.
     for key in ["nb:n1:c1", "dash:d1:c1"] {
         let e = s.run(req(&s.sales, key, JOIN)).await.unwrap_err();

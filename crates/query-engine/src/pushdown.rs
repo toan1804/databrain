@@ -60,15 +60,31 @@ impl TypeClass {
         }
     }
 
-    /// A column's class from its Arrow type and, for text, the server's type
+    /// A column's class from its Arrow field and, for text, the server's type
     /// name: drivers deliver other types as text too (json, uuid, enums,
     /// numerics), where the server's `=` errors or compares otherwise, so
-    /// text is text only when the server says it is characters.
-    pub(crate) fn of_column(t: &DataType, db_type: Option<&str>) -> TypeClass {
+    /// text is text only when the server says it is characters. An exact
+    /// decimal kept as text is a decimal (DuckDB reads it as `DECIMAL`,
+    /// `display::is_decimal_text`).
+    pub(crate) fn of_field(f: &databrain_connector_core::arrow::datatypes::Field, db_type: Option<&str>, kind: ConnectorKind) -> TypeClass {
+        // Not money: shown with its currency, it may stay text in DuckDB.
+        let money = db_type.is_some_and(|t| t.trim().to_ascii_lowercase().contains("money"));
+        if databrain_result_store::display::is_decimal_text(f) && !money {
+            return TypeClass::Decimal;
+        }
+        Self::of_column(f.data_type(), db_type, kind)
+    }
+
+    /// [`Self::of_field`] from the type alone.
+    pub(crate) fn of_column(t: &DataType, db_type: Option<&str>, kind: ConnectorKind) -> TypeClass {
         match TypeClass::of(t) {
             TypeClass::Text => {
                 let name = db_type.unwrap_or("").trim().to_ascii_lowercase();
                 let base = name.split(['(', ' ']).next().unwrap_or("");
+                // SQL Server's `text` / `ntext` refuse `=`.
+                if kind == ConnectorKind::Mssql && matches!(base, "text" | "ntext") {
+                    return TypeClass::Other;
+                }
                 let chars = matches!(
                     base,
                     "text"
@@ -202,15 +218,10 @@ pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
     // A use the scan can't tie to columns (a struct field, a longer path, a
     // relation's whole row, DuckDB's COLUMNS(…), a qualified wildcard
     // argument, a USING or NATURAL join): every part keeps every column.
-    let mut unsure = sel.from.iter().flat_map(|t| &t.joins).any(|j| match &j.join_operator {
-        JoinOperator::Join(c)
-        | JoinOperator::Inner(c)
-        | JoinOperator::Left(c)
-        | JoinOperator::LeftOuter(c)
-        | JoinOperator::Right(c)
-        | JoinOperator::RightOuter(c)
-        | JoinOperator::FullOuter(c) => matches!(c, JoinConstraint::Using(_) | JoinConstraint::Natural),
-        _ => false,
+    // Every kind of join (semi, anti and asof too); one not listed: unsure.
+    let mut unsure = sel.from.iter().flat_map(|t| &t.joins).any(|j| match join_constraint(&j.join_operator) {
+        Some(c) => matches!(c, JoinConstraint::Using(_) | JoinConstraint::Natural),
+        None => !matches!(j.join_operator, JoinOperator::CrossApply | JoinOperator::OuterApply),
     });
     let _ = sqlparser::ast::visit_expressions(&q, |e| {
         let path: Option<Vec<&Ident>> = match e {
@@ -413,7 +424,12 @@ impl Ctx<'_> {
                     _ => return None,
                 };
                 let ok = match t {
-                    TypeClass::Integer | TypeClass::Decimal | TypeClass::Bool | TypeClass::Date | TypeClass::Timestamp => true,
+                    TypeClass::Integer | TypeClass::Decimal | TypeClass::Bool | TypeClass::Date => true,
+                    // Values finer than a microsecond (datetime2, TIMESTAMP(9)) arrive cut to
+                    // one, so DuckDB sees them a little earlier than the server: `>`, `>=`,
+                    // `<` and `<>` (with a literal to the microsecond) keep what DuckDB keeps,
+                    // `=` and `<=` may not.
+                    TypeClass::Timestamp => matches!(sym, ">" | ">=" | "<" | "<>") && !negated,
                     TypeClass::Text => sym == "=",
                     // A single-precision column compares its stored value, not the one that arrives.
                     TypeClass::Float | TypeClass::Other => false,
@@ -428,7 +444,8 @@ impl Ctx<'_> {
                 let neg = *not_in || negated;
                 let ok = match t {
                     TypeClass::Text => !neg,
-                    TypeClass::Float | TypeClass::Other => false,
+                    // `IN` is `=` (see the comparison above).
+                    TypeClass::Float | TypeClass::Other | TypeClass::Timestamp => false,
                     _ => !neg || t.negation_safe(),
                 };
                 if !ok || list.is_empty() {
@@ -439,8 +456,9 @@ impl Ctx<'_> {
             }
             Expr::Between { expr, negated: not_between, low, high } => {
                 let (i, name, t) = col(expr)?;
-                // Numbers and dates only (negated too): no text, no floats.
-                let ok = matches!(t, TypeClass::Integer | TypeClass::Decimal | TypeClass::Date | TypeClass::Timestamp);
+                // Numbers and dates only (negated too): no text, no floats, no
+                // timestamps (its upper bound is `<=`, see the comparison above).
+                let ok = matches!(t, TypeClass::Integer | TypeClass::Decimal | TypeClass::Date);
                 if !ok {
                     return None;
                 }
@@ -484,6 +502,8 @@ fn literal(v: &Expr, t: TypeClass, kind: ConnectorKind) -> Option<String> {
                 ConnectorKind::Mssql | ConnectorKind::Oracle => None,
                 _ => Some(if *b { "TRUE" } else { "FALSE" }.into()),
             },
+            // MySQL reads a backslash by its sql_mode (NO_BACKSLASH_ESCAPES), which isn't known here.
+            (Value::SingleQuotedString(s), TypeClass::Text) if kind == ConnectorKind::Mysql && s.contains('\\') => None,
             (Value::SingleQuotedString(s), TypeClass::Text) => Some(match kind {
                 // National text: outside the database's code page a plain literal loses characters.
                 ConnectorKind::Mssql => format!("N{}", quote_string(s, kind)),
@@ -519,7 +539,9 @@ fn typed(s: &str, t: TypeClass, kind: ConnectorKind) -> Option<String> {
             date && (b.len() == 10 || (b.len() >= 19 && matches!(b[10], b' ' | b'T') && b[11..].iter().all(|c| c.is_ascii_digit() || matches!(c, b':' | b'.'))))
         }
     };
-    if !ok {
+    // To the microsecond at most: what arrives is (see the comparison rules).
+    let fraction = s.split_once('.').map_or(0, |(_, f)| f.len());
+    if !ok || fraction > 6 {
         return None;
     }
     let mut s = s.replace('T', " ");
@@ -570,6 +592,17 @@ fn wrap(p: &PartInput, cols: Option<&[String]>, terms: &[String], limit: Option<
     Some(out)
 }
 
+/// Whether the outer query could push anything at all (a column it doesn't
+/// read, a term, a limit): the parts' types are asked for only then.
+pub(crate) fn may_push(outer: &str) -> bool {
+    let Ok(stmts) = Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, outer) else { return false };
+    let [Statement::Query(q)] = stmts.as_slice() else { return false };
+    let SetExpr::Select(sel) = q.body.as_ref() else { return false };
+    let all = sel.projection.iter().all(|i| matches!(i, SelectItem::Wildcard(_)));
+    let on = sel.from.iter().flat_map(|t| &t.joins).any(|j| matches!(join_constraint(&j.join_operator), Some(JoinConstraint::On(_))));
+    !all || sel.selection.is_some() || on || q.limit_clause.is_some()
+}
+
 /// A query that returns `sql`'s columns and no row (its types for
 /// [`plan`]), or `None` when it can't be wrapped.
 pub(crate) fn describe_sql(sql: &str, kind: ConnectorKind) -> Option<String> {
@@ -583,7 +616,8 @@ pub(crate) fn describe_sql(sql: &str, kind: ConnectorKind) -> Option<String> {
 fn wrappable(sql: &str, kind: ConnectorKind) -> bool {
     let Ok(stmts) = Parser::parse_sql(databrain_connector_core::sql::dialect_for(kind).as_ref(), sql) else { return false };
     let [Statement::Query(q)] = stmts.as_slice() else { return false };
-    if q.for_clause.is_some() || !q.locks.is_empty() {
+    let into = matches!(q.body.as_ref(), SetExpr::Select(s) if s.into.is_some());
+    if q.for_clause.is_some() || !q.locks.is_empty() || into {
         return false;
     }
     if kind == ConnectorKind::Mssql {
@@ -599,15 +633,20 @@ fn wrappable(sql: &str, kind: ConnectorKind) -> bool {
 fn relations(sel: &Select, parts: &[PartInput]) -> Vec<Rel> {
     let rel = |f: &TableFactor| -> Rel {
         match f {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table { name, alias, sample, version, args, .. } => {
                 let base = match name.0.as_slice() {
                     [ObjectNamePart::Identifier(id)] => Some(id),
                     _ => None,
                 };
+                // Read as it stands only: a sample (TABLESAMPLE), a version or
+                // arguments change which rows it gives, so nothing is pushed below them.
+                let plain = sample.is_none() && version.is_none() && args.is_none();
                 Rel {
                     alias: alias.as_ref().map(|a| a.name.value.clone()).or_else(|| base.map(|b| b.value.clone())).unwrap_or_default(),
                     // A table alias with column names renames the part's columns: not read here.
-                    part: base.filter(|_| alias.as_ref().is_none_or(|a| a.columns.is_empty())).and_then(|b| parts.iter().position(|p| same_name(b, p.name))),
+                    part: base
+                        .filter(|_| plain && alias.as_ref().is_none_or(|a| a.columns.is_empty()))
+                        .and_then(|b| parts.iter().position(|p| same_name(b, p.name))),
                     nullable: false,
                 }
             }
@@ -635,6 +674,28 @@ fn relations(sel: &Select, parts: &[PartInput]) -> Vec<Rel> {
         }
     }
     out
+}
+
+/// A join's constraint (`ON`, `USING`, `NATURAL`), whatever its kind.
+fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+    match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c) => Some(c),
+        JoinOperator::AsOf { constraint, .. } => Some(constraint),
+        _ => None,
+    }
 }
 
 fn and_terms<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -891,12 +952,69 @@ mod tests {
     fn text_only_for_character_types() {
         use databrain_connector_core::arrow::datatypes::DataType::Utf8;
         for t in ["text", "character varying(20)", "VARCHAR2(50)", "nvarchar(max)", "STRING", "varchar"] {
-            assert_eq!(TypeClass::of_column(&Utf8, Some(t)), Text, "{t}");
+            assert_eq!(TypeClass::of_column(&Utf8, Some(t), Postgres), Text, "{t}");
         }
         for t in [Some("json"), Some("uuid"), Some("numeric(10,2)"), Some("enum"), Some("clob"), Some("uniqueidentifier"), None] {
-            assert_eq!(TypeClass::of_column(&Utf8, t), Other, "{t:?}");
+            assert_eq!(TypeClass::of_column(&Utf8, t, Postgres), Other, "{t:?}");
         }
-        assert_eq!(TypeClass::of_column(&DataType::Int64, None), Integer);
+        assert_eq!(TypeClass::of_column(&DataType::Int64, None, Postgres), Integer);
+        // SQL Server's text and ntext refuse `=`, and a type the connector
+        // doesn't know has a name of its own.
+        for t in ["text", "ntext", "sql_variant"] {
+            assert_eq!(TypeClass::of_column(&Utf8, Some(t), Mssql), Other, "{t}");
+        }
+        assert_eq!(TypeClass::of_column(&Utf8, Some("nvarchar"), Mssql), Text);
+        // An exact decimal kept as text (as PostgreSQL, MySQL, SQL Server and
+        // Oracle deliver them) is a decimal: DuckDB reads it as one.
+        let field = |t: &str| {
+            databrain_connector_core::arrow::datatypes::Field::new("total", Utf8, true)
+                .with_metadata([(databrain_connector_core::value::META_DB_TYPE.to_string(), t.to_string())].into())
+        };
+        assert_eq!(TypeClass::of_field(&field("numeric(12,2)"), Some("numeric(12,2)"), Postgres), Decimal);
+        assert_eq!(TypeClass::of_field(&field("NUMBER(10,2)"), Some("NUMBER(10,2)"), Oracle), Decimal);
+        assert_eq!(TypeClass::of_field(&field("money"), Some("money"), Postgres), Other);
+    }
+
+    /// Shapes the planner leaves alone: semi and anti joins with USING, a
+    /// sample, timestamps' `=` and `<=`, MySQL backslashes, SELECT INTO.
+    #[test]
+    fn shapes_left_as_written() {
+        let o = orders();
+        let c = cols(&[("id", Integer), ("name", Text)]);
+        let two = [("o", Postgres, "select * from orders", Some(o.as_slice())), ("c", Mssql, "select * from customers", Some(c.as_slice()))];
+        for q in [
+            "with o as (select * from results.r1), c as (select * from results.r2) select o.total from o semi join c using (id)",
+            "with o as (select * from results.r1), c as (select * from results.r2) select o.total from o anti join c using (id)",
+        ] {
+            let p = run(q, &two);
+            assert!(p.iter().flatten().all(|x| !x.what.iter().any(|w| w.starts_with("columns"))), "{q}: {p:?}");
+        }
+        let one = [("o", Postgres, "select * from orders", Some(o.as_slice()))];
+        assert_eq!(run("with o as (select * from results.r1) select id from o tablesample 10 percent limit 5", &one), vec![None]);
+        let ts = cols(&[("id", Integer), ("created", Timestamp)]);
+        let t = [("o", Mssql, "select * from t", Some(ts.as_slice()))];
+        let term = |w: &str| run(&format!("with o as (select * from results.r1) select * from o where {w}"), &t)[0].clone();
+        for w in ["created > '2024-01-01 10:00:00'", "created >= '2024-01-01'", "created < '2024-01-02 00:00:00.5'", "created <> '2024-01-01'"] {
+            assert!(term(w).is_some(), "{w}");
+        }
+        for w in [
+            "created = '2024-01-01'",
+            "created <= '2024-01-01'",
+            "created between '2024-01-01' and '2024-02-01'",
+            "created in ('2024-01-01')",
+            "created > '2024-01-01 10:00:00.1234567'",
+            "not (created > '2024-01-01')",
+        ] {
+            assert!(term(w).is_none(), "{w}: {:?}", term(w));
+        }
+        let my = [("o", Mysql, "select * from orders", Some(o.as_slice()))];
+        assert!(run("with o as (select * from results.r1) select * from o where note = 'a\\b'", &my)[0].is_none());
+        assert!(run("with o as (select * from results.r1) select * from o where note = 'ab'", &my)[0].is_some());
+        assert!(describe_sql("select * into x from t", Postgres).is_none());
+        // Nothing the outer query could push: the parts' types aren't asked for.
+        assert!(!may_push("with o as (select * from results.r1) select * from o"));
+        assert!(may_push("with o as (select * from results.r1) select id from o"));
+        assert!(may_push("with o as (select * from results.r1) select * from o where id = 1"));
     }
 
     #[test]

@@ -39,7 +39,9 @@ pub(crate) fn col_type(t: ColumnType) -> (ColType, &'static str) {
         T::NText => (ColType::Utf8, "ntext"),
         T::BigChar => (ColType::Utf8, "char"),
         T::Text => (ColType::Utf8, "text"),
-        _ => (ColType::Utf8, "varchar"),
+        T::BigVarChar => (ColType::Utf8, "varchar"),
+        // sql_variant, CLR types and anything newer: shown as text, compared as nothing.
+        _ => (ColType::Utf8, "sql_variant"),
     }
 }
 
