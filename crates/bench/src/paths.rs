@@ -133,6 +133,18 @@ fn sql_text(s: &mut Suite) {
         move || sql::substitute_parameters(&q, Postgres, &p)
     });
     s.add("find_parameters", "the editor shows a box for each `:name` as the text changes", 1, None, move || sql::find_parameters(&with_params, Postgres));
+    // Every statement is checked for parts before it runs: most aren't
+    // combined (the cheap test), a combined one is read in each dialect.
+    s.add("combined_not", "a statement that isn't a combined query is told apart", 1, None, || {
+        sql::parse_combined(std::hint::black_box(QUERY), &mut |_| Ok(Postgres))
+    });
+    let combined = format!(
+        "with orders as (@\"Sales PG\" {QUERY}), customers as (@crm select id, name, country from customers where name <> ')'), \
+         x as (select 1) select c.country, count(*) from orders o join customers c on c.id = o.id group by 1"
+    );
+    s.add("combined_parse", "a combined query's parts are found, each in its own dialect", 1, None, move || {
+        sql::parse_combined(&combined, &mut |r| Ok(if r.to_string() == "crm" { Mysql } else { Postgres }))
+    });
 }
 
 /// What is kept of every statement, job log line and AI message.

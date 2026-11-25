@@ -10,6 +10,7 @@ use crate::traits::SqlParser;
 use crate::types::ConnectorKind;
 
 mod classify;
+mod combined;
 mod mark;
 mod params;
 mod parsed;
@@ -20,6 +21,7 @@ mod statement;
 
 pub(crate) use classify::keyword_kind;
 pub use classify::{Classification, StatementKind, classify, delta_describe};
+pub use combined::{Combined, CombinedError, CombinedPart, ConnectionRef, looks_combined, parse_combined};
 pub use mark::MarkType;
 pub use params::{ParamSpan, ParamValue, find_parameters, quote_string, render_param, substitute_known_parameters, substitute_parameters};
 pub use parsed::{ParsedStatement, parse_script};

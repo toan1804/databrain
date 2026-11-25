@@ -1,6 +1,6 @@
 # Design: one query over several connections
 
-Status: proposal (2026-11-25). Nothing is implemented. The decisions are in §12; nothing is open.
+Status: phase 1 in progress (2026-11-25): the parser is in (`connector-core/src/sql/combined.rs`); the run, `dbr` and the result tabs follow. The decisions are in §12; nothing is open.
 
 ## 1. Problem
 
@@ -81,9 +81,13 @@ connection := identifier | "quoted name"         -- a saved connection's name (a
   combined query is one statement of the script.
 
 Recognised in `connector-core/src/sql` next to the splitter (a new
-`combined.rs`): `parse_combined(text) -> Option<Combined { parts: Vec<Part {
-name, connection, sql, span }>, outer_spans }>`. Not a combined query: `None`,
-and nothing changes for the statement. It runs for every statement at run time
+`combined.rs`): `parse_combined(text, resolve) -> Result<Option<Combined {
+parts: Vec<CombinedPart { name, connection, kind, sql, sql_span, body_span }> }>>`,
+where `resolve` gives each named connection's kind (its lexer finds the part's
+end) or why there is none. Not a combined query: `Ok(None)`, and nothing
+changes for the statement; once a part is found, what doesn't read as one is
+an error naming the part. `looks_combined` is the cheap test before it
+(`WITH` first and an `@` in the text). It runs for every statement at run time
 and per keystroke for highlighting, so it gets a `crates/bench` path.
 
 ## 3. How it runs
@@ -318,7 +322,7 @@ The planner pushes nothing into a part (it runs as written, as in phase 1) when:
 | `plan_combined` and `PartPlan { user_sql, sent_sql, pushed }` (§3) | `sent_sql = user_sql`, `pushed` empty | the planner of §7.2 and §7.3 |
 | Checks, runs, outputs, events and history read `sent_sql` | the same text as written | nothing |
 | The reuse key of §5 is (connection, `sent_sql`, parameters) | equals the written part | nothing |
-| The outer query is parsed (`sqlparser`, DuckDB dialect) to rewrite the CTE bodies, not patched as text | used for the rewrite of §3 | read for column use and `WHERE` / `ON` terms |
+| The outer query is rewritten by replacing each part's body span (`Combined::outer_sql`), so its text and error positions stay the user's; it is classified (parsed as DuckDB) before anything runs | used for the rewrite of §3 | the rewritten text parsed (`sqlparser`, DuckDB dialect) for column use and `WHERE` / `ON` terms |
 | Part outputs keep their columns' names and database types | shown in the result tab | the type table of §7.2 |
 | Error positions map through `PartPlan.span` | 1:1 | positions inside the wrapper map back to the written part; errors in generated text name the part |
 | `SourceTraits` (per-dialect facts) | no new field | `derived_table` rules, typed literal forms |
