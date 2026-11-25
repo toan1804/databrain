@@ -734,7 +734,11 @@ func changePassword(ctx context.Context, r *request) error {
 	if err := conn.OpenWithContext(ctx); err != nil {
 		return err
 	}
-	return conn.Close()
+	// Signed in: the password has changed. A failure to sign out (the
+	// network gone just after) must not say otherwise, or the app wouldn't
+	// save the new password.
+	_ = conn.Close()
+	return nil
 }
 
 func (s *session) close() {

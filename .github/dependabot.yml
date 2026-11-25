@@ -11,6 +11,12 @@ updates:
     groups:
       rust-minor:
         update-types: [minor, patch]
+    # Vendored copies with an addition of ours (vendor/*/DATABRAIN.md): the
+    # version in Cargo.toml doesn't build anything; updating means copying
+    # the new release and applying the change again.
+    ignore:
+      - dependency-name: mysql_async
+      - dependency-name: tiberius
 
   - package-ecosystem: npm
     directory: /ui
@@ -40,3 +46,7 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 2
+    # A vendored copy (agent/go-ora/DATABRAIN.md, `replace` in go.mod): the
+    # required version builds nothing; updating means copying the release.
+    ignore:
+      - dependency-name: github.com/sijms/go-ora/v2

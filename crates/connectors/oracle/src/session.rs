@@ -710,11 +710,14 @@ mod tests {
         };
         let Err(e) = open(&cfg, creds("Old_pw_1")).await else { panic!("an expired password signed in") };
         assert!(e.is_password_expired(), "{e:?}");
-        assert!(OracleConnector.connect_changing_password(&cfg, creds("Wrong_pw_9"), "New'pw_2").await.is_err(), "the current password is checked");
+        let refused = |e: databrain_connector_core::ConnectorError| e.code.as_deref() == Some("ORA-01017");
+        let Err(e) = OracleConnector.connect_changing_password(&cfg, creds("Wrong_pw_9"), "New'pw_2").await else { panic!("a wrong password changed it") };
+        assert!(refused(e.clone()), "the current password is checked: {e:?}");
         OracleConnector.connect_changing_password(&cfg, creds("Old_pw_1"), "New'pw_2").await.unwrap();
         let s = open(&cfg, creds("New'pw_2")).await.expect("the new password signs in");
         drop(s);
-        assert!(open(&cfg, creds("Old_pw_1")).await.is_err(), "the old one no longer does");
+        let Err(e) = open(&cfg, creds("Old_pw_1")).await else { panic!("the old password still signs in") };
+        assert!(refused(e.clone()), "the old one no longer does: {e:?}");
         run(&admin, "drop user db_exp cascade").await;
     }
 
