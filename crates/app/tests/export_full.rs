@@ -48,6 +48,7 @@ async fn run(st: &AppState, conn: &str, sql: &str, limit: Option<usize>) -> data
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )

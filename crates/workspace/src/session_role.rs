@@ -63,6 +63,10 @@ pub enum SessionRole {
     TestData(String),
     /// Tests that set up data.
     Tests,
+    /// A part of a combined query run from session `tab` (a tab's key):
+    /// `name` is the part's (its CTE's) name. Its own session, so a part
+    /// never runs in the tab's transaction; closed with the tab.
+    Part { tab: String, name: String },
 }
 
 const META: &str = "__meta__";
@@ -73,6 +77,9 @@ const LOAD: &str = "__load__:";
 const EXPORT: &str = "__export__:";
 const DRY_RUN: &str = "dryrun:";
 const TEST_DATA: &str = "__testdata__:";
+/// `__part__:{name length}:{name}{tab}`: a part's name may hold any
+/// character, a tab's key `:` (a notebook's), so the name is counted.
+const PART: &str = "__part__:";
 
 impl SessionRole {
     /// The role of `key` (any key not made by the app is a tab's).
@@ -101,6 +108,13 @@ impl SessionRole {
         }
         if let Some(id) = tail(DRY_RUN) {
             return SessionRole::DryRun(id);
+        }
+        if let Some(rest) = tail(PART)
+            && let Some((len, rest)) = rest.split_once(':')
+            && let Ok(len) = len.parse::<usize>()
+            && let (Some(name), Some(tab)) = (rest.get(..len), rest.get(len..))
+        {
+            return SessionRole::Part { tab: tab.to_string(), name: name.to_string() };
         }
         for part in AiPart::ALL {
             if let Some(chat) = tail(part.prefix()) {
@@ -137,6 +151,7 @@ impl SessionRole {
             SessionRole::DryRun(id) => format!("{DRY_RUN}{id}"),
             SessionRole::TestData(id) => format!("{TEST_DATA}{id}"),
             SessionRole::Tests => TESTS.into(),
+            SessionRole::Part { tab, name } => format!("{PART}{}:{name}{tab}", name.len()),
         }
     }
 
@@ -151,6 +166,15 @@ impl SessionRole {
     /// export): nothing comes back to it later.
     pub fn one_off(&self) -> bool {
         matches!(self, SessionRole::Load(_) | SessionRole::Export(_) | SessionRole::DryRun(_))
+    }
+
+    /// Closed when session `key` closes: the key itself, and the sessions
+    /// of the combined queries it ran ([`SessionRole::Part`]).
+    pub fn belongs_to(&self, key: &str) -> bool {
+        match self {
+            SessionRole::Part { tab, .. } => tab == key,
+            r => r.key() == key,
+        }
     }
 
     /// The assistant's (AI chat or MCP): SQL from it may run sandboxed.
@@ -188,6 +212,9 @@ mod tests {
             SessionRole::Load("job:j1:n3".into()),
             SessionRole::Export("e1".into()),
             SessionRole::Tests,
+            SessionRole::Part { tab: "2f1c7a9e-tab".into(), name: "orders".into() },
+            SessionRole::Part { tab: "nb:n1:c2".into(), name: "a:b c".into() },
+            SessionRole::Part { tab: "t".into(), name: "ünï".into() },
         ];
         for r in roles {
             assert_eq!(SessionRole::parse(&r.key()), r, "{}", r.key());
@@ -197,6 +224,11 @@ mod tests {
         assert_eq!(SessionRole::parse("job:j1:n3"), SessionRole::JobStep { job: "j1".into(), node: "n3".into() });
         // "job:" without a node is no job step's: a tab's own id.
         assert_eq!(SessionRole::parse("job:x"), SessionRole::Tab("job:x".into()));
+        // A part's session goes with its tab's, never with another's.
+        let part = SessionRole::Part { tab: "t1".into(), name: "o".into() };
+        assert!(part.belongs_to("t1") && !part.belongs_to("t2") && !part.belongs_to(&part.key().replace("t1", "t2")));
+        assert!(SessionRole::Tab("t1".into()).belongs_to("t1"));
+        assert_eq!(SessionRole::parse("__part__:99:x"), SessionRole::Tab("__part__:99:x".into()));
     }
 
     #[test]

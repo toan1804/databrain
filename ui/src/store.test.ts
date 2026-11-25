@@ -124,6 +124,27 @@ describe("job event ordering", () => {
   });
 });
 
+describe("combined queries", () => {
+  it("shows each part's rows as a result after the statement's", async () => {
+    emitBeforeResolve = false;
+    const key = "tab-combined";
+    await useStore.getState().runSql(key, "conn", "with a as (@pg select 1) select * from a");
+    const job_id = useStore.getState().runs[key].jobId!;
+    const part = { ...out("r7", key, 0), connection_id: "pg", connection_name: "Sales PG" };
+    handler?.({ type: "part_finished", job_id, tab_id: key, index: 0, part: "a", connection_name: "Sales PG", output: part } as never);
+    handler?.({ type: "statement_finished", job_id, tab_id: key, index: 0, result: null, output: out("r8", key, 0), rows_affected: null, duration_ms: 2, notices: [] } as never);
+    handler?.({ type: "job_finished", job_id, tab_id: key, status: "success", duration_ms: 2, in_transaction: false });
+    const run = useStore.getState().runs[key];
+    expect(run.parts?.map((p) => [p.part, p.output?.handle])).toEqual([[{ name: "a", connection: "Sales PG" }, "r7"]]);
+    expect(run.parts![0].plan.index).toBeLessThan(0);
+    // Shown when chosen; a new run starts without the last one's parts.
+    useStore.getState().setActiveStatement(key, run.parts![0].plan.index);
+    expect(shownStatement(useStore.getState().runs[key])?.part?.name).toBe("a");
+    await useStore.getState().runSql(key, "conn", "select 1");
+    expect(useStore.getState().runs[key].parts).toBeUndefined();
+  });
+});
+
 describe("restoring tab results after a restart", () => {
   it("builds a finished run from the tab's saved outputs", () => {
     const run = restoredRun("t1", [out("r3", "t1", 1), out("r2", "t1", 0), out("r9", "t2", 0), out("r1", "t1", 0, { active: false })])!;

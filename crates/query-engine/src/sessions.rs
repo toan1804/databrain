@@ -297,7 +297,7 @@ impl QueryEngine {
                 j.tab_closed |= j.tab_id == tab_id;
             }
         }
-        self.drop_sessions(|(_, t), _| t == tab_id);
+        self.drop_sessions(|(_, t), _| SessionRole::parse(t).belongs_to(tab_id));
         self.outputs.close_tab(tab_id);
         self.outputs_changed();
     }
@@ -534,7 +534,7 @@ impl QueryEngine {
 
     /// Close the database sessions of a run key (keeps its outputs).
     pub fn release_sessions(&self, tab: &str) {
-        self.drop_sessions(|(_, t), _| t == tab);
+        self.drop_sessions(|(_, t), _| SessionRole::parse(t).belongs_to(tab));
     }
 }
 

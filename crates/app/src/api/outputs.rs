@@ -163,6 +163,7 @@ pub async fn compare_outputs(state: &AppState, spec: CompareSpec, tab_id: &str) 
             output_name: None,
             params: Default::default(),
             output_masks: None,
+            part_rows: None,
         };
         async move {
             let out = st.run_and_wait(&hub, req, None).await?;
@@ -249,6 +250,7 @@ pub async fn compare_load_source(state: &AppState, source: CompareSource, tab_id
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )
@@ -309,6 +311,7 @@ pub async fn compare_suggest_keys(state: &AppState, before: &str, after: &str, m
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )

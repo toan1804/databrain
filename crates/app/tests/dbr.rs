@@ -354,6 +354,7 @@ async fn rows_come_while_the_query_runs() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     let run = tokio::spawn(async move { engine.run_and_wait(&hub, req, None).await });
     let first = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();
@@ -407,4 +408,22 @@ async fn a_reader_that_goes_away_stops_the_query() {
     let code = run_with(&st, opts, Io { out: &mut out, err: &mut err, ask: &ask, cancel: Default::default() }, Terminal { out: false, width: 120 }).await;
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
     assert!(started.elapsed() < std::time::Duration::from_secs(20), "the query wasn't stopped: {:?}", started.elapsed());
+}
+
+/// A combined query runs without `-c` (its parts name their connections);
+/// with `-c` it is refused before anything runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_combined_query_names_its_own_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    sqlite(&st, "Sales", &dir.path().join("sales.db"), EnvTag::Dev, false);
+    sqlite(&st, "CRM", &dir.path().join("crm.db"), EnvTag::Dev, false);
+    assert_eq!(dbr(&st, &["-c", "Sales", "-i", "create table o (id integer, c integer); insert into o values (1, 10), (2, 20)"], false).await.0, 0);
+    assert_eq!(dbr(&st, &["-c", "CRM", "-i", "create table c (id integer, name text); insert into c values (10, 'Ann'), (20, 'Bo')"], false).await.0, 0);
+    let q = "with o as (@Sales select * from o), c as (@crm select * from c) select c.name from o join c on c.id = o.c order by 1";
+    let (code, out) = dbr(&st, &["-i", "--csv", q], false).await;
+    assert_eq!((code, out.as_str()), (0, "name\nAnn\nBo\n"));
+    let (code, _, err) = dbr_full(&st, &["-c", "Sales", "-i", q], false, Answer::NoTerminal, Default::default()).await;
+    assert_eq!(code, 2);
+    assert!(err.contains("names its connections itself: leave out -c"), "{err}");
 }

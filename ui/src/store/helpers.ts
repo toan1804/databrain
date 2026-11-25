@@ -78,7 +78,7 @@ export function keptIndex(): number {
 export function shownStatement(run: TabRun): StatementRun | undefined {
   const i = run.activeIndex;
   if (i === null) return undefined;
-  return i < 0 ? run.kept?.find((s) => s.plan.index === i) : run.statements[i];
+  return i < 0 ? (run.kept?.find((s) => s.plan.index === i) ?? run.parts?.find((s) => s.plan.index === i)) : run.statements[i];
 }
 
 let tabSaveTimer: ReturnType<typeof setTimeout> | undefined;

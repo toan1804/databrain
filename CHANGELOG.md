@@ -8,6 +8,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 - **An expired SQL Server password can be changed in DataBrain:** the change-password dialog (which opens by itself when the server refuses an expired password, error 18487, or one that must be changed, 18488) now sets the new one as DataBrain signs in, the only way SQL Server takes it. SQL Server logins only: a Windows or Entra ID password is changed with their own tools. Through a small addition to the tiberius driver (`vendor/tiberius`).
 - **An expired Oracle password can be changed with the thin driver too:** the change-password dialog (which opens by itself on ORA-28001) now sets the new password as DataBrain signs in with the default thin driver, not only with Instant Client. Through a small addition to the go-ora driver in the Oracle helper (`crates/connectors/oracle/agent/go-ora`); the helper is downloaded again (0.1.10).
+- **One query over several connections:** a `WITH` part that starts with `@connection` runs on that connection, and the query around the parts joins them in DuckDB, in any tab: `WITH orders AS (@"Sales PG" SELECT …), customers AS (@crm SELECT …) SELECT … FROM orders JOIN customers …`. Only reads run (each part checked on its connection, before anything runs); parts are read whole, and one past 1,000,000 rows fails rather than being cut ("Run again without the limit"). Each part's rows show as a result of their own. `dbr -i` runs one without `-c`. Not yet in the assistant, notebooks or jobs.
 
 ## 0.5.3 - 2026-11-25
 

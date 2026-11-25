@@ -285,6 +285,7 @@ async fn denied_approval_and_blocked_writes() {
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             },
             None,
         )
@@ -701,6 +702,7 @@ async fn ai_tools_use_output_handles_with_source_policies() {
                 output_name: name.map(Into::into),
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             };
             engine.run_and_wait(&hub, r, None).await.unwrap()
         }
@@ -804,6 +806,7 @@ async fn output_columns_stay_masked_in_duckdb() {
         output_name: Some("people".into()),
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
     let ctx = databrain_ai::ToolContext {
@@ -1002,6 +1005,7 @@ async fn table_access_rules() {
                 output_name: Some(name.into()),
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             };
             let o = engine.run_and_wait(&hub, r, None).await.unwrap();
             assert!(o.iter().all(|x| x.error.is_none()), "{:?}", o[0].error);
@@ -1086,6 +1090,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
     // The setup tab's session holds the file; Windows lets one session open it.
@@ -1169,6 +1174,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     // Each DuckDB session opens the file on its own (one writer at a time).
     engine.disconnect(&conn);
@@ -2078,6 +2084,7 @@ async fn a_connections_rules_hold_wherever_it_is_reached_from() {
         output_name: None,
         params: Default::default(),
         output_masks: None,
+        part_rows: None,
     };
     let rid = f.engine.run_and_wait(&f.hub, r, None).await.unwrap()[0].result.as_ref().unwrap().id.clone();
     let grid = ctx("cloud", Arc::new(Grid(rid.clone())));

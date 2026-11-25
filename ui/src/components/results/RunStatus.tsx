@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, Ban, CheckCircle2, Loader2, Wrench, X } from "lucide-react";
+import { AlertCircle, Ban, CheckCircle2, Loader2, Play, Wrench, X } from "lucide-react";
 import { lineOf, locateStatement, useAi } from "../../aiStore";
 import { editorBridge } from "../../editorBridge";
 import { formatCount, formatDuration, sqlPreview } from "../../lib/util";
@@ -91,6 +91,15 @@ export function ErrorView({ stmt, tabId, connectionId, count, noEditor = false }
         </div>
         {!cancelled && <pre className="whitespace-pre-wrap break-words font-mono text-[12px] select-text">{e.message}</pre>}
         <div className="mt-2 font-mono text-[11px] text-muted">{sqlPreview(stmt.plan.sql, 200)}</div>
+        {!cancelled && e.code === "part_too_large" && !noEditor && (
+          <button
+            className="btn-ghost mt-2 mr-2 border border-line py-1"
+            title="Read every row of each part, this run only"
+            onClick={() => void useStore.getState().runWithoutPartLimit(tabId, stmt.plan.sql, at?.from ?? 0)}
+          >
+            <Play size={12} /> Run again without the limit
+          </button>
+        )}
         {!cancelled && !noEditor && (
           <button className="btn-ghost mt-2 border border-line py-1" onClick={fix}>
             <Wrench size={12} /> Fix with AI

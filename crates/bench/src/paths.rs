@@ -491,6 +491,7 @@ fn engine(s: &mut Suite) {
                 output_name: None,
                 params: Default::default(),
                 output_masks: None,
+                part_rows: None,
             };
             match engine.run(req).expect("run") {
                 RunResponse::Started { statements, .. } => {
