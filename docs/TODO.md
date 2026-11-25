@@ -236,3 +236,7 @@ Done: one description per table at a time and reused for 30 s (`describe_cache.r
 ## Explorer background session (2026-11-25)
 
 Done: the explorer's background catalog work has its own session on server databases (`SessionRole::Scan`, `Lane::Background`), closed 2 minutes after its work (a server's per-user session limit), falling back to the user's session when it can't open; Oracle's check reads the listed owners only; a background answer older than the user's own is dropped in the tree. Left: the schema lists of catalogs on three-level engines (`loadCatalogSchemas` at connect and for chosen catalogs, the quiet `listSchemas` refresh, `loadSchemas(force)` after DDL) still run on the user's session (one query per catalog on Snowflake and Databricks); Snowflake and Databricks fingerprints still ask for every schema and filter (an override limited to the listed schemas' databases would be cheaper, as Oracle's); a Refresh while a background check runs on the old session leaves that query running to its end.
+
+## Combined queries (2026-11-25)
+
+Phase 1 in progress (docs/design/cross-connection-queries.md): the parser (`sql/combined.rs`). A part's end is found with the shared lexer (`skip_token`), which misreads some dialect syntax, so such a part ends in the wrong place or is refused: SQL Server's `]]` inside brackets, Postgres' nested `/* /* */ */` comments, MySQL's `--` without a space after it (`5--1`). Only the statement's own `WITH` list is read (a part in a subquery isn't one).
