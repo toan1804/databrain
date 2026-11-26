@@ -204,7 +204,7 @@ The splitter, not sqlparser's tokens, decides where statements end: it reads str
 
 ### Parameters (`sql/params.rs`)
 
-- `find_parameters` returns `:name` spans (off where `colon_params` is false). Not parameters: `::`, `:=`, a colon right after a name, digit, quote, bracket or `$` (`col:field`), and Oracle `:new` / `:old`. On Oracle it also returns `&name` / `&&name`, in code and inside `'…'`, marked `textual`.
+- `find_parameters` returns `:name` spans (off where `colon_params` is false). Not parameters: `::`, `:=`, a colon right after a name, digit, quote, bracket or `$` (`col:field`), and Oracle `:new` / `:old`. On Oracle it also returns `&name` / `&&name`, in code only (never inside quotes or comments: `'b&a'` is text), marked `textual`.
 - `render_param` decides the text of a value; `quote_string` is the one text escaper (also used by loads and SQL export): quotes doubled, backslashes doubled where the dialect may read them, `\'` on BigQuery and Databricks.
 - `substitute_parameters` replaces every span or returns the names without a value.
 
