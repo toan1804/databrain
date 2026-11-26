@@ -321,7 +321,7 @@ impl QueryEngine {
             }
             self.events.emit(JobEvent::StatementStarted { job_id: job_id.clone(), tab_id: req.tab_id.clone(), index: stmt.index, sql: stmt.sql().to_string() });
             if changes_tables(stmt.classification().kind) {
-                self.forget_descriptions(&req.connection_id);
+                self.tables_may_have_changed(&req.connection_id);
             }
             let started_at = now_ms();
             let t0 = Instant::now();
@@ -340,7 +340,7 @@ impl QueryEngine {
             // have run). Also before it (below), so one made while it ran
             // isn't kept.
             if changes_tables(stmt.classification().kind) {
-                self.forget_descriptions(&req.connection_id);
+                self.tables_may_have_changed(&req.connection_id);
             }
 
             // A combined query's result is the outer query's, on Results (DuckDB).

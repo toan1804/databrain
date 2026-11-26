@@ -411,13 +411,37 @@ pub async fn describe(state: &AppState, id: &str, schema: &str, name: &str) -> R
 
 /// [`describe`]; `fresh`: asked of the server now (Refresh).
 pub async fn describe_with(state: &AppState, id: &str, schema: &str, name: &str, fresh: bool) -> Result<ObjectDetail> {
+    if !fresh && let Some(d) = described_from_cache(state, id, schema, name) {
+        return Ok(d);
+    }
+    // Before the read: a description kept from earlier is older still.
+    let read_at = databrain_workspace::now_ms();
     let d = if fresh { state.engine.describe_fresh(id, schema, name).await? } else { state.engine.describe(id, schema, name).await? };
     if !d.columns.is_empty() {
         let (ws, id2, s2, n2, cols, fks) =
             (state.workspace.clone(), id.to_string(), schema.to_string(), name.to_string(), d.columns.clone(), d.foreign_keys.clone());
-        state.meta.push_blocking(move || drop(ws.meta_put_table(&id2, &s2, &n2, &cols, Some(&fks))));
+        // Its comment and row estimate too: the tab opened from the cache shows them.
+        let object = databrain_connector_core::DbObject { schema: schema.to_string(), name: name.to_string(), ..d.object.clone() };
+        state.meta.push_blocking(move || {
+            let _ = ws.meta_put_described_object(&id2, &object);
+            drop(ws.meta_put_table_read_at(&id2, &s2, &n2, &cols, Some(&fks), read_at))
+        });
     }
     Ok(d)
+}
+
+/// The table's description as the explorer cache holds it, when that is a
+/// whole one (from a describe, not a schema-wide read), not marked stale,
+/// and read after anything DataBrain last ran that may have changed the
+/// connection's tables: the table tab then opens without asking the server
+/// (its Refresh does). Not for DuckDB's query outputs (`results.main`),
+/// which other runs redefine.
+fn described_from_cache(state: &AppState, id: &str, schema: &str, name: &str) -> Option<ObjectDetail> {
+    if schema == "results.main" {
+        return None;
+    }
+    let t = state.engine.workspace().meta_described(id, schema, name).ok().flatten()?;
+    Some(ObjectDetail { object: t.object, columns: t.columns, ddl: None, foreign_keys: t.foreign_keys })
 }
 
 /// A schema's tables for the ER diagram, and where they came from.

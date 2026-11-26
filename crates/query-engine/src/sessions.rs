@@ -378,13 +378,23 @@ impl QueryEngine {
             (None, false) => "ROLLBACK",
         };
         // SQL Server nests BEGIN TRAN: each COMMIT ends one level.
-        for _ in 0..32 {
-            session.execute(Statement::internal(sql), ExecOptions::default()).await?.collect().await?;
-            // Only a known open one: an unknown state would repeat COMMIT 32 times.
-            if !commit || session.transaction_state() != TxState::Open {
-                break;
+        let ended = async {
+            for _ in 0..32 {
+                session.execute(Statement::internal(sql), ExecOptions::default()).await?.collect().await?;
+                // Only a known open one: an unknown state would repeat COMMIT 32 times.
+                if !commit || session.transaction_state() != TxState::Open {
+                    break;
+                }
             }
+            Ok::<(), EngineError>(())
         }
+        .await;
+        // DDL in it (manual commit) is now what other sessions see: what
+        // they described while it was open is old. Even after an error.
+        if commit {
+            self.tables_may_have_changed(connection_id);
+        }
+        ended?;
         Ok(session.transaction_state() == TxState::Open)
     }
 

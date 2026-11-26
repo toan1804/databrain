@@ -91,4 +91,33 @@ impl QueryEngine {
     pub fn forget_descriptions(&self, connection_id: &str) {
         self.describes.forget(connection_id);
     }
+
+    /// Something run on the connection may have changed its tables (DDL,
+    /// a call or block, a COMMIT, a load that creates a table): its kept
+    /// descriptions go, and the explorer cache's tables read until now
+    /// count as stale (saved, so a restart or a description saved later
+    /// from a read before it doesn't make them current), so neither the
+    /// explorer nor a table tab shows them as current. The same for the
+    /// other connections to the same database (another user, a read-only
+    /// one, the same file).
+    pub fn tables_may_have_changed(&self, connection_id: &str) {
+        let ids = self.same_database(connection_id);
+        for id in &ids {
+            self.forget_descriptions(id);
+        }
+        if let Err(e) = self.workspace.meta_tables_may_have_changed(&ids, databrain_workspace::now_ms()) {
+            tracing::warn!(error = %e, "could not mark cached tables stale");
+        }
+    }
+
+    /// The connection and the others that point at the same database: the
+    /// same kind, server (host and port) and database, or the same file.
+    fn same_database(&self, connection_id: &str) -> Vec<String> {
+        let all = self.workspace.list_connections().unwrap_or_default();
+        let Some(me) = all.iter().find(|p| p.id == connection_id) else { return vec![connection_id.to_string()] };
+        let target = |c: &databrain_connector_core::ConnectionConfig| (c.kind, c.host.clone(), c.port, c.database.clone(), c.file_path.clone());
+        let mine = target(&me.config);
+        let known = mine.1.is_some() || mine.4.is_some();
+        all.iter().filter(|p| p.id == connection_id || (known && target(&p.config) == mine)).map(|p| p.id.clone()).collect()
+    }
 }

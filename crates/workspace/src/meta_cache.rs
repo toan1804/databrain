@@ -37,6 +37,14 @@ pub struct CachedListing {
     pub listed_at: i64,
 }
 
+/// A table's cached whole description ([`Workspace::meta_described`]).
+#[derive(Debug, Clone)]
+pub struct DescribedTable {
+    pub object: DbObject,
+    pub columns: Vec<ColumnInfo>,
+    pub foreign_keys: Vec<ForeignKey>,
+}
+
 /// What DataBrain knows of a table without asking the database: the newer
 /// of the explorer cache and the AI index ([`Workspace::meta_table`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +136,11 @@ pub const UNLISTED_COLUMNS_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// SQL: `m` (a `meta_columns` row) may be out of date.
 /// `?4` is the cut-off: `now_ms() - UNLISTED_COLUMNS_TTL_MS`.
-const STALE_SQL: &str = "(m.stale OR (m.seen_at < ?4 AND NOT EXISTS (SELECT 1 FROM meta_schemas s WHERE s.connection_id = m.connection_id \
+/// Also stale: read no later than DataBrain last ran something that may
+/// have changed the connection's tables (`meta_tables_changed`).
+const STALE_SQL: &str = "(m.stale \
+     OR m.seen_at <= coalesce((SELECT t.changed_at FROM meta_tables_changed t WHERE t.connection_id = m.connection_id), -1) \
+     OR (m.seen_at < ?4 AND NOT EXISTS (SELECT 1 FROM meta_schemas s WHERE s.connection_id = m.connection_id \
      AND s.schema_name = m.schema_name AND s.listed_at IS NOT NULL)))";
 
 impl Workspace {
@@ -622,14 +634,30 @@ impl Workspace {
     /// A table as described by the server: columns, and its foreign keys
     /// when the caller has them (`None` records them as not known).
     pub fn meta_put_table(&self, connection_id: &str, schema: &str, table: &str, columns: &[ColumnInfo], foreign_keys: Option<&[ForeignKey]>) -> Result<()> {
+        self.meta_put_table_read_at(connection_id, schema, table, columns, foreign_keys, now_ms())
+    }
+
+    /// [`Self::meta_put_table`] for a description read from the server at
+    /// `read_at` (ms; saved later, from a queue): a change DataBrain ran
+    /// between the read and the save ([`Self::meta_tables_may_have_changed`])
+    /// is then newer, and the saved description stale.
+    pub fn meta_put_table_read_at(
+        &self,
+        connection_id: &str,
+        schema: &str,
+        table: &str,
+        columns: &[ColumnInfo],
+        foreign_keys: Option<&[ForeignKey]>,
+        read_at: i64,
+    ) -> Result<()> {
         let fks = foreign_keys.map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".into()));
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         tx.execute(
-            "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json, described) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
-             fks_json = excluded.fks_json, stale = 0",
-            params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), now_ms(), fks],
+             fks_json = excluded.fks_json, stale = 0, described = excluded.described",
+            params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), read_at, fks, foreign_keys.is_some()],
         )?;
         // The AI's search row of the table, when it may use it.
         Self::kept_described_tx(&tx, connection_id, schema, table)?;
@@ -652,7 +680,7 @@ impl Workspace {
             tx.execute(
                 "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
-                 fks_json = coalesce(excluded.fks_json, meta_columns.fks_json), stale = 0",
+                 fks_json = coalesce(excluded.fks_json, meta_columns.fks_json), stale = 0, described = 0",
                 params![connection_id, schema, t.table, serde_json::to_string(&t.columns).unwrap_or_else(|_| "[]".into()), now, fks],
             )?;
             Self::kept_described_tx(&tx, connection_id, schema, &t.table)?;
@@ -760,6 +788,67 @@ impl Workspace {
             )
             .optional()?;
         Ok(row.map(|(j, stale)| CachedColumns { columns: serde_json::from_str(&j).unwrap_or_default(), stale }))
+    }
+
+    /// A table's whole description as last read from the server (columns,
+    /// foreign keys, and its object row's comment and row estimate), when
+    /// the cache holds one that is still current (see [`STALE_SQL`]): the
+    /// table tab opens from it. `None` when it was never described, may be out of date, or came
+    /// from a schema-wide read (which may lack defaults or keys). Exact
+    /// schema and table names.
+    pub fn meta_described(&self, connection_id: &str, schema: &str, table: &str) -> Result<Option<DescribedTable>> {
+        let row: Option<(String, Option<String>, bool)> = {
+            let c = self.conn.lock();
+            c.query_row(
+                &format!(
+                    "SELECT m.columns_json, m.fks_json, {STALE_SQL} FROM meta_columns m \
+                     WHERE m.connection_id = ?1 AND m.schema_name = ?2 AND m.table_name = ?3 AND m.described = 1"
+                ),
+                params![connection_id, schema, table, now_ms() - UNLISTED_COLUMNS_TTL_MS],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+        };
+        let Some((columns, Some(fks), false)) = row else { return Ok(None) };
+        let (Ok(columns), Ok(fks)) = (serde_json::from_str::<Vec<ColumnInfo>>(&columns), serde_json::from_str::<Vec<ForeignKey>>(&fks)) else {
+            return Ok(None);
+        };
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let Some(object) = self.meta_object(connection_id, schema, table)?.filter(|o| o.name == table && o.schema == schema && o.kind.is_relation()) else {
+            return Ok(None);
+        };
+        Ok(Some(DescribedTable { object, columns, foreign_keys: fks }))
+    }
+
+    /// Something run at `at` (ms) may have changed these connections'
+    /// tables (DDL run from DataBrain, a COMMIT): their cached columns read
+    /// no later than that count as stale, so the next look reads them
+    /// again. One row a connection, whatever its cache holds.
+    pub fn meta_tables_may_have_changed(&self, connection_ids: &[String], at: i64) -> Result<()> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "INSERT INTO meta_tables_changed (connection_id, changed_at) VALUES (?1, ?2) \
+             ON CONFLICT (connection_id) DO UPDATE SET changed_at = max(changed_at, excluded.changed_at)",
+        )?;
+        for id in connection_ids {
+            st.execute(params![id, at])?;
+        }
+        Ok(())
+    }
+
+    /// The table's object row as a describe gave it (its comment and row
+    /// estimate, which some listings lack, e.g. BigQuery's): what it
+    /// doesn't say keeps what the listing said.
+    pub fn meta_put_described_object(&self, connection_id: &str, object: &DbObject) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO meta_objects (connection_id, schema_name, name, kind, comment, row_estimate, seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (connection_id, schema_name, kind, name) DO UPDATE SET comment = coalesce(excluded.comment, comment), \
+             row_estimate = coalesce(excluded.row_estimate, row_estimate)",
+            params![connection_id, object.schema, object.name, kind_str(object.kind), object.comment, object.row_estimate, now_ms()],
+        )?;
+        Ok(())
     }
 
     /// Cached column names of a table (exact schema id, any-case name).
@@ -1383,5 +1472,47 @@ mod tests {
         fn delete_connection_cache_for_test(&self, id: &str) {
             self.meta_clear(id).unwrap();
         }
+    }
+
+    /// A description is current until DataBrain runs something that may
+    /// change the connection's tables; one read before that and saved
+    /// after stays stale (also after a restart: the time is saved). A
+    /// describe's comment and row estimate fill what the listing lacked.
+    #[test]
+    fn described_tables_and_changes() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None };
+        let listed = DbObject { schema: "s".into(), name: "t".into(), kind: ObjectKind::Table, comment: Some("from the listing".into()), row_estimate: None };
+        ws.meta_put_schema("c", "s", std::slice::from_ref(&listed)).unwrap();
+        ws.meta_put_table_read_at("c", "s", "t", &[col("id")], Some(&[]), 100).unwrap();
+        assert!(ws.meta_described("c", "s", "t").unwrap().is_some());
+        assert!(ws.meta_described("c", "s", "T").unwrap().is_none(), "exact names");
+        // Without keys known it isn't a description.
+        ws.meta_put_table("c", "s", "u", &[col("id")], None).unwrap();
+        assert!(ws.meta_described("c", "s", "u").unwrap().is_none());
+
+        ws.meta_tables_may_have_changed(&["c".to_string()], 200).unwrap();
+        assert!(ws.meta_described("c", "s", "t").unwrap().is_none(), "changed since");
+        assert!(ws.meta_table("c", "s", "t").unwrap().unwrap().stale, "the explorer reads it again too");
+        ws.meta_put_table_read_at("c", "s", "t", &[col("id")], Some(&[]), 150).unwrap();
+        assert!(ws.meta_described("c", "s", "t").unwrap().is_none(), "read before the change, saved after: still stale");
+        // An older change doesn't undo a newer one.
+        ws.meta_tables_may_have_changed(&["c".to_string()], 120).unwrap();
+        ws.meta_put_table_read_at("c", "s", "t", &[col("id"), col("x")], Some(&[]), 250).unwrap();
+        let d = ws.meta_described("c", "s", "t").unwrap().unwrap();
+        assert_eq!(d.columns.len(), 2);
+        assert_eq!((d.object.comment.as_deref(), d.object.row_estimate), (Some("from the listing"), None));
+
+        ws.meta_put_described_object("c", &DbObject { comment: None, row_estimate: Some(42), ..listed.clone() }).unwrap();
+        let o = ws.meta_described("c", "s", "t").unwrap().unwrap().object;
+        assert_eq!((o.comment.as_deref(), o.row_estimate), (Some("from the listing"), Some(42)), "a describe without a comment keeps the listing's");
+        ws.meta_put_described_object("c", &DbObject { comment: Some("described".into()), row_estimate: None, ..listed }).unwrap();
+        let o = ws.meta_described("c", "s", "t").unwrap().unwrap().object;
+        assert_eq!((o.comment.as_deref(), o.row_estimate), (Some("described"), Some(42)));
+        // Another connection isn't touched.
+        ws.meta_put_schema("d", "s", &[DbObject { schema: "s".into(), name: "t".into(), kind: ObjectKind::Table, comment: None, row_estimate: None }]).unwrap();
+        ws.meta_put_table_read_at("d", "s", "t", &[col("id")], Some(&[]), 100).unwrap();
+        ws.meta_tables_may_have_changed(&["c".to_string()], 300).unwrap();
+        assert!(ws.meta_described("d", "s", "t").unwrap().is_some());
     }
 }

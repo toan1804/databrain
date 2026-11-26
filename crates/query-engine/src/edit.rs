@@ -372,12 +372,14 @@ impl QueryEngine {
         let detail = match from_cache {
             Some(d) => d,
             None => {
+                // Before the read: saved with it, a change run meanwhile is newer.
+                let read_at = databrain_workspace::now_ms();
                 let d = self.describe_source(cid, &schema_id, cached.as_ref().map_or(src.table.as_str(), |x| x.name.as_str())).await?;
                 // Remember it like the explorer does: the next Edit (and the
                 // check when saving) needs no round trip.
                 if !d.columns.is_empty() {
                     let _ = ws.meta_add_objects(cid, &[DbObject { schema: schema_id.clone(), ..d.object.clone() }]);
-                    let _ = ws.meta_put_table(cid, &schema_id, &d.object.name, &d.columns, Some(&d.foreign_keys));
+                    let _ = ws.meta_put_table_read_at(cid, &schema_id, &d.object.name, &d.columns, Some(&d.foreign_keys), read_at);
                 }
                 d
             }
