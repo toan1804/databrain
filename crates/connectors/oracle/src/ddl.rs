@@ -393,13 +393,18 @@ pub fn indexes_ddl(table: &str, rows: &Rows, expressions: &Rows, skip: &[&str]) 
         let (owner, name) = (get(&rows[i], 0).unwrap_or(""), get(&rows[i], 1).unwrap_or(""));
         let mut j = i;
         let mut cols = Vec::new();
+        // A hidden expression column whose expression wasn't read.
+        let mut unread = false;
         while j < rows.len() && get(&rows[j], 1) == Some(name) && get(&rows[j], 0) == Some(owner) {
             let r = &rows[j];
             // Function-based (and DESC) columns: the expression.
             let expr = expressions.iter().find(|e| get(e, 0) == Some(owner) && get(e, 1) == Some(name) && get(e, 2).is_some() && get(e, 2) == get(r, 6));
             let mut c = match expr.and_then(|e| get(e, 3)).map(str::trim).filter(|e| !e.is_empty()) {
                 Some(e) => e.to_string(),
-                None => qi(get(r, 4).unwrap_or("")),
+                None => {
+                    unread |= get(r, 4).is_some_and(|c| c.starts_with("SYS_NC"));
+                    qi(get(r, 4).unwrap_or(""))
+                }
             };
             if get(r, 5) == Some("DESC") {
                 c.push_str(" DESC");
@@ -410,6 +415,11 @@ pub fn indexes_ddl(table: &str, rows: &Rows, expressions: &Rows, skip: &[&str]) 
         let r = &rows[i];
         i = j;
         if skip.contains(&name) {
+            continue;
+        }
+        // Its hidden column's name would make a statement that doesn't run.
+        if unread {
+            out.push(format!("-- index {}: its expression could not be read", full(owner, name)));
             continue;
         }
         let ty = get(r, 2).unwrap_or("");
@@ -658,8 +668,8 @@ COMMENT ON COLUMN "APP"."ORDERS"."NAME" IS 'it''s the name';"#;
         assert!(!has_function_based(&plain));
         let desc = vec![row(&[Some("APP"), Some("IX"), Some("FUNCTION-BASED NORMAL"), Some("NONUNIQUE"), Some("SYS_NC00003$"), Some("DESC"), Some("1")])];
         assert!(has_function_based(&desc));
-        // Without its expression the column's own name is written; with it, the expression.
-        assert_eq!(indexes_ddl("T", &desc, &vec![], &[]), ["CREATE INDEX \"APP\".\"IX\" ON T (\"SYS_NC00003$\" DESC);"]);
+        // Without its expression the index is named, not written with its hidden column; with it, the expression.
+        assert_eq!(indexes_ddl("T", &desc, &vec![], &[]), ["-- index \"APP\".\"IX\": its expression could not be read"]);
         let e = vec![row(&[Some("APP"), Some("IX"), Some("1"), Some("\"ID\"")]), row(&[Some("APP"), Some("IX"), n, Some("x")])];
         assert_eq!(indexes_ddl("T", &desc, &e, &[]), ["CREATE INDEX \"APP\".\"IX\" ON T (\"ID\" DESC);"]);
     }

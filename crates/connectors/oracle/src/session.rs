@@ -1121,6 +1121,8 @@ mod tests {
         assert!(e.position.is_some(), "{e:?}");
 
         // DDL/DML, many rows in several batches, the catalog.
+        // (A child left by a failed run would keep kb_thin from being dropped.)
+        let _ = run("drop table kb_fk_child purge").await;
         let _ = run("drop table kb_thin purge").await;
         run("create table kb_thin (id number(10) primary key, name varchar2(40), note varchar2(100))").await.unwrap();
         run("comment on table kb_thin is 'thin test'").await.unwrap();
@@ -1170,8 +1172,8 @@ mod tests {
             c.contains("CONSTRAINT \"KB_FK_CHILD_PAIR\" FOREIGN KEY (\"A\", \"B\") REFERENCES \"KB_FK_PARENT\" (\"K1\", \"K2\") ON DELETE CASCADE")
                 && c.contains("CONSTRAINT \"KB_FK_CHILD_THIN\" FOREIGN KEY (\"T\") REFERENCES \"KB_THIN\" (\"ID\")")
                 && c.contains("CONSTRAINT \"KB_FK_CHILD_PK\" PRIMARY KEY (\"ID\")")
-                && c.contains("CREATE INDEX")
-                && c.contains("(\"A\", \"B\")"),
+                && c.contains("\".\"KB_FK_CHILD_A\" ON ")
+                && c.contains("\"KB_FK_CHILD\" (\"A\", \"B\");"),
             "{driver}: {c}"
         );
         let d = s.describe(&me, "KB_FK_CHILD").await.unwrap();
@@ -1191,7 +1193,10 @@ mod tests {
         let all = s.schema_columns(&me).await.unwrap();
         let t = all.iter().find(|t| t.table == "KB_FK_CHILD").unwrap();
         assert_eq!(t.columns.iter().map(|c| (c.name.as_str(), c.is_primary_key)).collect::<Vec<_>>(), cols, "{driver}");
-        assert_eq!(t.foreign_keys.len(), 2, "{driver}");
+        let mut all_fks: Vec<(Vec<String>, String, Vec<String>)> =
+            t.foreign_keys.iter().map(|f| (f.columns.clone(), f.ref_table.clone(), f.ref_columns.clone())).collect();
+        all_fks.sort();
+        assert_eq!(all_fks, fks, "{driver}");
         run("drop table kb_fk_child purge").await.unwrap();
         run("drop table kb_fk_parent purge").await.unwrap();
         // A partitioned table's DDL: its first partition and how many more,
