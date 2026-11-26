@@ -25,7 +25,8 @@ export const SqlEditor = memo(function SqlEditor({ tabId, visible }: { tabId: st
   // What is typed (the tab's text follows after a pause).
   const draft = useDrafts((s) => s.text[tabId]);
   const conn = useStore((s) => s.connections.find((c) => c.id === tab?.connection_id));
-  const errorRange = useStore((s) => s.runs[tabId]?.errorRange);
+  // A refusal before the run wins over the last run's mark.
+  const errorRange = useStore((s) => s.preRunErrors[tabId] ?? s.runs[tabId]?.errorRange);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   // Create the view once per tab.

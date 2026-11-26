@@ -410,6 +410,43 @@ async fn parts_are_marked_as_parts() {
     assert!(now.iter().filter(|o| o.part.is_some()).all(|o| !o.kept), "no part took the keep");
 }
 
+/// Errors point where they are in the editor: a refusal before the run
+/// names its statement (bytes here; the app gives the UI UTF-16), and a
+/// server's position counts in the text as written, not as bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn errors_point_where_they_are_written() {
+    let s = setup().await;
+    // A part that writes, in the second statement of a script.
+    let script = "select 1;\nwith a as (@\"Sales DB\" delete from orders returning id) select * from a";
+    let e = s.run(req(&s.sales, "t9", script)).await.unwrap_err();
+    let at = e.statement.expect("its statement");
+    assert_eq!((at.index, &script[at.start..at.end]), (1, &script[10..]));
+    assert_eq!(e.position, Some(script[10..].find("delete").unwrap() as u32 + 1));
+    // A read-only connection's refusal names its statement too.
+    let ro = "select 1;\ndelete from customers";
+    let e = s.run(req(&s.crm, "t9", ro)).await.unwrap_err();
+    let at = e.statement.expect("its statement");
+    assert_eq!((at.index, &ro[at.start..at.end]), (1, "delete from customers"), "{e:?}");
+    // An unknown connection: the part's statement and where its name is.
+    let unknown = "select 1;\nwith a as (@nope select 1) select * from a";
+    let e = s.run(req(&s.sales, "t9", unknown)).await.unwrap_err();
+    assert_eq!(e.statement.map(|a| a.index), Some(1), "{e:?}");
+    assert_eq!(e.position, Some(unknown[10..].find("@nope").unwrap() as u32 + 1));
+    // A value longer than its `:name` before the error: the position is the written one.
+    let long = HashMap::from([("v".to_string(), ParamValue { value: "a much longer value than the name".into(), raw: false })]);
+    let plain = "select :v, nope from orders";
+    let mut r = req(&s.sales, "t9", plain);
+    r.params = long.clone();
+    let out = s.run(r).await.unwrap();
+    assert_eq!(out[0].error.as_ref().and_then(|e| e.position), Some(plain.find("nope").unwrap() as u32 + 1), "{:?}", out[0].error);
+    // The same in a part (it runs as bound: nothing to push).
+    let part = "with a as (@crm select :v, nope from customers) select * from a";
+    let mut r = req(&s.sales, "t9", part);
+    r.params = long;
+    let out = s.run(r).await.unwrap();
+    assert_eq!(out[0].error.as_ref().and_then(|e| e.position), Some(part.find("nope").unwrap() as u32 + 1), "{:?}", out[0].error);
+}
+
 /// Two combined statements of one run, each with a part of the same name:
 /// each part keeps its own result (their ids carry the statement and the
 /// part's place, not its name), and each join reads its own part.

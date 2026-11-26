@@ -70,15 +70,19 @@ impl QueryEngine {
                         } else {
                             ": on a read-only connection only queries run (transactions and session settings could make it writable)"
                         };
-                        return Err(EngineError::new(
-                            "invalid",
-                            format!(
-                                "Connection \"{}\" is read-only; statement {} ({}) was not run{why}.",
-                                profile.name,
-                                p.index + 1,
-                                p.classification().keyword
-                            ),
-                        ));
+                        return Err(EngineError {
+                            // The editor marks the statement (a part's has no place of its own here).
+                            statement: (p.end > p.start).then_some(crate::StatementAt { index: p.index, start: p.start, end: p.end }),
+                            ..EngineError::new(
+                                "invalid",
+                                format!(
+                                    "Connection \"{}\" is read-only; statement {} ({}) was not run{why}.",
+                                    profile.name,
+                                    p.index + 1,
+                                    p.classification().keyword
+                                ),
+                            )
+                        });
                     }
                 }
                 Ok(if *confirmed { Vec::new() } else { Self::safety_reasons(profile, plan) })

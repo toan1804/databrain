@@ -142,7 +142,7 @@ export const isTauri = (): boolean =>
 export function toError(e: unknown): EngineError {
   if (e && typeof e === "object" && "message" in e) {
     const o = e as Partial<EngineError>;
-    return { kind: o.kind ?? "internal", message: String(o.message), code: o.code, position: o.position };
+    return { kind: o.kind ?? "internal", message: String(o.message), code: o.code, position: o.position, statement: o.statement };
   }
   return { kind: "internal", message: String(e) };
 }

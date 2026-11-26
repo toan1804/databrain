@@ -23,7 +23,10 @@ pub(crate) use classify::keyword_kind;
 pub use classify::{Classification, StatementKind, classify, delta_describe};
 pub use combined::{Combined, CombinedError, CombinedPart, ConnectionRef, looks_combined, parse_combined, with_list_end};
 pub use mark::MarkType;
-pub use params::{ParamSpan, ParamValue, find_parameters, quote_string, render_param, substitute_known_parameters, substitute_parameters};
+pub use params::{
+    ParamMap, ParamSpan, ParamValue, find_parameters, quote_string, render_param, substitute_known_parameters, substitute_parameters, substitute_with_map,
+    written_position,
+};
 pub use parsed::{ParsedStatement, parse_script};
 pub use read_only::{read_only_allows, unknown_functions};
 pub use redact::{redact_key_values, redact_secrets, redact_text, redact_url_passwords};

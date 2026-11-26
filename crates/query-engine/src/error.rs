@@ -20,11 +20,26 @@ pub struct EngineError {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub position: Option<u32>,
+    /// A refusal before the run: the statement it is about, so the editor
+    /// marks it there (`position` is in it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub statement: Option<StatementAt>,
+}
+
+/// Where a statement is in the run's text: its index and offsets (bytes in
+/// the engine; the app gives the UI UTF-16 offsets, as for the plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct StatementAt {
+    pub index: usize,
+    pub start: usize,
+    pub end: usize,
 }
 
 impl EngineError {
     pub fn new(kind: &str, message: impl Into<String>) -> Self {
-        Self { kind: kind.into(), message: message.into(), code: None, position: None }
+        Self { kind: kind.into(), message: message.into(), code: None, position: None, statement: None }
     }
 }
 
@@ -38,10 +53,10 @@ impl From<ConnectorError> for EngineError {
         // whatever kind the driver gave it. Its own code isn't kept (Oracle's
         // is in the message; MySQL's and SQL Server's aren't).
         if e.is_password_expired() {
-            return Self { kind: "auth".into(), message: e.message, code: Some(PASSWORD_EXPIRED.into()), position: None };
+            return Self { code: Some(PASSWORD_EXPIRED.into()), ..Self::new("auth", e.message) };
         }
         let kind = serde_json::to_value(e.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "internal".into());
-        Self { kind, message: e.message, code: e.code, position: e.position }
+        Self { code: e.code, position: e.position, ..Self::new(&kind, e.message) }
     }
 }
 

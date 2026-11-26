@@ -63,6 +63,8 @@ export interface RunsSlice {
   /** Forget dropped outputs in runs, output tabs and the list. */
   forgetOutputs: (handles: string[]) => void;
   runs: Record<string, TabRun>;
+  /** Where a run refused before it started points in the editor (by run key); it wins over the last run's mark until the next run. */
+  preRunErrors: Record<string, { from: number; to: number }>;
   /** Drop the runs of closed run keys (notebook cells removed or closed); `prefix` drops every key starting with it. */
   forgetRuns: (keys: string[], prefix?: string) => void;
   /** Run keys whose owner is gone for good (a notebook cell deleted): their runs go, and a run of one still starting is stopped. */
@@ -235,17 +237,22 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       return { runs, outputs: s.outputs.map((x) => (x.handle === o.handle ? o : x)) };
     }),
   runs: {},
+  preRunErrors: {},
   retireRunKeys: (keys) => {
     for (const k of keys) retiredKeys.add(k);
     get().forgetRuns(keys);
   },
   forgetRuns: (keys, prefix) => {
-    const gone = Object.keys(get().runs).filter((k) => keys.includes(k) || (prefix !== undefined && k.startsWith(prefix)));
-    if (!gone.length) return;
+    const of = (k: string) => keys.includes(k) || (prefix !== undefined && k.startsWith(prefix));
+    const gone = Object.keys(get().runs).filter(of);
+    const refused = Object.keys(get().preRunErrors).filter(of);
+    if (!gone.length && !refused.length) return;
     set((s) => {
       const runs = { ...s.runs };
       for (const k of gone) delete runs[k];
-      return { runs };
+      const preRunErrors = { ...s.preRunErrors };
+      for (const k of refused) delete preRunErrors[k];
+      return { runs, preRunErrors };
     });
   },
   txOpen: {},
@@ -350,8 +357,17 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     // sign-in): what started is stopped and nothing is shown for it.
     const openAtStart = runKeyOpen(get(), runKey);
     const closed = () => retiredKeys.has(runKey) || (openAtStart && !runKeyOpen(get(), runKey));
+    // A refusal's mark is the last run's until this one says otherwise.
+    const clearRefusal = () =>
+      get().preRunErrors[runKey] &&
+      set((st) => {
+        const rest = { ...st.preRunErrors };
+        delete rest[runKey];
+        return { preRunErrors: rest };
+      });
     const submit = async (confirmed: boolean): Promise<boolean> => {
       if (closed()) return false;
+      clearRefusal();
       try {
         const req = {
           connection_id: connectionId,
@@ -421,7 +437,8 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
                 jobId: resp.job_id,
                 running: true,
                 startedAt: Date.now(),
-                statements: resp.statements.map((p) => ({ plan: p, status: "pending", notices: [] })),
+                // What the editor had: positions count in it (`plan.sql` is bound).
+                statements: resp.statements.map((p) => ({ plan: p, status: "pending", notices: [], written: sql.slice(p.start - base, p.end - base) })),
                 kept: carriedResults(st.runs[runKey]),
                 activeIndex: null,
                 connectionId,
@@ -441,6 +458,21 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           // Interactive sign-in expired: sign in, then retry once.
           if (await get().signInConnection(conn.id)) return submit(confirmed);
           return false;
+        }
+        // A refusal before the run (a part that writes, an unknown
+        // connection, a read-only connection) is marked where it is, and
+        // the last run's mark goes (it would come back once this one is
+        // cleared). Not for a refreshed result: its SQL isn't the editor's.
+        if (err.statement && replaces === undefined) {
+          const { start, end } = err.statement;
+          const range = errorRange({ start, end, sql: sql.slice(start - base, end - base) }, err.position ?? undefined);
+          set((st) => {
+            const prev = st.runs[runKey];
+            return {
+              preRunErrors: { ...st.preRunErrors, [runKey]: range },
+              ...(prev?.errorRange ? { runs: { ...st.runs, [runKey]: { ...prev, errorRange: undefined } } } : {}),
+            };
+          });
         }
         get().toast(err.message, "error");
         return false;
@@ -642,7 +674,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             durationMs: e.duration_ms,
           });
           const st = statements[posOf(e.index)];
-          if (!cancelled && st) next.errorRange = errorRange(st.plan, e.error.position);
+          if (!cancelled && st) next.errorRange = errorRange({ ...st.plan, sql: st.written ?? st.plan.sql }, e.error.position);
           if (next.activeIndex === null || !cancelled) next.activeIndex = e.index;
           break;
         }

@@ -266,15 +266,18 @@ export function runContext(key: string | null | undefined): {
   resultId: string | null;
   error: string | null;
   failed: PlannedStatement | null;
+  /** The failed statement as written in the editor (`failed.sql` is what ran). */
+  failedWritten: string | null;
 } {
   const run = key ? useStore.getState().runs[key] : undefined;
-  if (!run) return { resultId: null, error: null, failed: null };
+  if (!run) return { resultId: null, error: null, failed: null, failedWritten: null };
   const active = shownStatement(run);
   const failed = run.statements.find((s) => s.status === "error");
   return {
     resultId: active?.result?.id ?? run.statements.find((s) => s.result)?.result?.id ?? null,
     error: failed?.error?.message ?? null,
     failed: failed?.plan ?? null,
+    failedWritten: failed?.written ?? null,
   };
 }
 
@@ -840,7 +843,7 @@ export const useAi = create<AiState>((set, get) => {
       let failedLine: number | null = null;
       if (mode === "fix_error" && rc.failed) {
         const doc = editorBridge.snapshot(key)?.sql;
-        const at = doc !== undefined ? locateStatement(doc, rc.failed) : null;
+        const at = doc !== undefined ? locateStatement(doc, { ...rc.failed, sql: rc.failedWritten ?? rc.failed.sql }) : null;
         if (doc !== undefined && at) {
           editorBridge.select(key, at.from, at.to);
           failedLine = lineOf(doc, at.from);

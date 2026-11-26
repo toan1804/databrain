@@ -100,13 +100,13 @@ export function slowStatements<T extends { status: string; durationMs?: number; 
 export async function computeRunTips(
   connId: string,
   kind: ConnectorKind | undefined,
-  statements: { plan: PlannedStatement; status: string }[],
+  statements: { plan: PlannedStatement; status: string; written?: string }[],
   fetch: Fetch = (c, t) => api.hintLayouts(c, t),
 ): Promise<RunTips> {
   const out: RunTips = { tips: [], tables: [], statements: [], unavailable: [] };
   const todo = statements.filter(analysable).slice(0, 20);
   const refs = todo.map((s) =>
-    refsWithPos(s.plan.sql, kind).filter((r) => !(kind === "duckdb" && r.parts[0]?.toLowerCase() === "results")),
+    refsWithPos(s.written ?? s.plan.sql, kind).filter((r) => !(kind === "duckdb" && r.parts[0]?.toLowerCase() === "results")),
   );
   const written = refs.flat().map((r) => r.parts.join("."));
   if (!written.length) return out;
@@ -125,8 +125,10 @@ export async function computeRunTips(
         out.unavailable.push({ table: w, error: l.error });
       }
     }
-    out.statements.push({ index: s.plan.index, start: s.plan.start, sql: s.plan.sql });
-    for (const h of analyzeStatement(s.plan.sql, known, kind)) {
+    // Positions in the editor count in the text as written.
+    const text = s.written ?? s.plan.sql;
+    out.statements.push({ index: s.plan.index, start: s.plan.start, sql: text });
+    for (const h of analyzeStatement(text, known, kind)) {
       out.tips.push({ statementIndex: s.plan.index, from: s.plan.start + h.from, to: s.plan.start + h.to, level: h.level, message: h.message });
     }
   });

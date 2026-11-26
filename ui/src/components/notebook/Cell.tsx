@@ -67,6 +67,7 @@ export function Cell(props: CellProps) {
   } = props;
   const key = cellKey(nbId, cell.id);
   const run = useStore((s) => s.runs[key]);
+  const refused = useStore((s) => s.preRunErrors[key]);
   const connections = useStore((s) => s.connections);
   const [aiOpen, setAiOpen] = useState(false);
   const outRef = useRef<HTMLDivElement>(null);
@@ -243,7 +244,7 @@ export function Cell(props: CellProps) {
             editorKey={key}
             source={cell.source}
             connectionId={props.connectionId}
-            error={run?.errorRange}
+            error={refused ?? run?.errorRange}
             height={cell.editor_height ?? null}
             onResize={(h) => onChange({ editor_height: h })}
             onChange={(source) => onChange({ source })}
