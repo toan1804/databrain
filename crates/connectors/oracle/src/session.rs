@@ -392,37 +392,44 @@ impl Session for OracleSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{TableLayout, group_indexes, query_text, quote_literal, truthy};
-        let (s, t) = (quote_literal(schema), quote_literal(name));
-        let idx = query_text(
-            self,
-            &format!(
-                "select ic.index_name, ic.column_name, case when i.uniqueness = 'UNIQUE' then 1 else 0 end, \
-                        case when c.constraint_name is not null then 1 else 0 end, i.index_type \
+        use databrain_connector_core::{TableLayout, group_indexes, truthy};
+        // Binds, not literals: one statement for every table, planned once
+        // (with the names in the text Oracle planned each table's anew, and
+        // the join to ALL_CONSTRAINTS for the primary key made that 50 ms).
+        let b = || crate::schema::binds(schema, name);
+        let idx = self
+            .query_named(
+                "select ic.index_name, ic.column_name, case when i.uniqueness = 'UNIQUE' then '1' else '0' end, i.index_type \
                  from all_ind_columns ic \
                  join all_indexes i on i.owner = ic.index_owner and i.index_name = ic.index_name \
-                 left join all_constraints c on c.owner = i.table_owner and c.index_name = i.index_name and c.constraint_type = 'P' \
-                 where ic.table_owner = {s} and ic.table_name = {t} \
-                 order by 4 desc, ic.index_name, ic.column_position"
-            ),
-        )
-        .await?;
-        let mut l = TableLayout {
-            indexes: group_indexes(idx.into_iter().map(|r| {
-                let m = r[4].clone().map(|m| m.to_ascii_lowercase()).filter(|m| m != "normal");
-                (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), m)
-            })),
-            ..Default::default()
-        };
-        if let Ok(p) = query_text(
-            self,
-            &format!(
-                "select k.column_name, lower(p.partitioning_type), p.partition_count from all_part_key_columns k \
+                 where ic.table_owner = :o and ic.table_name = :n \
+                 order by ic.index_name, ic.column_position",
+                b(),
+            )
+            .await?;
+        // The primary key's index (none: no primary key, or not readable).
+        let pk: Option<String> = self
+            .query_named("select index_name from all_constraints where owner = :o and table_name = :n and constraint_type = 'P'", b())
+            .await
+            .ok()
+            .and_then(|r| r.into_iter().next())
+            .and_then(|r| r.into_iter().next().flatten());
+        // `group_indexes` puts the primary key's index first.
+        let rows = idx.into_iter().map(|r| {
+            let name = r[0].clone().unwrap_or_default();
+            let m = r[3].clone().map(|m| m.to_ascii_lowercase()).filter(|m| m != "normal");
+            let primary = pk.as_deref() == Some(name.as_str());
+            (name, r[1].clone().unwrap_or_default(), truthy(&r[2]), primary, m)
+        });
+        let mut l = TableLayout { indexes: group_indexes(rows), ..Default::default() };
+        if let Ok(p) = self
+            .query_named(
+                "select k.column_name, lower(p.partitioning_type), to_char(p.partition_count) from all_part_key_columns k \
                  join all_part_tables p on p.owner = k.owner and p.table_name = k.name \
-                 where k.owner = {s} and k.name = {t} and k.object_type = 'TABLE' order by k.column_position"
-            ),
-        )
-        .await
+                 where k.owner = :o and k.name = :n and k.object_type = 'TABLE' order by k.column_position",
+                b(),
+            )
+            .await
         {
             l.partition_by = p.iter().filter_map(|r| r[0].clone()).collect();
             l.partition_kind = p.first().and_then(|r| r[1].clone());
@@ -432,7 +439,9 @@ impl Session for OracleSession {
             }
         }
         // From the optimizer statistics (no DBA views needed): rows × average row length.
-        if let Ok(r) = query_text(self, &format!("select num_rows, num_rows * avg_row_len from all_tables where owner = {s} and table_name = {t}")).await {
+        if let Ok(r) =
+            self.query_named("select to_char(num_rows), to_char(num_rows * avg_row_len) from all_tables where owner = :o and table_name = :n", b()).await
+        {
             l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
             l.size_bytes = r.first().and_then(|r| r.get(1).cloned().flatten()).and_then(|x| x.parse().ok());
         }
@@ -1112,6 +1121,8 @@ mod tests {
         assert!(e.position.is_some(), "{e:?}");
 
         // DDL/DML, many rows in several batches, the catalog.
+        // (A child left by a failed run would keep kb_thin from being dropped.)
+        let _ = run("drop table kb_fk_child purge").await;
         let _ = run("drop table kb_thin purge").await;
         run("create table kb_thin (id number(10) primary key, name varchar2(40), note varchar2(100))").await.unwrap();
         run("comment on table kb_thin is 'thin test'").await.unwrap();
@@ -1143,9 +1154,54 @@ mod tests {
         let v = s.object_ddl(&me, "KB_THIN_V", ObjectKind::View).await.unwrap().unwrap();
         assert!(v.starts_with("CREATE OR REPLACE VIEW") && v.contains("where id > 10"), "{driver}: {v}");
         run("drop view kb_thin_v").await.unwrap();
-        // A partitioned table's DDL: its first partition and how many more,
-        // and it runs (an INTERVAL table needs a partition in it). Checks
-        // come without a LONG on 12.2+.
+        // Foreign keys are read apart from the constraints (two statements,
+        // never ALL_CONS_COLUMNS twice in one): a two-column key pairs with
+        // the referenced columns in key order, in the DDL and in describe;
+        // the primary key is marked, and its index comes first in the layout.
+        let _ = run("drop table kb_fk_child purge").await;
+        let _ = run("drop table kb_fk_parent purge").await;
+        run("create table kb_fk_parent (k2 number, k1 number, constraint kb_fk_parent_uk unique (k1, k2))").await.unwrap();
+        run("create table kb_fk_child (id number constraint kb_fk_child_pk primary key, b number, a number, t number, \
+             constraint kb_fk_child_pair foreign key (a, b) references kb_fk_parent (k1, k2) on delete cascade, \
+             constraint kb_fk_child_thin foreign key (t) references kb_thin (id))")
+        .await
+        .unwrap();
+        run("create index kb_fk_child_a on kb_fk_child (a, b)").await.unwrap();
+        let c = s.object_ddl(&me, "KB_FK_CHILD", ObjectKind::Table).await.unwrap().unwrap();
+        assert!(
+            c.contains("CONSTRAINT \"KB_FK_CHILD_PAIR\" FOREIGN KEY (\"A\", \"B\") REFERENCES \"KB_FK_PARENT\" (\"K1\", \"K2\") ON DELETE CASCADE")
+                && c.contains("CONSTRAINT \"KB_FK_CHILD_THIN\" FOREIGN KEY (\"T\") REFERENCES \"KB_THIN\" (\"ID\")")
+                && c.contains("CONSTRAINT \"KB_FK_CHILD_PK\" PRIMARY KEY (\"ID\")")
+                && c.contains("\".\"KB_FK_CHILD_A\" ON ")
+                && c.contains("\"KB_FK_CHILD\" (\"A\", \"B\");"),
+            "{driver}: {c}"
+        );
+        let d = s.describe(&me, "KB_FK_CHILD").await.unwrap();
+        let cols: Vec<(&str, bool)> = d.columns.iter().map(|c| (c.name.as_str(), c.is_primary_key)).collect();
+        assert_eq!(cols, [("ID", true), ("B", false), ("A", false), ("T", false)], "{driver}");
+        let mut fks: Vec<(Vec<String>, String, Vec<String>)> =
+            d.foreign_keys.iter().map(|f| (f.columns.clone(), f.ref_table.clone(), f.ref_columns.clone())).collect();
+        fks.sort();
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(fks, [(v(&["A", "B"]), "KB_FK_PARENT".to_string(), v(&["K1", "K2"])), (v(&["T"]), "KB_THIN".to_string(), v(&["ID"]))], "{driver}");
+        assert!(d.foreign_keys.iter().all(|f| f.ref_schema == me), "{driver}");
+        assert!(s.describe(&me, "KB_FK_PARENT").await.unwrap().foreign_keys.is_empty(), "{driver}");
+        let l = s.table_layout(&me, "KB_FK_CHILD").await.unwrap();
+        let idx: Vec<(&str, bool, bool, Vec<String>)> = l.indexes.iter().map(|i| (i.name.as_str(), i.primary, i.unique, i.columns.clone())).collect();
+        assert_eq!(idx, [("KB_FK_CHILD_PK", true, true, v(&["ID"])), ("KB_FK_CHILD_A", false, false, v(&["A", "B"]))], "{driver}");
+        // The whole schema's columns and keys agree with the one table's.
+        let all = s.schema_columns(&me).await.unwrap();
+        let t = all.iter().find(|t| t.table == "KB_FK_CHILD").unwrap();
+        assert_eq!(t.columns.iter().map(|c| (c.name.as_str(), c.is_primary_key)).collect::<Vec<_>>(), cols, "{driver}");
+        let mut all_fks: Vec<(Vec<String>, String, Vec<String>)> =
+            t.foreign_keys.iter().map(|f| (f.columns.clone(), f.ref_table.clone(), f.ref_columns.clone())).collect();
+        all_fks.sort();
+        assert_eq!(all_fks, fks, "{driver}");
+        run("drop table kb_fk_child purge").await.unwrap();
+        run("drop table kb_fk_parent purge").await.unwrap();
+        // A partitioned table's DDL has no partitioning (the table's
+        // Partitions part shows it) and runs as a plain table. Checks come
+        // without a LONG on 12.2+.
         let _ = run("drop table kb_part purge").await;
         run("create table kb_part (id number, d date not null, constraint kb_part_ck check (id > 0)) \
              partition by range (d) interval (numtoyminterval(1, 'MONTH')) (partition p0 values less than (date '2020-01-01'))")
@@ -1154,11 +1210,7 @@ mod tests {
         run("insert into kb_part values (1, date '2024-05-01')").await.unwrap();
         run("insert into kb_part values (2, date '2024-07-01')").await.unwrap();
         let p = s.object_ddl(&me, "KB_PART", ObjectKind::Table).await.unwrap().unwrap();
-        assert!(
-            p.contains("PARTITION BY RANGE (\"D\") INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))") && p.contains("PARTITION \"P0\" VALUES LESS THAN (TO_DATE"),
-            "{driver}: {p}"
-        );
-        assert!(p.contains("lists them all") && !p.contains("1048575") && p.contains("CHECK (id > 0)"), "{driver}: {p}");
+        assert!(!p.to_uppercase().contains("PARTITION") && p.contains("CHECK (id > 0)") && p.contains("\"D\" DATE NOT NULL"), "{driver}: {p}");
         run("drop table kb_part purge").await.unwrap();
         let create = p.split(";\n").next().unwrap().to_string();
         s.execute(databrain_connector_core::Statement::internal(&create), ExecOptions::default())

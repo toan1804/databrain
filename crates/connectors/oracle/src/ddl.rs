@@ -33,48 +33,51 @@ pub const COLUMNS_SQL: &str = "select c.column_name, c.data_type, to_char(c.data
 pub const COLUMNS_SQL_11G: &str = "select c.column_name, c.data_type, to_char(c.data_length), to_char(c.data_precision), to_char(c.data_scale), \
        to_char(c.char_length), c.char_used, c.nullable, c.data_default, c.virtual_column, 'NO', null \
      from all_tab_cols c where c.owner = :o and c.table_name = :n and c.hidden_column = 'NO' order by c.column_id";
-/// Table properties.
-pub const TABLE_SQL: &str = "select t.temporary, t.duration, t.iot_type, t.partitioned, \
-       (select c.comments from all_tab_comments c where c.owner = t.owner and c.table_name = t.table_name) \
-     from all_tables t where t.owner = :o and t.table_name = :n";
-/// Constraints with their columns and, for foreign keys, the referenced columns.
+/// Table properties (its comment comes with [`COMMENTS_SQL`]). Partitioning
+/// isn't part of the DDL: the table's Partitions part shows it, and reading
+/// it took up to three more statements.
+pub const TABLE_SQL: &str = "select t.temporary, t.duration, t.iot_type from all_tables t where t.owner = :o and t.table_name = :n";
+/// Constraints with their columns. A foreign key's referenced columns are
+/// [`REF_KEYS_SQL`], a query of its own: joining ALL_CONS_COLUMNS a second
+/// time here (paired by position) takes Oracle about ten times longer to
+/// plan (0.45 s against 0.04 s on 23ai), and it plans that join badly.
 pub const CONSTRAINTS_SQL: &str = "select k.constraint_name, k.constraint_type, k.search_condition_vc, k.delete_rule, k.status, k.generated, \
-       k.index_name, cc.column_name, rc.owner, rc.table_name, rc.column_name, k.deferrable, k.deferred \
+       k.index_name, cc.column_name, k.deferrable, k.deferred \
      from all_constraints k \
      left join all_cons_columns cc on cc.owner = k.owner and cc.constraint_name = k.constraint_name and cc.table_name = k.table_name \
-     left join all_cons_columns rc on rc.owner = k.r_owner and rc.constraint_name = k.r_constraint_name and rc.position = cc.position \
      where k.owner = :o and k.table_name = :n and k.constraint_type in ('P','U','R','C') \
      order by decode(k.constraint_type, 'P', 0, 'U', 1, 'R', 2, 3), k.constraint_name, cc.position";
 /// Before 12.2: the condition only as a LONG (read a row at a time).
 pub const CONSTRAINTS_SQL_12_1: &str = "select k.constraint_name, k.constraint_type, k.search_condition, k.delete_rule, k.status, k.generated, \
-       k.index_name, cc.column_name, rc.owner, rc.table_name, rc.column_name, k.deferrable, k.deferred \
+       k.index_name, cc.column_name, k.deferrable, k.deferred \
      from all_constraints k \
      left join all_cons_columns cc on cc.owner = k.owner and cc.constraint_name = k.constraint_name and cc.table_name = k.table_name \
-     left join all_cons_columns rc on rc.owner = k.r_owner and rc.constraint_name = k.r_constraint_name and rc.position = cc.position \
      where k.owner = :o and k.table_name = :n and k.constraint_type in ('P','U','R','C') \
      order by decode(k.constraint_type, 'P', 0, 'U', 1, 'R', 2, 3), k.constraint_name, cc.position";
-/// Indexes on the table (any owner), with function-based expressions.
-pub const INDEXES_SQL: &str = "select i.owner, i.index_name, i.index_type, i.uniqueness, ic.column_name, ic.descend, ie.column_expression \
+/// The columns each foreign key of the table references, in key order
+/// (asked only when the table has a foreign key).
+pub const REF_KEYS_SQL: &str = "select k.constraint_name, rc.owner, rc.table_name, rc.column_name \
+     from all_constraints k \
+     join all_cons_columns rc on rc.owner = k.r_owner and rc.constraint_name = k.r_constraint_name \
+     where k.owner = :o and k.table_name = :n and k.constraint_type = 'R' \
+     order by k.constraint_name, rc.position";
+/// Indexes on the table (any owner). The expressions of function-based
+/// (and DESC) index columns are [`INDEX_EXPRESSIONS_SQL`].
+pub const INDEXES_SQL: &str = "select i.owner, i.index_name, i.index_type, i.uniqueness, ic.column_name, ic.descend, to_char(ic.column_position) \
      from all_indexes i \
      join all_ind_columns ic on ic.index_owner = i.owner and ic.index_name = i.index_name \
-     left join all_ind_expressions ie on ie.index_owner = ic.index_owner and ie.index_name = ic.index_name and ie.column_position = ic.column_position \
      where i.table_owner = :o and i.table_name = :n and i.index_type not in ('LOB', 'IOT - TOP') \
      order by i.index_name, ic.column_position";
-pub const COL_COMMENTS_SQL: &str = "select column_name, comments from all_col_comments \
-     where owner = :o and table_name = :n and comments is not null";
-/// Partitioning: type, subpartitioning type, interval.
-pub const PART_SQL: &str = "select partitioning_type, subpartitioning_type, interval, to_char(partition_count) from all_part_tables \
-     where owner = :o and table_name = :n";
-/// The first partition: a RANGE or LIST table needs one in its DDL (the
-/// rest aren't listed: each bound is a LONG, read a row at a time).
-pub const FIRST_PARTITION_SQL: &str = "select partition_name, high_value from all_tab_partitions \
-     where table_owner = :o and table_name = :n and partition_position = 1";
-pub const PART_SQL_10G: &str = "select partitioning_type, subpartitioning_type, null, to_char(partition_count) from all_part_tables \
-     where owner = :o and table_name = :n";
-/// Partition and subpartition key columns (object_type TABLE).
-pub const PART_KEYS_SQL: &str = "select 'P', column_name, column_position from all_part_key_columns where owner = :o and name = :n and object_type = 'TABLE' \
-     union all select 'S', column_name, column_position from all_subpart_key_columns where owner = :o and name = :n and object_type = 'TABLE' \
-     order by 1, 3";
+/// Expressions of the table's function-based index columns (asked only
+/// when it has such an index: each is a LONG, read a row at a time, and
+/// joined to [`INDEXES_SQL`] it made every index column a row of its own
+/// round trip and the statement five times slower to plan).
+pub const INDEX_EXPRESSIONS_SQL: &str = "select index_owner, index_name, to_char(column_position), column_expression from all_ind_expressions \
+     where table_owner = :o and table_name = :n";
+/// Column comments, and the table's own (no column name).
+pub const COMMENTS_SQL: &str = "select column_name, comments from all_col_comments \
+     where owner = :o and table_name = :n and comments is not null \
+     union all select null, comments from all_tab_comments where owner = :o and table_name = :n and comments is not null";
 pub const VIEW_SQL: &str = "select v.text, (select c.comments from all_tab_comments c where c.owner = v.owner and c.table_name = v.view_name) \
      from all_views v where v.owner = :o and v.view_name = :n";
 pub const VIEW_COLUMNS_SQL: &str = "select column_name from all_tab_columns where owner = :o and table_name = :n order by column_id";
@@ -132,12 +135,13 @@ pub struct TableParts {
     pub columns: Rows,
     pub table: Rows,
     pub constraints: Rows,
+    /// Referenced columns of the foreign keys (see [`REF_KEYS_SQL`]).
+    pub ref_keys: Rows,
     pub indexes: Rows,
-    pub col_comments: Rows,
-    pub part: Rows,
-    pub part_keys: Rows,
-    /// The first partition (see [`FIRST_PARTITION_SQL`]).
-    pub first_partition: Rows,
+    /// See [`INDEX_EXPRESSIONS_SQL`].
+    pub index_expressions: Rows,
+    /// Column comments and the table's (see [`COMMENTS_SQL`]).
+    pub comments: Rows,
 }
 
 struct Constraint<'a> {
@@ -156,7 +160,10 @@ struct Constraint<'a> {
     deferred: bool,
 }
 
-fn constraints(rows: &Rows) -> Vec<Constraint<'_>> {
+/// Constraints from the rows of [`CONSTRAINTS_SQL`] (one per column, a
+/// constraint's rows together), foreign keys with what `ref_keys` says they
+/// reference.
+fn constraints<'a>(rows: &'a Rows, ref_keys: &'a Rows) -> Vec<Constraint<'a>> {
     let mut out: Vec<Constraint> = Vec::new();
     for r in rows {
         let name = get(r, 0).unwrap_or("");
@@ -170,11 +177,11 @@ fn constraints(rows: &Rows) -> Vec<Constraint<'_>> {
                 generated: get(r, 5) == Some("GENERATED NAME"),
                 index: get(r, 6),
                 cols: vec![],
-                r_owner: get(r, 8),
-                r_table: get(r, 9),
+                r_owner: None,
+                r_table: None,
                 r_cols: vec![],
-                deferrable: get(r, 11) == Some("DEFERRABLE"),
-                deferred: get(r, 12) == Some("DEFERRED"),
+                deferrable: get(r, 8) == Some("DEFERRABLE"),
+                deferred: get(r, 9) == Some("DEFERRED"),
             });
         }
         let c = out.last_mut().unwrap();
@@ -183,8 +190,14 @@ fn constraints(rows: &Rows) -> Vec<Constraint<'_>> {
         {
             c.cols.push(col);
         }
-        if let Some(rc) = get(r, 10) {
-            c.r_cols.push(rc);
+    }
+    for c in out.iter_mut().filter(|c| c.kind == "R") {
+        for k in ref_keys.iter().filter(|k| get(k, 0) == Some(c.name)) {
+            c.r_owner = get(k, 1);
+            c.r_table = get(k, 2);
+            if let Some(col) = get(k, 3) {
+                c.r_cols.push(col);
+            }
         }
     }
     out
@@ -228,55 +241,7 @@ fn constraint_line(owner: &str, c: &Constraint) -> Option<String> {
     Some(s)
 }
 
-/// Oracle's partition count of an INTERVAL table: the most it may have.
-const INTERVAL_COUNT: &str = "1048575";
-
-fn partition_clause(p: &TableParts) -> Option<String> {
-    let r = p.part.first()?;
-    let kind = get(r, 0)?;
-    let keys = |k: &str| {
-        let l: Vec<&str> = p.part_keys.iter().filter(|r| get(r, 0) == Some(k)).filter_map(|r| get(r, 1)).collect();
-        if l.is_empty() { String::new() } else { format!(" {}", col_list(l.into_iter())) }
-    };
-    let interval = get(r, 2).map(str::trim).filter(|i| !i.is_empty());
-    let count = get(r, 3).filter(|n| *n != "0" && *n != INTERVAL_COUNT).and_then(|n| n.parse::<u64>().ok());
-    let mut s = format!("PARTITION BY {kind}{}", keys("P"));
-    if let Some(i) = interval {
-        s.push_str(&format!(" INTERVAL ({i})"));
-    }
-    if let Some(sub) = get(r, 1).filter(|s| *s != "NONE") {
-        s.push_str(&format!("\nSUBPARTITION BY {sub}{}", keys("S")));
-    }
-    match kind {
-        "HASH" | "SYSTEM" => {
-            if let Some(n) = count {
-                s.push_str(&format!("\nPARTITIONS {n}"));
-            }
-        }
-        // The partitions aren't all listed (DBeaver lists them apart too):
-        // the first one, which the statement needs, and how many more.
-        _ => {
-            if let Some(f) = p.first_partition.first() {
-                let name = qi(get(f, 0)?);
-                let hv = get(f, 1).map(str::trim).unwrap_or("");
-                let first = match kind {
-                    "RANGE" => format!("    PARTITION {name} VALUES LESS THAN ({hv})"),
-                    "LIST" => format!("    PARTITION {name} VALUES ({hv})"),
-                    _ => format!("    PARTITION {name}"),
-                };
-                let more = match count {
-                    Some(n) if n > 1 => format!("\n    -- and {} more: the table's Partitions part lists them", n - 1),
-                    Some(_) => String::new(),
-                    None => "\n    -- the table's Partitions part lists them all".into(),
-                };
-                s.push_str(&format!("\n(\n{first}{more}\n)"));
-            }
-        }
-    }
-    Some(s)
-}
-
-/// CREATE TABLE with constraints, partitioning, indexes and comments.
+/// CREATE TABLE with constraints, indexes and comments (no partitioning).
 /// `None` when the table isn't visible (no columns).
 pub fn table_ddl(owner: &str, name: &str, p: &TableParts) -> Option<String> {
     if p.columns.is_empty() {
@@ -310,7 +275,7 @@ pub fn table_ddl(owner: &str, name: &str, p: &TableParts) -> Option<String> {
             l
         })
         .collect();
-    let cons = constraints(&p.constraints);
+    let cons = constraints(&p.constraints, &p.ref_keys);
     lines.extend(cons.iter().filter_map(|c| constraint_line(owner, c)));
     let table = full(owner, name);
     let mut ddl = format!("CREATE {}TABLE {table} (\n{}\n)", if temporary { "GLOBAL TEMPORARY " } else { "" }, lines.join(",\n"));
@@ -320,25 +285,21 @@ pub fn table_ddl(owner: &str, name: &str, p: &TableParts) -> Option<String> {
     if iot {
         ddl.push_str("\nORGANIZATION INDEX");
     }
-    if let Some(pc) = partition_clause(p) {
-        ddl.push('\n');
-        ddl.push_str(&pc);
-    }
     ddl.push(';');
 
     // Indexes, except those created by a primary key or unique constraint.
     let backing: Vec<&str> = cons.iter().filter(|c| matches!(c.kind, "P" | "U")).filter_map(|c| c.index).collect();
-    let idx = indexes_ddl(&table, &p.indexes, &backing);
+    let idx = indexes_ddl(&table, &p.indexes, &p.index_expressions, &backing);
     if !idx.is_empty() {
         ddl.push_str("\n\n");
         ddl.push_str(&idx.join("\n"));
     }
 
     let mut comments = Vec::new();
-    if let Some(c) = t.and_then(|r| get(r, 4)).filter(|c| !c.is_empty()) {
+    if let Some(c) = p.comments.iter().find(|r| get(r, 0).is_none()).and_then(|r| get(r, 1)).filter(|c| !c.is_empty()) {
         comments.push(format!("COMMENT ON TABLE {table} IS {};", quote_literal(c)));
     }
-    for r in &p.col_comments {
+    for r in &p.comments {
         if let (Some(col), Some(c)) = (get(r, 0), get(r, 1)) {
             comments.push(format!("COMMENT ON COLUMN {table}.{} IS {};", qi(col), quote_literal(c)));
         }
@@ -350,20 +311,33 @@ pub fn table_ddl(owner: &str, name: &str, p: &TableParts) -> Option<String> {
     Some(ddl)
 }
 
-/// CREATE INDEX statements (rows of [`INDEXES_SQL`]), skipping `skip` names.
-pub fn indexes_ddl(table: &str, rows: &Rows, skip: &[&str]) -> Vec<String> {
+/// Whether [`INDEX_EXPRESSIONS_SQL`] has something to say about these rows
+/// of [`INDEXES_SQL`]: a function-based index (a DESC column makes one too).
+pub fn has_function_based(indexes: &Rows) -> bool {
+    indexes.iter().any(|r| get(r, 2).is_some_and(|t| t.contains("FUNCTION-BASED")))
+}
+
+/// CREATE INDEX statements (rows of [`INDEXES_SQL`], expressions from
+/// [`INDEX_EXPRESSIONS_SQL`]), skipping `skip` names.
+pub fn indexes_ddl(table: &str, rows: &Rows, expressions: &Rows, skip: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < rows.len() {
         let (owner, name) = (get(&rows[i], 0).unwrap_or(""), get(&rows[i], 1).unwrap_or(""));
         let mut j = i;
         let mut cols = Vec::new();
+        // A hidden expression column whose expression wasn't read.
+        let mut unread = false;
         while j < rows.len() && get(&rows[j], 1) == Some(name) && get(&rows[j], 0) == Some(owner) {
             let r = &rows[j];
             // Function-based (and DESC) columns: the expression.
-            let mut c = match get(r, 6).map(str::trim).filter(|e| !e.is_empty()) {
+            let expr = expressions.iter().find(|e| get(e, 0) == Some(owner) && get(e, 1) == Some(name) && get(e, 2).is_some() && get(e, 2) == get(r, 6));
+            let mut c = match expr.and_then(|e| get(e, 3)).map(str::trim).filter(|e| !e.is_empty()) {
                 Some(e) => e.to_string(),
-                None => qi(get(r, 4).unwrap_or("")),
+                None => {
+                    unread |= get(r, 4).is_some_and(|c| c.starts_with("SYS_NC"));
+                    qi(get(r, 4).unwrap_or(""))
+                }
             };
             if get(r, 5) == Some("DESC") {
                 c.push_str(" DESC");
@@ -374,6 +348,11 @@ pub fn indexes_ddl(table: &str, rows: &Rows, skip: &[&str]) -> Vec<String> {
         let r = &rows[i];
         i = j;
         if skip.contains(&name) {
+            continue;
+        }
+        // Its hidden column's name would make a statement that doesn't run.
+        if unread {
+            out.push(format!("-- index {}: its expression could not be read", full(owner, name)));
             continue;
         }
         let ty = get(r, 2).unwrap_or("");
@@ -402,7 +381,7 @@ pub fn view_ddl(owner: &str, name: &str, view: &Rows, columns: &Rows) -> Option<
     Some(ddl)
 }
 
-pub fn mview_ddl(owner: &str, name: &str, mv: &Rows, indexes: &Rows) -> Option<String> {
+pub fn mview_ddl(owner: &str, name: &str, mv: &Rows, indexes: &Rows, index_expressions: &Rows) -> Option<String> {
     let r = mv.first()?;
     let query = get(r, 0)?.trim_end().trim_end_matches(';');
     let target = full(owner, name);
@@ -418,7 +397,7 @@ pub fn mview_ddl(owner: &str, name: &str, mv: &Rows, indexes: &Rows) -> Option<S
         _ => {}
     }
     ddl.push_str(&format!("\nAS\n{};", query.trim_start()));
-    let idx = indexes_ddl(&target, indexes, &[]);
+    let idx = indexes_ddl(&target, indexes, index_expressions, &[]);
     if !idx.is_empty() {
         ddl.push_str("\n\n");
         ddl.push_str(&idx.join("\n"));
@@ -472,73 +451,46 @@ mod tests {
                 row(&[Some("AMOUNT"), Some("NUMBER"), Some("22"), Some("12"), Some("2"), Some("0"), n, Some("N"), n, Some("NO"), Some("NO"), n]),
                 row(&[Some("CUST_ID"), Some("NUMBER"), Some("22"), n, n, Some("0"), n, Some("Y"), n, Some("NO"), Some("NO"), n]),
             ],
-            table: vec![row(&[Some("N"), n, n, Some("NO"), Some("Orders")])],
+            table: vec![row(&[Some("N"), n, n])],
             constraints: vec![
+                row(&[Some("PK_O"), Some("P"), n, n, Some("ENABLED"), Some("USER NAME"), Some("PK_O"), Some("ID"), Some("NOT DEFERRABLE"), Some("IMMEDIATE")]),
+                row(&[Some("FK_C"), Some("R"), n, Some("CASCADE"), Some("ENABLED"), Some("USER NAME"), n, Some("CUST_ID"), n, n]),
+                row(&[Some("FK_P"), Some("R"), n, Some("NO ACTION"), Some("ENABLED"), Some("USER NAME"), n, Some("ID"), Some("DEFERRABLE"), Some("DEFERRED")]),
                 row(&[
-                    Some("PK_O"),
-                    Some("P"),
-                    n,
-                    n,
-                    Some("ENABLED"),
-                    Some("USER NAME"),
-                    Some("PK_O"),
-                    Some("ID"),
-                    n,
-                    n,
-                    n,
-                    Some("NOT DEFERRABLE"),
-                    Some("IMMEDIATE"),
-                ]),
-                row(&[
-                    Some("FK_C"),
+                    Some("FK_P"),
                     Some("R"),
                     n,
-                    Some("CASCADE"),
+                    Some("NO ACTION"),
                     Some("ENABLED"),
                     Some("USER NAME"),
                     n,
                     Some("CUST_ID"),
-                    Some("APP"),
-                    Some("CUSTOMERS"),
-                    Some("ID"),
-                    n,
-                    n,
+                    Some("DEFERRABLE"),
+                    Some("DEFERRED"),
                 ]),
-                row(&[
-                    Some("SYS_C001"),
-                    Some("C"),
-                    Some("\"AMOUNT\" IS NOT NULL"),
-                    n,
-                    Some("ENABLED"),
-                    Some("GENERATED NAME"),
-                    n,
-                    Some("AMOUNT"),
-                    n,
-                    n,
-                    n,
-                    n,
-                    n,
-                ]),
-                row(&[Some("CK_AMT"), Some("C"), Some("amount >= 0"), n, Some("ENABLED"), Some("USER NAME"), n, Some("AMOUNT"), n, n, n, n, n]),
+                // A key this user can't see (no rows in `ref_keys`) isn't written.
+                row(&[Some("FK_HIDDEN"), Some("R"), n, n, Some("ENABLED"), Some("USER NAME"), n, Some("CUST_ID"), n, n]),
+                row(&[Some("SYS_C001"), Some("C"), Some("\"AMOUNT\" IS NOT NULL"), n, Some("ENABLED"), Some("GENERATED NAME"), n, Some("AMOUNT"), n, n]),
+                row(&[Some("CK_AMT"), Some("C"), Some("amount >= 0"), n, Some("ENABLED"), Some("USER NAME"), n, Some("AMOUNT"), n, n]),
+            ],
+            // In key order per constraint, whatever the order of the constraints.
+            ref_keys: vec![
+                row(&[Some("FK_P"), Some("OTHER"), Some("PAIRS"), Some("A")]),
+                row(&[Some("FK_P"), Some("OTHER"), Some("PAIRS"), Some("B")]),
+                row(&[Some("FK_C"), Some("APP"), Some("CUSTOMERS"), Some("ID")]),
             ],
             indexes: vec![
-                row(&[
-                    Some("APP"),
-                    Some("IX_NAME"),
-                    Some("FUNCTION-BASED NORMAL"),
-                    Some("NONUNIQUE"),
-                    Some("SYS_NC00005$"),
-                    Some("ASC"),
-                    Some("UPPER(\"NAME\")"),
-                ]),
-                row(&[Some("APP"), Some("IX_NAME"), Some("FUNCTION-BASED NORMAL"), Some("NONUNIQUE"), Some("AMOUNT"), Some("ASC"), n]),
-                row(&[Some("APP"), Some("PK_O"), Some("NORMAL"), Some("UNIQUE"), Some("ID"), Some("ASC"), n]),
-                row(&[Some("APP"), Some("UX_CUST"), Some("NORMAL"), Some("UNIQUE"), Some("CUST_ID"), Some("ASC"), n]),
+                row(&[Some("APP"), Some("IX_NAME"), Some("FUNCTION-BASED NORMAL"), Some("NONUNIQUE"), Some("SYS_NC00005$"), Some("ASC"), Some("1")]),
+                row(&[Some("APP"), Some("IX_NAME"), Some("FUNCTION-BASED NORMAL"), Some("NONUNIQUE"), Some("AMOUNT"), Some("ASC"), Some("2")]),
+                row(&[Some("APP"), Some("PK_O"), Some("NORMAL"), Some("UNIQUE"), Some("ID"), Some("ASC"), Some("1")]),
+                row(&[Some("APP"), Some("UX_CUST"), Some("NORMAL"), Some("UNIQUE"), Some("CUST_ID"), Some("ASC"), Some("1")]),
             ],
-            col_comments: vec![row(&[Some("NAME"), Some("it's the name")])],
-            part: vec![row(&[Some("RANGE"), Some("NONE"), n, Some("2")])],
-            part_keys: vec![row(&[Some("P"), Some("ID"), Some("1")])],
-            first_partition: vec![row(&[Some("P1"), Some("100")])],
+            // Another owner's index of the same name isn't this one's.
+            index_expressions: vec![
+                row(&[Some("ELSE"), Some("IX_NAME"), Some("2"), Some("LOWER(\"X\")")]),
+                row(&[Some("APP"), Some("IX_NAME"), Some("1"), Some("UPPER(\"NAME\")")]),
+            ],
+            comments: vec![row(&[Some("NAME"), Some("it's the name")]), row(&[n, Some("Orders")])],
         };
         let d = table_ddl("APP", "ORDERS", &p).unwrap();
         let want = r#"CREATE TABLE "APP"."ORDERS" (
@@ -548,12 +500,8 @@ mod tests {
     "CUST_ID" NUMBER,
     CONSTRAINT "PK_O" PRIMARY KEY ("ID"),
     CONSTRAINT "FK_C" FOREIGN KEY ("CUST_ID") REFERENCES "CUSTOMERS" ("ID") ON DELETE CASCADE,
+    CONSTRAINT "FK_P" FOREIGN KEY ("ID", "CUST_ID") REFERENCES "OTHER"."PAIRS" ("A", "B") DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT "CK_AMT" CHECK (amount >= 0)
-)
-PARTITION BY RANGE ("ID")
-(
-    PARTITION "P1" VALUES LESS THAN (100)
-    -- and 1 more: the table's Partitions part lists them
 );
 
 CREATE INDEX "APP"."IX_NAME" ON "APP"."ORDERS" (UPPER("NAME"), "AMOUNT");
@@ -573,7 +521,8 @@ COMMENT ON COLUMN "APP"."ORDERS"."NAME" IS 'it''s the name';"#;
         assert!(source_ddl(&vec![]).is_none());
         let s = sequence_ddl("APP", "S", &vec![row(&[Some("1"), Some("999"), Some("1"), Some("N"), Some("N"), Some("20"), Some("41")])]).unwrap();
         assert!(s.starts_with("CREATE SEQUENCE \"APP\".\"S\"\n    START WITH 41") && s.contains("CACHE 20") && s.ends_with("NOORDER;"));
-        let m = mview_ddl("APP", "M", &vec![row(&[Some("select 1 x from dual"), Some("COMPLETE"), Some("DEMAND"), Some("IMMEDIATE"), None])], &vec![]).unwrap();
+        let m = mview_ddl("APP", "M", &vec![row(&[Some("select 1 x from dual"), Some("COMPLETE"), Some("DEMAND"), Some("IMMEDIATE"), None])], &vec![], &vec![])
+            .unwrap();
         assert_eq!(m, "CREATE MATERIALIZED VIEW \"APP\".\"M\"\nBUILD IMMEDIATE\nREFRESH COMPLETE ON DEMAND\nAS\nselect 1 x from dual;");
         assert!(
             table_ddl(
@@ -583,53 +532,37 @@ COMMENT ON COLUMN "APP"."ORDERS"."NAME" IS 'it''s the name';"#;
                     columns: vec![],
                     table: vec![],
                     constraints: vec![],
+                    ref_keys: vec![],
                     indexes: vec![],
-                    col_comments: vec![],
-                    part: vec![],
-                    part_keys: vec![],
-                    first_partition: vec![]
+                    index_expressions: vec![],
+                    comments: vec![],
                 }
             )
             .is_none()
         );
     }
 
+    /// Expressions are asked for only when an index is function-based.
     #[test]
-    fn partitioning_without_listing_every_partition() {
+    fn expressions_only_for_function_based_indexes() {
         let n = None;
-        let parts = |part: &[Option<&str>], keys: Rows, first: Rows| TableParts {
-            columns: vec![],
-            table: vec![],
-            constraints: vec![],
-            indexes: vec![],
-            col_comments: vec![],
-            part: vec![row(part)],
-            part_keys: keys,
-            first_partition: first,
-        };
-        let k = || vec![row(&[Some("P"), Some("ID"), Some("1")])];
-        // HASH and SYSTEM: the count is the statement.
-        assert_eq!(partition_clause(&parts(&[Some("HASH"), Some("NONE"), n, Some("8")], k(), vec![])).unwrap(), "PARTITION BY HASH (\"ID\")\nPARTITIONS 8");
-        assert_eq!(partition_clause(&parts(&[Some("SYSTEM"), Some("NONE"), n, Some("4")], vec![], vec![])).unwrap(), "PARTITION BY SYSTEM\nPARTITIONS 4");
-        // INTERVAL: Oracle's count is the most it may have, not said.
-        let i = partition_clause(&parts(
-            &[Some("RANGE"), Some("NONE"), Some("NUMTOYMINTERVAL(1,'MONTH')"), Some("1048575")],
-            k(),
-            vec![row(&[Some("P0"), Some("DATE '2020-01-01'")])],
-        ))
-        .unwrap();
-        assert!(
-            i.contains("INTERVAL (NUMTOYMINTERVAL(1,'MONTH'))")
-                && i.contains("VALUES LESS THAN (DATE '2020-01-01')")
-                && i.contains("lists them all")
-                && !i.contains("1048575"),
-            "{i}"
-        );
-        // LIST with one partition: nothing more to say.
-        assert_eq!(
-            partition_clause(&parts(&[Some("LIST"), Some("NONE"), n, Some("1")], k(), vec![row(&[Some("P_EU"), Some("'EU'")])])).unwrap(),
-            "PARTITION BY LIST (\"ID\")\n(\n    PARTITION \"P_EU\" VALUES ('EU')\n)"
-        );
+        let plain = vec![row(&[Some("APP"), Some("IX"), Some("NORMAL"), Some("UNIQUE"), Some("ID"), Some("ASC"), Some("1")])];
+        assert!(!has_function_based(&plain));
+        let desc = vec![row(&[Some("APP"), Some("IX"), Some("FUNCTION-BASED NORMAL"), Some("NONUNIQUE"), Some("SYS_NC00003$"), Some("DESC"), Some("1")])];
+        assert!(has_function_based(&desc));
+        // Without its expression the index is named, not written with its hidden column; with it, the expression.
+        assert_eq!(indexes_ddl("T", &desc, &vec![], &[]), ["-- index \"APP\".\"IX\": its expression could not be read"]);
+        let e = vec![row(&[Some("APP"), Some("IX"), Some("1"), Some("\"ID\"")]), row(&[Some("APP"), Some("IX"), n, Some("x")])];
+        assert_eq!(indexes_ddl("T", &desc, &e, &[]), ["CREATE INDEX \"APP\".\"IX\" ON T (\"ID\" DESC);"]);
+    }
+
+    /// The statements never join ALL_CONS_COLUMNS twice (see [`CONSTRAINTS_SQL`]).
+    #[test]
+    fn one_cons_columns_join_per_statement() {
+        for sql in [CONSTRAINTS_SQL, CONSTRAINTS_SQL_12_1, REF_KEYS_SQL] {
+            assert_eq!(sql.matches("all_cons_columns").count(), 1, "{sql}");
+        }
+        assert!(!INDEXES_SQL.contains("all_ind_expressions"));
     }
 
     #[test]
