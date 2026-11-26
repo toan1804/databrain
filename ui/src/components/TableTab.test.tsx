@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import type { ConnectionView, ExploreRows, ObjectDetail } from "../lib/types";
 import { useStore } from "../store";
 import { TableTab } from "./TableTab";
+import * as menus from "./CatalogMenus";
 
 const conn = (env: "prod" | "none") =>
   ({
@@ -60,6 +61,15 @@ describe("table explorer: profile, top values, statistics", () => {
     useStore.setState({ connections: [conn(env)], tabs: [{ id: "t1", title: "orders", sql: "", connection_id: "c1", table: { schema: "public", name: "orders", kind: "table" } } as never], askConfirm: confirm as never });
     return render(<TableTab tabId="t1" reference={{ schema: "public", name: "orders", kind: "table" }} visible />);
   };
+
+  it("copies the table's path and its name from the header", async () => {
+    const copy = vi.spyOn(menus, "copyText").mockResolvedValue();
+    open("none");
+    fireEvent.click(await screen.findByRole("button", { name: "Copy path" }));
+    expect(copy).toHaveBeenLastCalledWith("public.orders", "table path");
+    fireEvent.click(screen.getByRole("button", { name: "Copy name" }));
+    expect(copy).toHaveBeenLastCalledWith("orders", "table name");
+  });
 
   it("asks once on production, profiles every column, and stops a column's top values when another opens", async () => {
     open("prod");

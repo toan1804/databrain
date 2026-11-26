@@ -106,9 +106,20 @@ export function TableTab({ tabId, reference, visible }: { tabId: string; referen
       <header className="shrink-0 space-y-1.5 border-b border-line px-3 py-2">
         <div className="flex min-w-0 items-center gap-2 text-[12.5px]">
           <Table2 size={15} className="shrink-0 text-accent" />
-          <span className="min-w-0 truncate font-mono font-semibold" title={path}>
+          <span className="min-w-0 cursor-text select-text truncate font-mono font-semibold" title={path}>
             {path}
           </span>
+          <button className="icon-btn h-6 w-6 shrink-0" onClick={() => void copyText(path, "table path")} title={`Copy the path: ${path}`} aria-label="Copy path">
+            <Copy size={12} />
+          </button>
+          <button
+            className="btn-ghost h-6 shrink-0 border border-line px-1.5 py-0 font-mono text-[11px]"
+            onClick={() => void copyText(reference.name, "table name")}
+            title={`Copy the table's name: ${reference.name}`}
+            aria-label="Copy name"
+          >
+            <Copy size={11} /> Name
+          </button>
           <span className="shrink-0 text-muted">{reference.kind.replace("_", " ")}</span>
           <span className="flex shrink-0 items-center gap-1 text-muted">
             · <ConnDot color={conn.color} connected={conn.connected} /> {conn.name}
