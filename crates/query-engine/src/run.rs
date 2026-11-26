@@ -22,8 +22,22 @@ impl QueryEngine {
     // -------------------------------------------------------------- jobs
 
     pub fn plan(&self, profile: &ConnectionProfile, sql: &str) -> Vec<PlannedStatement> {
+        self.plan_from(profile, sql, Origin::Job)
+    }
+
+    /// [`Self::plan`], for a run from `origin`: the user's own (a tab, `dbr`)
+    /// reads a combined query's parts in their connections' dialects; others
+    /// in the tab's, so how a script splits never says which connections
+    /// exist (the rule of `plan_combined`).
+    pub(crate) fn plan_from(&self, profile: &ConnectionProfile, sql: &str, origin: Origin) -> Vec<PlannedStatement> {
         let kind = profile.config.kind;
-        split_statements(sql, kind)
+        let spans = if matches!(origin, Origin::User | Origin::Cli) && sql.contains('@') {
+            let all = self.workspace.list_connections().unwrap_or_default();
+            databrain_connector_core::sql::split_statements_with_parts(sql, kind, &mut |r| databrain_workspace::part_kind(&all, r))
+        } else {
+            split_statements(sql, kind)
+        };
+        spans
             .into_iter()
             .enumerate()
             .map(|(index, s)| PlannedStatement { index, checked: Checked::new(s.sql, kind), start: s.start, end: s.end, combined: false })
@@ -111,7 +125,7 @@ impl QueryEngine {
 
     fn start(self: &Arc<Self>, req: RunRequest, waiter: Option<Waiter>, replaces: Option<&str>) -> Result<RunResponse> {
         let profile = self.workspace.get_connection(&req.connection_id)?;
-        let mut plan = self.plan(&profile, &req.sql);
+        let mut plan = self.plan_from(&profile, &req.sql, req.origin);
         if plan.is_empty() {
             return Err(EngineError::new("invalid", "Nothing to run"));
         }

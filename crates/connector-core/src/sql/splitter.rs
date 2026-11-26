@@ -38,10 +38,14 @@ pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(us
     let next = b.get(i + 1).copied();
     let ident = |k: usize| k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_' || b[k - 1] == b'$' || b[k - 1] == b'.' || b[k - 1] >= 0x80);
     let end = match c {
-        b'-' if next == Some(b'-') => return Some((skip_line(b, i), Skipped::Comment)),
+        // MySQL: `--` is a comment only before whitespace, a control
+        // character or the end (`5--1` is `5 - -1`).
+        b'-' if next == Some(b'-') && (!syntax.dash_comment_needs_space || b.get(i + 2).is_none_or(|&x| x <= b' ' || x == 0x7f)) => {
+            return Some((skip_line(b, i), Skipped::Comment));
+        }
         b'#' if syntax.hash_comment => return Some((skip_line(b, i), Skipped::Comment)),
         b'/' if syntax.slash_comment && next == Some(b'/') => return Some((skip_line(b, i), Skipped::Comment)),
-        b'/' if next == Some(b'*') => return Some((text[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2), Skipped::Comment)),
+        b'/' if next == Some(b'*') => return Some((block_comment_end(b, i, syntax.nested_block_comments), Skipped::Comment)),
         b'\'' | b'"' if syntax.triple_quotes && b[i..].starts_with(if c == b'"' { b"\"\"\"" } else { b"'''" }) => {
             let q = &text[i..i + 3];
             text[i + 3..].find(q).map_or(n, |p| i + 3 + p + 3)
@@ -49,7 +53,7 @@ pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(us
         b'\'' => return Some((skip_quoted(b, i, b'\'', syntax.backslash_escapes), Skipped::SingleQuoted { start: i })),
         b'"' => skip_quoted(b, i, b'"', syntax.backslash_in_double_quotes),
         b'`' if syntax.backtick => skip_quoted(b, i, b'`', syntax.backslash_in_backticks),
-        b'[' if syntax.brackets => text[i..].find(']').map_or(n, |p| i + p + 1),
+        b'[' if syntax.brackets => bracket_end(b, i, syntax.bracket_doubling),
         b'$' if syntax.dollar != DollarQuotes::None => match dollar_tag(text, i) {
             Some(tag) if syntax.dollar == DollarQuotes::Tagged || tag == "$$" => {
                 let body = i + tag.len();
@@ -90,6 +94,63 @@ pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(us
         _ => return None,
     };
     Some((end, Skipped::Quoted))
+}
+
+/// Whether `list` (a combined statement's WITH list, which the splitter
+/// jumps over) holds what would end the statement as the tab reads it: a
+/// directive line (`GO`, `/`, `DELIMITER`) or, with a delimiter other than
+/// `;`, that delimiter. Then the jump isn't taken: the statements stay as
+/// the tab splits them.
+fn crosses_a_directive(list: &str, syntax: &SqlSyntax, delimiter: &[u8]) -> bool {
+    if delimiter != b";" && list.as_bytes().windows(delimiter.len()).any(|w| w == delimiter) {
+        return true;
+    }
+    list.lines().skip(1).any(|l| {
+        let l = l.trim();
+        (syntax.delimiter_directive && l.len() > 10 && l.is_char_boundary(10) && l[..10].eq_ignore_ascii_case("delimiter "))
+            || (syntax.block_end == BlockEnd::SlashLine && l == "/")
+            || (syntax.block_end == BlockEnd::GoLine && is_go_line(l))
+    })
+}
+
+/// Where the block comment opening at `i` (`/*`) ends: after its `*/`, or
+/// with `nested`, after the `*/` that closes every `/*` opened inside it.
+/// Unclosed: the end of the text.
+fn block_comment_end(b: &[u8], i: usize, nested: bool) -> usize {
+    let mut depth = 1usize;
+    let mut k = i + 2;
+    while k + 1 < b.len() {
+        if b[k] == b'*' && b[k + 1] == b'/' {
+            depth -= 1;
+            k += 2;
+            if depth == 0 {
+                return k;
+            }
+        } else if nested && b[k] == b'/' && b[k + 1] == b'*' {
+            depth += 1;
+            k += 2;
+        } else {
+            k += 1;
+        }
+    }
+    b.len()
+}
+
+/// Where the `[…]` name opening at `i` ends: after its `]`, where with
+/// `doubling` a `]]` inside is an escaped `]`.
+fn bracket_end(b: &[u8], i: usize, doubling: bool) -> usize {
+    let mut k = i + 1;
+    while k < b.len() {
+        if b[k] == b']' {
+            if doubling && b.get(k + 1) == Some(&b']') {
+                k += 2;
+                continue;
+            }
+            return k + 1;
+        }
+        k += 1;
+    }
+    b.len()
 }
 
 /// How a procedural block that contains `;` ends.
@@ -177,8 +238,32 @@ pub fn split_statements(text: &str, kind: ConnectorKind) -> Vec<StatementSpan> {
     split_with(text, kind.traits())
 }
 
+/// [`split_statements`] where a combined query's parts are read with their
+/// own connections' dialects (`resolve`: a part's connection kind, `None`
+/// when unknown) and the query around them with DuckDB's quotes and
+/// comments, which is what runs it; the tab's delimiter, `GO` and `/`
+/// lines still apply. Only for the user's own runs and editor actions:
+/// elsewhere the answer must not depend on which connections exist.
+pub fn split_statements_with_parts(
+    text: &str,
+    kind: ConnectorKind,
+    resolve: &mut dyn FnMut(&super::ConnectionRef) -> Option<ConnectorKind>,
+) -> Vec<StatementSpan> {
+    if !text.contains('@') {
+        return split_statements(text, kind);
+    }
+    split_inner(text, kind.traits(), Some(resolve))
+}
+
 /// [`split_statements`] for a source's traits (testable without a kind).
 pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
+    split_inner(text, t, None)
+}
+
+/// A combined query's part connection → its kind (`None`: unknown).
+type PartKinds<'a> = &'a mut dyn FnMut(&super::ConnectionRef) -> Option<ConnectorKind>;
+
+fn split_inner(text: &str, t: &SourceTraits, mut resolve: Option<PartKinds<'_>>) -> Vec<StatementSpan> {
     if !t.language.splits_on_semicolon() {
         return crate::language::split_whole(text);
     }
@@ -200,6 +285,13 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
     // starts another one. Not in T-SQL batches with variables: each
     // statement runs on its own, so a DECLARE must stay with its uses.
     let blank_lines_split = !(syntax.block_end == BlockEnd::GoLine && text.to_ascii_lowercase().contains("declare"));
+    // In a combined statement, past its WITH list: the outer query is
+    // DuckDB's, read with its quotes and comments.
+    let duck = &ConnectorKind::Duckdb.traits().syntax;
+    let mut outer = false;
+    // Where the next `@` is (a part needs one): found again only once
+    // passed, so a long script is read once.
+    let mut next_at: Option<usize> = text.find('@');
 
     let push = |out: &mut Vec<StatementSpan>, from: usize, to: usize, has_code: bool| {
         if !has_code {
@@ -235,6 +327,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 i = (line_end + 1).min(n);
                 seg_start = i;
                 has_code = false;
+                outer = false;
                 depth = 0;
                 opened = false;
                 continue;
@@ -251,6 +344,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                     push(&mut out, seg_start, i, has_code);
                     seg_start = i;
                     has_code = false;
+                    outer = false;
                 }
             }
         }
@@ -271,16 +365,39 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
             i += delimiter.len();
             seg_start = i;
             has_code = false;
+            outer = false;
             depth = 0;
             opened = false;
             continue;
         }
 
         let c = b[i];
-        if let Some((end, what)) = skip_token(text, i, syntax) {
+        if let Some((end, what)) = skip_token(text, i, if outer { duck } else { syntax }) {
             has_code |= what != Skipped::Comment;
             i = end;
             continue;
+        }
+        // A statement that starts with WITH: a combined query's list is read
+        // part by part, each in its connection's dialect.
+        if !has_code
+            && (c == b'w' || c == b'W')
+            && let Some(resolve) = resolve.as_mut()
+        {
+            if next_at.is_some_and(|a| a < i) {
+                next_at = text[i..].find('@').map(|a| i + a);
+            }
+            // Only where DuckDB, which runs it, reads the same comments
+            // before the WITH (the run reads the statement so too).
+            if next_at.is_some()
+                && super::combined::duckdb_trivia(text, seg_start) == i
+                && let Some(end) = super::combined::walk_end(&text[i..], &mut **resolve)
+                && !crosses_a_directive(&text[i..i + end], syntax, &delimiter)
+            {
+                has_code = true;
+                outer = true;
+                i += end;
+                continue;
+            }
         }
         if !c.is_ascii_whitespace() {
             has_code = true;
@@ -559,6 +676,90 @@ mod tests {
         assert_eq!(sqls("select '''a;b''' # c;\n; select 2", Bigquery).len(), 2);
         let v = sqls("create procedure p() returns int language sql as $$ begin return 1; end $$; // c;\nselect 1", Snowflake);
         assert_eq!(v.len(), 2, "{v:?}");
+    }
+
+    /// Three dialect rules of comments and names: SQL Server's `]]` and
+    /// nested comments, DuckDB's nested comments, MySQL's `--` that needs
+    /// a space. What the reading changes is what runs, so each case also
+    /// says how the statements are classified (a read-only connection
+    /// refuses what isn't a read).
+    #[test]
+    fn brackets_nested_comments_and_dashes_per_dialect() {
+        use crate::sql::{StatementKind, classify, read_only_allows};
+        let kinds = |t: &str, k: ConnectorKind| sqls(t, k).iter().map(|s| classify(s, k).kind).collect::<Vec<_>>();
+        // SQL Server: `]]` is a `]` inside a name; comments nest.
+        assert_eq!(kinds("select [a]]; drop table t] from x", Mssql), [StatementKind::Read]);
+        assert_eq!(kinds("select 1 /* a /* b */ ; drop table t */", Mssql), [StatementKind::Read]);
+        assert_eq!(kinds("select 1 /* a */ ; drop table t", Mssql).len(), 2);
+        // SQLite's brackets have no escape: the name ends at the first `]`.
+        assert_eq!(sqls("select [a]]; select 2", Sqlite).len(), 2);
+        // DuckDB nests (its scanner is PostgreSQL's).
+        assert_eq!(sqls("select 1 /* a /* b */ ; c */; select 2", Duckdb).len(), 2);
+        // PostgreSQL's kind also connects servers that don't nest: off, so a
+        // statement after the first `*/` is read as one (and classified).
+        let pg = sqls("select 1 /* a /* b */ ; drop table t", Postgres);
+        assert_eq!(pg.len(), 2, "{pg:?}");
+        assert_eq!(classify(&pg[1], Postgres).kind, StatementKind::Ddl);
+        // MySQL: `--` before a space is a comment, `5--1` is arithmetic, so
+        // the statement after it is one of its own and refused read-only.
+        let my = sqls("select 5--1; drop table t", Mysql);
+        assert_eq!(my.len(), 2, "{my:?}");
+        let c = classify(&my[1], Mysql);
+        assert_eq!(c.kind, StatementKind::Ddl);
+        assert!(!read_only_allows(&my[1], &c));
+        assert_eq!(sqls("select 1 -- ; drop table t\n", Mysql).len(), 1);
+        assert_eq!(sqls("select 1 --\tx; drop table t", Mysql).len(), 1, "a tab is whitespace");
+        assert_eq!(sqls("select 1 --", Mysql).len(), 1, "at the end");
+        // Elsewhere `--` is always a comment.
+        assert_eq!(sqls("select 5--1; drop table t", Postgres).len(), 1);
+        // A `:param` after MySQL's `5--1` is a parameter (it is code).
+        assert_eq!(crate::sql::find_parameters("select 5--1 + :x", Mysql).len(), 1);
+        assert!(crate::sql::find_parameters("select 5 -- :x", Mysql).is_empty());
+    }
+
+    /// A combined query's parts are read in their connections' dialects
+    /// and the outer query in DuckDB's; the tab's delimiter still applies.
+    /// Unknown connections (or no resolver: others' runs) read as before.
+    #[test]
+    fn combined_parts_in_their_own_dialects() {
+        use crate::sql::ConnectionRef;
+        let mut kinds = |r: &ConnectionRef| match r {
+            ConnectionRef::Name(n) if n == "my" => Some(Mysql),
+            ConnectionRef::Name(n) if n == "pg" => Some(Postgres),
+            _ => None,
+        };
+        let parts = |t: &str, k: ConnectorKind, r: &mut dyn FnMut(&ConnectionRef) -> Option<ConnectorKind>| {
+            split_statements_with_parts(t, k, r).into_iter().map(|s| s.sql).collect::<Vec<_>>()
+        };
+        // A MySQL part's `\'` and `#` comment on a PostgreSQL tab.
+        let t = "with a as (@my select 'it\\'s; here' x # don't; split\n) select * from a; select 2";
+        assert_eq!(parts(t, Postgres, &mut kinds).len(), 2, "{:?}", parts(t, Postgres, &mut kinds));
+        assert_ne!(sqls(t, Postgres).len(), 2, "the tab's dialect alone misreads it");
+        // The outer query is DuckDB's on a MySQL tab: `'C:\'` is a whole string there.
+        let t = "with a as (@pg select 1 x) select 'C:\\' from a; select 2";
+        assert_eq!(parts(t, Mysql, &mut kinds).len(), 2);
+        // An unknown connection: as the tab reads it.
+        let t = "with a as (@nope select 'it\\'s; here' x) select * from a; select 2";
+        assert_eq!(parts(t, Postgres, &mut kinds), sqls(t, Postgres));
+        // MySQL's DELIMITER still decides where statements end.
+        let t = "DELIMITER //\nwith a as (@pg select 1 x; ) select * from a; select 3 //\nselect 4 //";
+        let v = parts(t, Mysql, &mut kinds);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v[0].starts_with("with a as"));
+        // Not a combined statement: unchanged.
+        let t = "with x as (select '@' a) select * from x; select 2";
+        assert_eq!(parts(t, Postgres, &mut kinds), sqls(t, Postgres));
+        // A comment before the WITH that DuckDB (which runs it) reads
+        // otherwise: the run doesn't see a combined query, nor does the split.
+        let t = "# note\nwith a as (@pg select 'it\\'s' x) select * from a; select 2";
+        assert_eq!(parts(t, Mysql, &mut kinds), sqls(t, Mysql));
+        // An unclosed CTE doesn't take the next statements' `)`.
+        let t = "with a as (select 1; select 2; with b as (@pg select 1) select (1) from b";
+        assert_eq!(parts(t, Postgres, &mut kinds), sqls(t, Postgres));
+        // Nor does a jump cross a line that ends the statement for the tab.
+        let t = "with a as (@pg select 1\nGO\n) select * from a";
+        let mut ms = |r: &ConnectionRef| kinds(r);
+        assert_eq!(parts(t, Mssql, &mut ms), sqls(t, Mssql));
     }
 
     #[test]

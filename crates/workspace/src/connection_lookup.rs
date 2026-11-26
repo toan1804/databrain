@@ -2,6 +2,18 @@
 
 use crate::ConnectionProfile;
 
+/// The kind of the connection a combined query's part names (`@name` or
+/// `@id:…`), as the run finds it; `None` when none does (the splitter then
+/// reads the part with the tab's dialect, and the run refuses it).
+pub fn part_kind(all: &[ConnectionProfile], r: &databrain_connector_core::sql::ConnectionRef) -> Option<databrain_connector_core::ConnectorKind> {
+    use databrain_connector_core::sql::ConnectionRef;
+    match r {
+        ConnectionRef::Id(id) => all.iter().find(|c| c.id == *id),
+        ConnectionRef::Name(n) => find_connection(all, n, "").ok(),
+    }
+    .map(|c| c.config.kind)
+}
+
 /// The saved connection `name` names: its name in any case (spaces around
 /// it ignored) or its id, nothing else. A part of a name or a typo picks
 /// none, so a command never runs on a connection that wasn't meant: the
