@@ -355,6 +355,7 @@ async fn rows_come_while_the_query_runs() {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     let run = tokio::spawn(async move { engine.run_and_wait(&hub, req, None).await });
     let first = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await.unwrap().unwrap();

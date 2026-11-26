@@ -23,13 +23,14 @@ mod metadata;
 pub mod outputs;
 pub mod plan;
 pub mod probe;
+mod pushdown;
 pub mod related;
 mod run;
 pub mod schema_diff;
 mod sessions;
 pub mod testdata;
 
-pub use combined::{PART_ROWS_DEFAULT, PART_ROWS_SETTING, PART_TOO_LARGE};
+pub use combined::{PART_ROWS_DEFAULT, PART_ROWS_SETTING, PART_TOO_LARGE, PUSHDOWN_SETTING};
 pub use error::*;
 pub use events::*;
 use guard::{Guarded, Hold, Intent};
@@ -96,6 +97,10 @@ pub struct RunRequest {
     /// setting ([`PART_ROWS_SETTING`]). "Run again without the limit" sends 0.
     #[serde(default)]
     pub part_rows: Option<usize>,
+    /// Push the outer query's columns, filters and limit into the parts;
+    /// `None`: the setting ([`PUSHDOWN_SETTING`], on by default).
+    #[serde(default)]
+    pub pushdown: Option<bool>,
 }
 
 impl RunRequest {

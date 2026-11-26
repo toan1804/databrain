@@ -26,6 +26,9 @@ pub const PART_ROWS_SETTING: &str = "combined_part_rows";
 pub const PART_ROWS_DEFAULT: usize = 1_000_000;
 /// Parts run at once.
 const PARALLEL_PARTS: usize = 4;
+/// Setting: push the outer query's columns, filters and limit into the
+/// parts (docs/design/cross-connection-queries.md, §7); default on.
+pub const PUSHDOWN_SETTING: &str = "combined_pushdown";
 /// [`EngineError::code`] of a part with more rows than the limit.
 pub const PART_TOO_LARGE: &str = "part_too_large";
 
@@ -39,9 +42,8 @@ pub(crate) struct PartPlan {
     /// What the server is asked, classified: in phase 1 the part as written
     /// with its parameters bound.
     pub sent: Checked,
-    /// What pushdown added to the part (phase 2; none yet), for the UI and
-    /// the history.
-    #[allow(dead_code)]
+    /// What pushdown added to the part ("columns id, total", "total > 5"),
+    /// for the UI; empty when it runs as written.
     pub pushed: Vec<String>,
     /// The part's SQL in the statement (byte range): error positions.
     pub span: Range<usize>,
@@ -116,13 +118,17 @@ impl QueryEngine {
             }
             o => Some(o.as_str()),
         };
-        if let Some(from) = elsewhere
-            && parse_combined(text, &mut |_| Ok(ConnectorKind::Postgres)).is_ok_and(|c| c.is_some())
-        {
-            return Err(EngineError::new(
-                "unsupported",
-                format!("A query with parts on other connections (@connection) runs from a query tab or `dbr` for now, not from {from}"),
-            ));
+        // A stand-in for every name, so the answer never depends on which
+        // connections exist: an error comes only once a part was found, so
+        // it is a part too. Not one: nothing is looked up.
+        if let Some(from) = elsewhere {
+            return match parse_combined(text, &mut |_| Ok(ConnectorKind::Postgres)) {
+                Ok(None) => Ok(None),
+                _ => Err(EngineError::new(
+                    "unsupported",
+                    format!("A query with parts on other connections (@connection) runs from a query tab or `dbr` for now, not from {from}"),
+                )),
+            };
         }
         let all = self.workspace.list_connections()?;
         let mut found: HashMap<ConnectionRef, ConnectionProfile> = HashMap::new();
@@ -136,8 +142,11 @@ impl QueryEngine {
         })
         .map_err(|e| refused(text, e.position, e.message))?;
         let Some(parsed) = parsed else { return Ok(None) };
-        if elsewhere.is_some() {
-            return Err(EngineError::new("unsupported", "A query with parts on other connections (@connection) runs from a query tab or `dbr` for now"));
+        // Two parts of one name would share a session (and DuckDB refuses the duplicate).
+        for (k, p) in parsed.parts.iter().enumerate() {
+            if parsed.parts[..k].iter().any(|q| q.name.to_lowercase() == p.name.to_lowercase()) {
+                return Err(refused(text, p.body_span.start, format!("Two parts are named `{}`: give each its own name", p.name)));
+            }
         }
         let mut missing: Vec<String> = Vec::new();
         let mut parts = Vec::with_capacity(parsed.parts.len());
@@ -206,6 +215,99 @@ impl QueryEngine {
         Ok(Some(plan))
     }
 
+    /// Whether this run pushes into its parts: the run's own choice, else
+    /// the setting (on by default).
+    fn pushdown_on(&self, req: &RunRequest) -> bool {
+        req.pushdown.unwrap_or_else(|| self.workspace.get_setting(PUSHDOWN_SETTING).ok().flatten().and_then(|v| v.as_bool()).unwrap_or(true))
+    }
+
+    /// Pushdown (§7): each part's column types from a query that returns
+    /// none of its rows, then what the outer query lets each server be
+    /// asked ([`crate::pushdown::plan`]). What is sent is checked again
+    /// as a read on its connection; a part whose types aren't known, or
+    /// whose sent SQL isn't a read there, runs as written.
+    async fn push_down(self: &Arc<Self>, job_id: &str, req: &RunRequest, plan: &mut CombinedPlan, cancel: &CancellationToken) {
+        let outer = match Checked::new(plan.outer(&vec!["r0".to_string(); plan.parts.len()]), ConnectorKind::Duckdb).bind(ConnectorKind::Duckdb, &req.params) {
+            Ok(o) => o.sql().to_string(),
+            Err(_) => return,
+        };
+        // Nothing the outer query could push: no part is asked for its types.
+        if !crate::pushdown::may_push(&outer) {
+            return;
+        }
+        // The parts' types, asked for at once.
+        let mut asks = tokio::task::JoinSet::new();
+        for (i, p) in plan.parts.iter().enumerate() {
+            let (engine, job, req, p, cancel) = (self.clone(), job_id.to_string(), req.clone(), p.clone(), cancel.clone());
+            asks.spawn(async move { (i, engine.part_types(&job, &req, &p, &cancel).await) });
+        }
+        let mut types: Vec<Option<Vec<(String, crate::pushdown::TypeClass)>>> = vec![None; plan.parts.len()];
+        while let Some(done) = asks.join_next().await {
+            if let Ok((i, t)) = done {
+                types[i] = t;
+            }
+        }
+        let inputs: Vec<crate::pushdown::PartInput> = plan
+            .parts
+            .iter()
+            .zip(&types)
+            .map(|(p, t)| crate::pushdown::PartInput { name: &p.name, kind: p.kind, sql: p.sent.sql(), columns: t.as_deref() })
+            .collect();
+        let pushed = crate::pushdown::plan(&outer, &inputs);
+        for (p, x) in plan.parts.iter_mut().zip(pushed) {
+            let Some(x) = x else { continue };
+            let sent = Checked::new(x.sent, p.kind);
+            let one = [PlannedStatement { index: 0, start: 0, end: 0, checked: sent.clone(), combined: false }];
+            let allowed = self
+                .workspace
+                .get_connection(&p.connection_id)
+                .is_ok_and(|prof| Self::check_intent(&prof, &Intent::Run { plan: &one, confirmed: true }).is_ok());
+            if sent.kind() == StatementKind::Read && allowed {
+                p.sent = sent;
+                p.pushed = x.what;
+                // Positions now count in the wrapper: the part's start is shown.
+                p.as_written = false;
+            }
+        }
+    }
+
+    /// A part's output columns and their classes, from its query wrapped to
+    /// return no row; `None` when it can't be asked so.
+    async fn part_types(
+        self: &Arc<Self>,
+        job_id: &str,
+        req: &RunRequest,
+        p: &PartPlan,
+        cancel: &CancellationToken,
+    ) -> Option<Vec<(String, crate::pushdown::TypeClass)>> {
+        let sql = crate::pushdown::describe_sql(p.sent.sql(), p.kind)?;
+        let checked = Checked::new(sql, p.kind);
+        if checked.kind() != StatementKind::Read {
+            return None;
+        }
+        let mut on = req.clone();
+        on.connection_id = p.connection_id.clone();
+        on.session_key = Some(SessionRole::Part { tab: req.session_key().to_string(), name: p.name.clone() }.key());
+        on.output_masks = None;
+        let run = PartRun { job_id: job_id.to_string(), index: 0, rows: Arc::new(AtomicUsize::new(0)) };
+        let stmt = PlannedStatement { index: 0, start: 0, end: 0, checked, combined: false };
+        let job = format!("{job_id}/{}/types", p.name);
+        let out = self.run_statement(&job, &on, &stmt, Some(1), cancel.child_token(), None, Some(&run)).await.ok()?;
+        let r = out.result?;
+        let schema = self.results.get(&r.id).ok().map(|rs| rs.lock().schema());
+        self.results.remove(&r.id);
+        let schema = schema?;
+        // The server's type name (as the grid shows it) tells text from what arrives as text.
+        let db: HashMap<&str, Option<&str>> = r.columns.iter().map(|c| (c.name.as_str(), c.db_type.as_deref())).collect();
+        Some(
+            schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), crate::pushdown::TypeClass::of_field(f, db.get(f.name().as_str()).copied().flatten(), p.kind)))
+                .collect(),
+        )
+    }
+
     /// The rows a part may have: the run's own (`part_rows`, 0 = no
     /// limit), else the setting, else [`PART_ROWS_DEFAULT`].
     fn part_rows(&self, req: &RunRequest) -> Option<usize> {
@@ -235,6 +337,10 @@ impl QueryEngine {
             .ok_or_else(|| EngineError::new("internal", "the statement is no longer a combined query"))?;
         let results = self.results_connection()?;
         let cap = self.part_rows(req);
+        let mut plan = plan;
+        if self.pushdown_on(req) {
+            self.push_down(job_id, req, &mut plan, &cancel).await;
+        }
         let stop = cancel.child_token();
         let rows = Arc::new(AtomicUsize::new(0));
         let mut handles: Vec<Option<String>> = vec![None; plan.parts.len()];
@@ -260,6 +366,7 @@ impl QueryEngine {
                         index: stmt.index,
                         part: p.name.clone(),
                         connection_name: p.connection_name.clone(),
+                        pushed: p.pushed.clone(),
                         output: Box::new(output),
                     };
                     if let Some(w) = waiter {
@@ -371,6 +478,7 @@ impl QueryEngine {
                 // tab's runs hold too (never the part's session, which a
                 // run of the tab may be using).
                 session_key: req.session_key().to_string(),
+                part: Some(p.name.clone()),
             })
         });
         let (status, rows, error) = match &outcome {

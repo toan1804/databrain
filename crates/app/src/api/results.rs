@@ -438,6 +438,7 @@ pub(crate) fn store_test_data(
         row_limit: None,
         origin: databrain_workspace::Origin::User,
         session_key: String::new(),
+        part: None,
     });
     state.engine.outputs_changed();
     Ok(TestDataOutput { output, seed: data.seed, notes: data.notes, table: data.table })

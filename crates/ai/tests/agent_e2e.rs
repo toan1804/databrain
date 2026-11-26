@@ -286,6 +286,7 @@ async fn denied_approval_and_blocked_writes() {
                 params: Default::default(),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             },
             None,
         )
@@ -703,6 +704,7 @@ async fn ai_tools_use_output_handles_with_source_policies() {
                 params: Default::default(),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             };
             engine.run_and_wait(&hub, r, None).await.unwrap()
         }
@@ -743,6 +745,34 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     // run_query on the current (SQLite) connection with results.<name> runs on Results (DuckDB) instead.
     let o = ctx.call("run_query", &json!({"sql": "select country, total from results.by_country order by total desc"})).await;
     assert!(o.content.contains("Vietnam\t300"), "{}", o.content);
+    // A combined query's join is judged by its parts' connections: one with
+    // AI disabled can't be read through it; once a part's result is no
+    // longer kept, the join isn't shared at all (its sources can't be checked).
+    let join = |sql: &'static str| {
+        let run = &run;
+        let open = open.id.clone();
+        let engine = engine.clone();
+        async move {
+            let out = run(open, sql, None).await;
+            let rid = out[0].result.as_ref().expect("the join's rows").id.clone();
+            engine.outputs().list().into_iter().find(|o| o.result_id == rid).unwrap()
+        }
+    };
+    let closed_join = join("with s as (@Closed select country, count(*) n from orders group by 1) select * from s").await;
+    let o = ctx.call("query_result", &json!({"result_id": closed_join.handle, "sql": "select * from result"})).await;
+    assert!(o.content.contains("AI is disabled"), "{}", o.content);
+    // Results shares its rows here, so only the parts decide.
+    let mut results = engine.results_connection().unwrap();
+    results.ai_policy.share_result_rows = true;
+    f.ws.save_connection(results).unwrap();
+    let open_join = join("with s as (@Shop select country, count(*) n from orders group by 1) select * from s").await;
+    let o = ctx.call("query_result", &json!({"result_id": open_join.handle, "sql": "select * from result"})).await;
+    assert!(!o.content.starts_with("ERROR") && o.content.contains("Vietnam"), "{}", o.content);
+    let part = engine.outputs().referenced(&open_join.sql).pop().expect("the join reads its part");
+    engine.outputs().remove(&part.handle).unwrap();
+    let o = ctx.call("query_result", &json!({"result_id": open_join.handle, "sql": "select * from result"})).await;
+    assert!(o.content.contains("no longer kept"), "{}", o.content);
+
     // MCP: an MCP-enabled connection cannot read outputs of a connection
     // that is not shared with MCP.
     let mut shared = f.ws.get_connection(&f.conn).unwrap();
@@ -807,6 +837,7 @@ async fn output_columns_stay_masked_in_duckdb() {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
     let ctx = databrain_ai::ToolContext {
@@ -1006,6 +1037,7 @@ async fn table_access_rules() {
                 params: Default::default(),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             };
             let o = engine.run_and_wait(&hub, r, None).await.unwrap();
             assert!(o.iter().all(|x| x.error.is_none()), "{:?}", o[0].error);
@@ -1091,6 +1123,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
     // The setup tab's session holds the file; Windows lets one session open it.
@@ -1175,6 +1208,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     // Each DuckDB session opens the file on its own (one writer at a time).
     engine.disconnect(&conn);
@@ -2085,6 +2119,7 @@ async fn a_connections_rules_hold_wherever_it_is_reached_from() {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     let rid = f.engine.run_and_wait(&f.hub, r, None).await.unwrap()[0].result.as_ref().unwrap().id.clone();
     let grid = ctx("cloud", Arc::new(Grid(rid.clone())));

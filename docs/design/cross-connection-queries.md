@@ -1,6 +1,6 @@
 # Design: one query over several connections
 
-Status: phase 1 built (2026-11-25): the parser (`connector-core/src/sql/combined.rs`), the run (`query-engine/src/combined.rs`), part result tabs and `dbr`; what it leaves is in docs/TODO.md (Combined queries). The decisions are in §12; nothing is open.
+Status: phase 1 built (2026-11-25): the parser (`connector-core/src/sql/combined.rs`), the run (`query-engine/src/combined.rs`), part result tabs and `dbr`. Phase 2 (pushdown, §7) built in `query-engine/src/pushdown.rs`, except the Run-button toggle and the editor's marks; what is left is in docs/TODO.md (Combined queries). The decisions are in §12; nothing is open.
 
 ## 1. Problem
 

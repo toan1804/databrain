@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+sqlparser = { version = "0.63.0", default-features = false, features = ["std", "visitor"] }
 databrain-auth = { version = "0.5.3", path = "../auth" }
 databrain-connector-core = { version = "0.5.3", path = "../connector-core" }
 databrain-export = { version = "0.5.3", path = "../export" }

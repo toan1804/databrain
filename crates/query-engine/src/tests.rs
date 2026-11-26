@@ -66,6 +66,7 @@ fn req(f: &Fixture, sql: &str) -> RunRequest {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     }
 }
 
@@ -1664,6 +1665,7 @@ async fn a_table_is_described_once_for_callers_together() {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     };
     let hub = crate::EventHub::new(Arc::new(CollectingSink::default()));
     assert!(engine.run_and_wait(&hub, r("select 1"), None).await.unwrap().iter().all(|o| o.error.is_none()));

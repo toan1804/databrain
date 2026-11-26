@@ -185,6 +185,11 @@ pub struct OutputInfo {
     /// notebook's cells share `nb:{notebook}`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_key: String,
+    /// A part of a combined query (its name), read for statement
+    /// `statement_index`: never that statement's own result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub part: Option<String>,
 }
 
 impl OutputInfo {
@@ -226,6 +231,9 @@ pub struct NewOutput {
     pub origin: Origin,
     /// Session it ran on (empty: `tab_id`).
     pub session_key: String,
+    /// A part of a combined query (its name): shown with the statement's
+    /// result, not as one of the run's statements.
+    pub part: Option<String>,
 }
 
 #[derive(Default)]
@@ -763,9 +771,13 @@ impl OutputRegistry {
                 last_used: now,
                 active: true,
                 session_key: if n.session_key == n.tab_id { String::new() } else { n.session_key },
+                part: n.part,
             };
             let mut info = info;
-            info.kept = g.keep_next.remove(&(info.tab_id.clone(), info.statement_index));
+            // "Keep" of a statement's result goes to its next result, not to a part.
+            if info.part.is_none() {
+                info.kept = g.keep_next.remove(&(info.tab_id.clone(), info.statement_index));
+            }
             g.by_result.insert(info.result_id.clone(), handle.clone());
             g.active.entry(n.tab_id).or_default().push(handle.clone());
             g.by_handle.insert(handle, info.clone());
@@ -1261,6 +1273,7 @@ pub(crate) mod tests {
             row_limit: None,
             origin: Origin::User,
             session_key: String::new(),
+            part: None,
         })
     }
 

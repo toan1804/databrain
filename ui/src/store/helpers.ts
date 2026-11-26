@@ -52,10 +52,12 @@ export function restoredRun(tabId: string, outputs: OutputInfo[]): TabRun | null
   const mine = outputs.filter((o) => o.tab_id === tabId && o.active && o.state !== "evicted").sort((a, b) => a.statement_index - b.statement_index);
   if (!mine.length) return null;
   const shown = (o: OutputInfo, index: number): StatementRun => outputRun(o, index, [RESTORED_NOTICE]);
-  // Kept results apart (oldest first), as before the restart.
-  const kept = mine.filter((o) => o.kept).sort((a, b) => a.created_at - b.created_at);
-  const statements = mine.filter((o) => !o.kept).map((o, i) => shown(o, i));
+  // Kept results apart (oldest first), as before the restart; a combined
+  // query's parts after the statements, as parts.
+  const kept = mine.filter((o) => o.kept && !o.part).sort((a, b) => a.created_at - b.created_at);
+  const statements = mine.filter((o) => !o.kept && !o.part).map((o, i) => shown(o, i));
   const keptRuns = kept.map((o) => shown(o, keptIndex()));
+  const parts = mine.filter((o) => o.part).map((o) => ({ ...shown(o, keptIndex()), part: { name: o.part!, connection: o.connection_name, pushed: [] } }));
   return {
     jobId: null,
     running: false,
@@ -63,6 +65,7 @@ export function restoredRun(tabId: string, outputs: OutputInfo[]): TabRun | null
     finishedStatus: "success",
     statements,
     kept: keptRuns,
+    ...(parts.length ? { parts } : {}),
     activeIndex: statements.length ? statements.length - 1 : (keptRuns.at(-1)?.plan.index ?? null),
   };
 }

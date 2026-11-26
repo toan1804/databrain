@@ -1646,6 +1646,7 @@ async fn run_sql(
                 params,
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             },
             Some(cancel.clone()),
             &reading,
@@ -2552,6 +2553,7 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
                 params: dry_run_params(ctx, job, node),
                 output_masks: None,
                 part_rows: None,
+                pushdown: None,
             };
             match ctx.engine.run_and_wait(&ctx.hub, req, Some(cancel.clone())).await {
                 Err(e) => (None, Some(e.message)),

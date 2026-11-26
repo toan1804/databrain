@@ -69,6 +69,7 @@ fn req(conn: &str, tab: &str, sql: &str) -> RunRequest {
         params: Default::default(),
         output_masks: None,
         part_rows: None,
+        pushdown: None,
     }
 }
 
@@ -270,12 +271,24 @@ async fn who_and_where_may_run_one() {
     // Not the assistant, MCP or a job: refused before any connection is
     // looked up, so the refusal names none.
     for origin in [databrain_workspace::Origin::Ai, databrain_workspace::Origin::Mcp, databrain_workspace::Origin::Job] {
-        let mut r = req(&s.sales, "t9", "with a as (@cmr select 1) select * from a");
-        r.origin = origin;
-        let e = s.run(r).await.unwrap_err();
-        assert_eq!(e.kind, "unsupported", "{origin:?}");
-        assert!(!e.message.contains("crm") && !e.message.contains("Sales"), "{}", e.message);
+        // A part that doesn't parse (an unclosed parenthesis) answers the
+        // same, whether its name is a connection or not.
+        for sql in [
+            "with a as (@cmr select 1) select * from a",
+            "with a as (@cmr select (1) select * from a",
+            "with a as (@crm select (1) select * from a",
+            "with a as (@nothing_like_it select (1) select * from a",
+        ] {
+            let mut r = req(&s.sales, "t9", sql);
+            r.origin = origin;
+            let e = s.run(r).await.unwrap_err();
+            assert_eq!(e.kind, "unsupported", "{origin:?} {sql}");
+            assert!(!e.message.contains("crm") && !e.message.contains("Sales") && !e.message.contains("parenthesis"), "{}", e.message);
+        }
     }
+    // Two parts of one name.
+    let e = s.run(req(&s.sales, "t9", "with a as (@crm select 1), A as (@crm select 2) select * from a")).await.unwrap_err();
+    assert!(e.message.contains("Two parts are named `A`"), "{}", e.message);
     // Not in a notebook or a dashboard yet.
     for key in ["nb:n1:c1", "dash:d1:c1"] {
         let e = s.run(req(&s.sales, key, JOIN)).await.unwrap_err();
@@ -325,4 +338,74 @@ async fn many_parts_and_a_transaction_opened_in_the_same_script() {
     let e = out[1].error.as_ref().expect("refused");
     assert!(e.message.contains("open transaction"), "{e:?}");
     s.run(req(&s.sales, "t12", "rollback")).await.unwrap();
+}
+
+/// Pushdown (phase 2): a filter of the outer query is also sent to the part's
+/// server, which then sends fewer rows; the answer is the same either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushdown_asks_for_less_and_changes_no_answer() {
+    let s = setup().await;
+    let q = "with o as (@\"Sales DB\" select * from orders) select id, total from o where id > 1 and total > 5 order by id";
+    let on = s.run(req(&s.sales, "p1", q)).await.unwrap();
+    assert_eq!(s.rows(&on[0]), vec!["3|7.0"]);
+    let part = s
+        .events
+        .0
+        .lock()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            JobEvent::PartFinished { tab_id, pushed, output, .. } if tab_id == "p1" => Some((pushed.clone(), output.sql.clone(), output.rows)),
+            _ => None,
+        })
+        .unwrap();
+    // The integer filter goes to the server; the float one (SQLite REAL) stays in DuckDB.
+    assert!(part.0.iter().any(|w| w == "\"id\" > 1") && !part.0.iter().any(|w| w.contains("total >")), "{:?}", part.0);
+    assert!(part.1.contains("databrain_part") && part.1.contains("WHERE \"id\" > 1"), "{}", part.1);
+    assert_eq!(part.2, 2, "the server sent only the rows that pass");
+    // The same rows with it off, the part as written.
+    let queries = [
+        q,
+        JOIN,
+        "with o as (@\"Sales DB\" select * from orders), c as (@crm select * from customers) select c.name, o.id from c left join o on o.customer_id = c.id where o.id is null order by 1",
+        "with o as (@\"Sales DB\" select * from orders), c as (@crm select * from customers) select c.name, o.total from o join c on c.id = o.customer_id and c.name in ('Ann', 'Cy') where o.total between 4 and 6 order by 2",
+        "with c as (@crm select * from customers) select name from c where name = 'Bo' or id = 30 order by 1",
+        "with o as (@\"Sales DB\" select * from orders) select id from o where id <> 2 limit 1",
+    ];
+    for q in queries {
+        let mut off = req(&s.sales, "p2", q);
+        off.pushdown = Some(false);
+        let a = s.rows(&s.run(req(&s.sales, "p1", q)).await.unwrap()[0]);
+        let b = s.rows(&s.run(off).await.unwrap()[0]);
+        assert_eq!(a, b, "{q}");
+    }
+    // The left join's IS NULL on the nullable side: Cy has no order.
+    let mut off = req(&s.sales, "p2", queries[2]);
+    off.pushdown = Some(false);
+    assert_eq!(s.rows(&s.run(off).await.unwrap()[0]), vec!["Cy|"]);
+}
+
+/// Part outputs say they are parts: a kept join refreshed stays kept (a part
+/// never takes its place), and the parts aren't statements of their own.
+#[tokio::test(flavor = "multi_thread")]
+async fn parts_are_marked_as_parts() {
+    let s = setup().await;
+    let out = s.run(req(&s.sales, "k1", JOIN)).await.unwrap();
+    let rid = out[0].result.as_ref().unwrap().id.clone();
+    let of_tab = || s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "k1" && o.active).collect::<Vec<_>>();
+    let join = of_tab().into_iter().find(|o| o.result_id == rid).unwrap();
+    assert!(join.part.is_none());
+    let mut names: Vec<String> = of_tab().into_iter().filter_map(|o| o.part).collect();
+    names.sort();
+    assert_eq!(names, ["c", "o"]);
+    s.st.engine.outputs().set_kept(&join.handle, true).unwrap();
+    let started = s.st.engine.rerun_output(req(&s.sales, "k1", JOIN), &join.handle).unwrap();
+    let databrain_query_engine::RunResponse::Started { job_id, .. } = started else { panic!("not started") };
+    while s.st.engine.is_running(&job_id) {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let now = of_tab();
+    let new_join = now.iter().find(|o| o.part.is_none() && o.handle != join.handle).expect("a new join result");
+    assert!(new_join.kept, "the refreshed join is kept");
+    assert!(now.iter().filter(|o| o.part.is_some()).all(|o| !o.kept), "no part took the keep");
 }
