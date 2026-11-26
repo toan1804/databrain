@@ -104,6 +104,20 @@ fn sql_text(s: &mut Suite) {
         let big = big.clone();
         move || sql::split_statements(&big, Postgres)
     });
+    // A script of combined queries (each statement's WITH list walked, its
+    // parts read in their connections' dialects).
+    let combined: String = (0..200)
+        .map(|i| {
+            format!("with a as (@pg select id, total from orders where id > {i}), b as (@my select id from customers) select * from a join b using (id);\n")
+        })
+        .collect();
+    let ckb = combined.len() as f64 / 1024.0;
+    s.add("split_200_combined", "the editor finds the statement at the cursor in a script of combined queries", 15, Some((ckb, "KB")), move || {
+        sql::split_statements_with_parts(&combined, Postgres, &mut |r| match r {
+            sql::ConnectionRef::Name(n) if n == "my" => Some(Mysql),
+            _ => Some(Postgres),
+        })
+    });
     for (name, kind) in [("postgres", Postgres), ("mysql", Mysql), ("mssql", Mssql), ("snowflake", Snowflake)] {
         s.add(&format!("classify_query_{name}"), "a statement is classified before it runs", 1, None, move || sql::classify(QUERY, kind));
     }

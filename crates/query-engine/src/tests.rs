@@ -1917,3 +1917,27 @@ async fn background_work_falls_back_when_its_session_cant_open() {
     let keys: Vec<String> = engine.sessions.lock().keys().map(|(_, t)| t.clone()).collect();
     assert_eq!(keys, vec![meta_tab()]);
 }
+
+/// How a script splits depends on which connections exist only for the
+/// user's own runs: theirs read a combined query's parts in their
+/// connections' dialects; the assistant's, MCP's and jobs' in the tab's.
+#[test]
+fn only_the_users_runs_split_parts_by_their_connection() {
+    let f = fixture(EnvTag::None);
+    let mut my = f.ws.get_connection(&f.conn_id).unwrap();
+    my.id = String::new();
+    my.name = "my".into();
+    my.config.kind = ConnectorKind::Mysql;
+    my.config.file_path = None;
+    my.config.host = Some("db.invalid".into());
+    f.ws.save_connection(my).unwrap();
+    let p = f.ws.get_connection(&f.conn_id).unwrap();
+    let text = "with a as (@my select 'a\\'; select 3; x' y) select * from a; select 2";
+    let n = |o: Origin| f.engine.plan_from(&p, text, o).len();
+    assert_eq!((n(Origin::User), n(Origin::Cli)), (2, 2));
+    let tab = f.engine.plan(&p, text).len();
+    assert_ne!(tab, 2, "the tab's dialect alone splits it elsewhere");
+    for o in [Origin::Ai, Origin::Mcp, Origin::Job, Origin::Explorer] {
+        assert_eq!(n(o), tab, "{o:?}");
+    }
+}

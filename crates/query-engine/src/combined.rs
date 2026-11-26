@@ -315,6 +315,10 @@ impl QueryEngine {
                 p.checked_limit = x.checked_limit;
             }
         }
+        // Kept types matter only where they pushed something.
+        for (c, p) in from_cache.iter_mut().zip(&plan.parts) {
+            *c &= !p.pushed.is_empty();
+        }
         from_cache
     }
 
@@ -334,16 +338,19 @@ impl QueryEngine {
     ) -> bool {
         let mut changed = false;
         for (i, p) in plan.parts.iter().enumerate().filter(|(i, _)| from_cache[*i]) {
+            if cancel.is_cancelled() {
+                return false;
+            }
             let now = self.part_types(job_id, index, i, req, p, cancel).await;
             if now.as_ref() != p.types.as_ref() {
                 match now {
                     Some(t) => self.keep_part_types(&p.connection_id, p.bound.sql(), t),
-                    None => self.forget_descriptions(&p.connection_id),
+                    None => self.describes.drop_part_types(&p.connection_id, p.bound.sql()),
                 }
                 changed = true;
             }
         }
-        changed
+        changed && !cancel.is_cancelled()
     }
 
     /// The classes a part's output arrived with, as `part_types` reads them.
@@ -443,9 +450,16 @@ impl QueryEngine {
         let cap = self.part_rows(req);
         // Asked again when kept types turned out old (`fresh`), or a limit
         // pushed with filters was filled by rows DuckDB dropped.
-        let (mut fresh, mut limit_with_where) = (false, true);
+        // A tapped tab (`dbr --csv`) prints rows as they come: never a run
+        // that may be done again (no kept types, no checked limit).
+        let tapped = self.taps.lock().contains_key(&req.tab_id);
+        let (mut fresh, mut limit_with_where) = (tapped, !tapped);
         let mut notices: Vec<String> = Vec::new();
         for attempt in 0..3 {
+            // The last attempt can't be checked again: nothing it would check.
+            if attempt == 2 {
+                limit_with_where = false;
+            }
             let mut plan = self
                 .plan_combined(text, &req.params, req.origin, &req.connection_id, req.session_key())?
                 .ok_or_else(|| EngineError::new("internal", "the statement is no longer a combined query"))?;
@@ -471,32 +485,41 @@ impl QueryEngine {
                     if hold && cached && e.kind != "cancelled" && self.types_changed(job_id, stmt.index, req, &plan, &from_cache, &cancel).await {
                         self.drop_attempt(&outputs_of(&held), None);
                         fresh = true;
+                        notices.push(TYPES_CHANGED.into());
                         continue;
                     }
                     emit(held);
                     return Err(e);
                 }
             };
-            // Kept types that no longer match what the parts gave.
+            // Kept types that no longer match what the parts gave: a class
+            // by name, or, for every column (nothing pruned: a CTE that names
+            // its columns reads them by place), their names in order.
             let stale = plan.parts.iter().zip(&outs).zip(&from_cache).any(|((p, o), c)| {
                 *c && self.output_classes(o, p.kind).is_some_and(|got| {
                     let kept = p.types.as_deref().unwrap_or(&[]);
-                    got.iter().any(|(n, t)| kept.iter().find(|(k, _)| k == n).is_some_and(|(_, kt)| kt != t))
+                    let reordered = got.len() == kept.len() && got.iter().zip(kept).any(|((a, _), (b, _))| a != b);
+                    reordered || got.iter().any(|(n, t)| kept.iter().find(|(k, _)| k == n).is_some_and(|(_, kt)| kt != t))
                 })
             });
             if hold && stale && self.types_changed(job_id, stmt.index, req, &plan, &from_cache, &cancel).await {
                 self.drop_attempt(&outs, None);
                 fresh = true;
-                notices.push("A part's column types had changed since they were last read: its rows were read again".into());
+                notices.push(TYPES_CHANGED.into());
                 continue;
             }
             let handles: Vec<String> = outs.iter().map(|o| o.handle.clone()).collect();
-            let outer = Checked::new(plan.outer(&handles), ConnectorKind::Duckdb)
-                .bind(ConnectorKind::Duckdb, &req.params)
-                .map_err(|names| EngineError::new("invalid", format!("Enter a value for :{}", names.join(", :"))))?;
-            if outer.kind() != StatementKind::Read {
-                return Err(EngineError::new("invalid", "The query that reads the parts must only read (it runs in DuckDB)"));
-            }
+            let outer = match Checked::new(plan.outer(&handles), ConnectorKind::Duckdb).bind(ConnectorKind::Duckdb, &req.params) {
+                Ok(o) if o.kind() == StatementKind::Read => o,
+                Ok(_) => {
+                    emit(held);
+                    return Err(EngineError::new("invalid", "The query that reads the parts must only read (it runs in DuckDB)"));
+                }
+                Err(names) => {
+                    emit(held);
+                    return Err(EngineError::new("invalid", format!("Enter a value for :{}", names.join(", :"))));
+                }
+            };
             let mut on_results = req.clone();
             on_results.connection_id = results.id.clone();
             let ran = outer.sql().to_string();
@@ -510,6 +533,7 @@ impl QueryEngine {
                     if hold && cached && e.kind != "cancelled" && self.types_changed(job_id, stmt.index, req, &plan, &from_cache, &cancel).await {
                         self.drop_attempt(&outs, None);
                         fresh = true;
+                        notices.push(TYPES_CHANGED.into());
                         continue;
                     }
                     emit(held);
@@ -517,13 +541,15 @@ impl QueryEngine {
                 }
             };
             // A limit pushed with filters, filled by rows DuckDB then dropped:
-            // the server had more; that part is read again without it.
+            // the server had more; that part is read again without it. A join
+            // that was cut (the tab's row limit, memory) can't tell, and an
+            // export of every row reads it again from the parts: read again too.
             let joined = o.result.as_ref().map(|r| (r.total_rows, r.truncated));
             let short = plan
                 .parts
                 .iter()
                 .zip(&outs)
-                .any(|(p, out)| p.checked_limit.is_some_and(|n| out.rows >= n && joined.is_some_and(|(rows, cut)| rows < n && !cut)));
+                .any(|(p, out)| p.checked_limit.is_some_and(|n| out.rows >= n && joined.is_some_and(|(rows, cut)| rows < n || cut)));
             if hold && short {
                 self.drop_attempt(&outs, o.result.as_ref().map(|r| r.id.as_str()));
                 limit_with_where = false;
@@ -705,6 +731,9 @@ impl QueryEngine {
         outcome.map(|_| output.expect("an output for a result"))
     }
 }
+
+/// The notice of a run done again because kept part types were old.
+const TYPES_CHANGED: &str = "A part's column types had changed since they were last read: its rows were read again";
 
 /// The outputs a held attempt's part events carry.
 fn outputs_of(held: &[JobEvent]) -> Vec<OutputInfo> {

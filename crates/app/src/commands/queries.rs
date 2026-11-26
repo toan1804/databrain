@@ -50,14 +50,14 @@ pub(crate) async fn estimate_cost(
 }
 
 #[tauri::command]
-pub(crate) async fn statement_at_cursor(kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
-    Ok(api::statement_at_cursor(kind, &text, cursor))
+pub(crate) async fn statement_at_cursor(state: State<'_, AppState>, kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
+    Ok(api::statement_at_cursor(&state, kind, &text, cursor))
 }
 
 /// Every statement of an editor text (next/previous statement keys).
 #[tauri::command]
-pub(crate) async fn statement_spans(kind: ConnectorKind, text: String) -> R<Vec<Span>> {
-    Ok(api::statement_spans(kind, &text))
+pub(crate) async fn statement_spans(state: State<'_, AppState>, kind: ConnectorKind, text: String) -> R<Vec<Span>> {
+    Ok(api::statement_spans(&state, kind, &text))
 }
 
 #[tauri::command]

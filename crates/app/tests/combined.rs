@@ -564,3 +564,22 @@ async fn parts_share_the_statements_memory() {
     assert!(parts.iter().any(|o| o.spilled), "one part on disk: {:?}", parts.iter().map(|o| (o.bytes, o.spilled)).collect::<Vec<_>>());
     assert!(parts.iter().all(|o| !o.truncated));
 }
+
+/// A CTE that names its columns reads a part's columns by place: kept types
+/// whose names come in another order now (the table was made again) are
+/// old, and the run is done again with them read anew.
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_types_in_another_order_are_read_again() {
+    let s = setup().await;
+    s.ok(&s.sales, "create table pair (a integer, b integer); insert into pair values (1, 5), (2, 6)").await;
+    let q = "with p(x, y) as (@\"Sales DB\" select * from pair) select x from p where y = 5";
+    assert_eq!(s.rows(&s.run(req(&s.sales, "r1", q)).await.unwrap()[0]), ["1"]);
+    let sess = s.st.engine.session_for_tests(&s.sales).await.unwrap();
+    for stmt in ["drop table pair", "create table pair (b integer, a integer)", "insert into pair values (5, 1), (6, 2)"] {
+        sess.execute(databrain_connector_core::Statement::internal(stmt), Default::default()).await.unwrap().collect().await.unwrap();
+    }
+    let again = s.run(req(&s.sales, "r1", q)).await.unwrap();
+    let mut off = req(&s.sales, "r1", q);
+    off.pushdown = Some(false);
+    assert_eq!(s.rows(&again[0]), s.rows(&s.run(off).await.unwrap()[0]), "{:?}", again[0].error);
+}

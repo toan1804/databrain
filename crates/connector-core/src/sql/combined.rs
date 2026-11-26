@@ -104,10 +104,43 @@ pub fn parse_combined(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Res
     if !looks_combined(text) {
         return Ok(None);
     }
+    let Some((combined, i)) = walk(text, resolve)? else { return Ok(None) };
+    if text[i..].trim_matches(|c: char| c.is_whitespace() || c == ';').is_empty() {
+        return Err(CombinedError { message: "The query that reads the parts is missing after the WITH list".into(), position: i });
+    }
+    Ok(Some(combined))
+}
+
+/// Where the WITH list of the combined statement at the start of `text`
+/// ends (a byte offset in `text`), each part's body read with its own
+/// connection's dialect (`resolve`; an unknown one: `None`). `None` when
+/// the statement isn't a combined one, or can't be read as one: the
+/// splitter then reads it with the tab's dialect, as before. `text` may go
+/// on past the statement (the rest of a script).
+pub fn with_list_end(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Option<ConnectorKind>) -> Option<usize> {
+    if !looks_combined(text) {
+        return None;
+    }
+    walk_end(text, resolve)
+}
+
+/// [`with_list_end`] without its `@` test (the splitter knows one is ahead):
+/// the walk reads only the statement's WITH list, not the rest of a script.
+pub(crate) fn walk_end(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Option<ConnectorKind>) -> Option<usize> {
+    walk(text, &mut |r| resolve(r).ok_or_else(String::new)).ok().flatten().map(|(_, end)| end)
+}
+
+/// Past spaces and comments from `i`, as DuckDB reads them.
+pub(crate) fn duckdb_trivia(text: &str, i: usize) -> usize {
+    trivia(text, i, &ConnectorKind::Duckdb.traits().syntax)
+}
+
+/// The WITH list at the start of `text`: its parts and where it ends.
+fn walk(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Result<ConnectorKind, String>) -> Result<Option<(Combined, usize)>, CombinedError> {
     let syn = &ConnectorKind::Duckdb.traits().syntax;
     let mut parts: Vec<CombinedPart> = Vec::new();
     // Before a part is found, anything unexpected means "not combined".
-    let fail = |parts: &[CombinedPart], message: String, position: usize| -> Result<Option<Combined>, CombinedError> {
+    let fail = |parts: &[CombinedPart], message: String, position: usize| -> Result<Option<(Combined, usize)>, CombinedError> {
         if parts.is_empty() { Ok(None) } else { Err(CombinedError { message, position }) }
     };
     let mut i = trivia(text, 0, syn);
@@ -165,6 +198,11 @@ pub fn parse_combined(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Res
             i = parts.last().expect("pushed").body_span.end;
         } else {
             let Some(close) = close_paren(text, open, syn) else { return fail(&parts, format!("`{name}` isn't closed"), open) };
+            // A `;` in it (read as DuckDB reads it) means it isn't closed
+            // in its statement: the `)` found is a later statement's.
+            if super::code_text(&text[open..close], ConnectorKind::Duckdb).contains(';') {
+                return fail(&parts, format!("`{name}` isn't closed"), open);
+            }
             i = close + 1;
         }
         i = trivia(text, i, syn);
@@ -177,10 +215,7 @@ pub fn parse_combined(text: &str, resolve: &mut dyn FnMut(&ConnectionRef) -> Res
     if parts.is_empty() {
         return Ok(None);
     }
-    if text[i..].trim_matches(|c: char| c.is_whitespace() || c == ';').is_empty() {
-        return Err(CombinedError { message: "The query that reads the parts is missing after the WITH list".into(), position: i });
-    }
-    Ok(Some(Combined { parts }))
+    Ok(Some((Combined { parts }, i)))
 }
 
 /// The part whose body opens at `open` (`(`), its `@` at `at`.

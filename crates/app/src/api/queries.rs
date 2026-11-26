@@ -14,16 +14,26 @@ pub struct Span {
     pub sql: String,
 }
 
+/// The editor's statements, as the user's run splits them: a combined
+/// query's parts in their connections' dialects.
+fn split_for_editor(state: &AppState, kind: ConnectorKind, text: &str) -> Vec<databrain_connector_core::sql::StatementSpan> {
+    if !text.contains('@') {
+        return split_statements(text, kind);
+    }
+    let all = state.workspace.list_connections().unwrap_or_default();
+    databrain_connector_core::sql::split_statements_with_parts(text, kind, &mut |r| databrain_workspace::part_kind(&all, r))
+}
+
 /// Statement under the cursor (`cursor` is a UTF-16 offset).
-pub fn statement_at_cursor(kind: ConnectorKind, text: &str, cursor: usize) -> Option<Span> {
-    let spans = split_statements(text, kind);
+pub fn statement_at_cursor(state: &AppState, kind: ConnectorKind, text: &str, cursor: usize) -> Option<Span> {
+    let spans = split_for_editor(state, kind, text);
     let byte = utf16_to_byte(text, cursor);
     statement_at(&spans, byte).map(|s| Span { start: byte_to_utf16(text, s.start), end: byte_to_utf16(text, s.end), sql: s.sql.clone() })
 }
 
 /// Every statement of `text` (UTF-16 offsets).
-pub fn statement_spans(kind: ConnectorKind, text: &str) -> Vec<Span> {
-    split_statements(text, kind).into_iter().map(|s| Span { start: byte_to_utf16(text, s.start), end: byte_to_utf16(text, s.end), sql: s.sql }).collect()
+pub fn statement_spans(state: &AppState, kind: ConnectorKind, text: &str) -> Vec<Span> {
+    split_for_editor(state, kind, text).into_iter().map(|s| Span { start: byte_to_utf16(text, s.start), end: byte_to_utf16(text, s.end), sql: s.sql }).collect()
 }
 
 /// Write a text file chosen in a save dialog (diagram exports).
