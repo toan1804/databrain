@@ -50,6 +50,12 @@ pub(crate) struct PartPlan {
     /// The part with its parameters bound, before pushdown: where a
     /// server's position maps back to the part as written.
     pub bound: Checked,
+    /// The column classes pushdown planned with (the part's as described,
+    /// or as kept from an earlier run), checked against what its run gave.
+    pub types: Option<Vec<(String, crate::pushdown::TypeClass)>>,
+    /// A limit pushed with filters, checked after the run
+    /// (`pushdown::Pushed::checked_limit`).
+    pub checked_limit: Option<usize>,
     /// Pushdown wrapped it: where `bound`'s text starts in `sent` (bytes).
     /// `None` when it runs as bound (`sent` is `bound`), or wasn't found.
     pub wrapped_at: Option<Option<usize>>,
@@ -197,6 +203,8 @@ impl QueryEngine {
                 sent,
                 pushed: Vec::new(),
                 span: p.sql_span.clone(),
+                types: None,
+                checked_limit: None,
                 wrapped_at: None,
             });
         }
@@ -236,24 +244,44 @@ impl QueryEngine {
     /// asked ([`crate::pushdown::plan`]). What is sent is checked again
     /// as a read on its connection; a part whose types aren't known, or
     /// whose sent SQL isn't a read there, runs as written.
-    async fn push_down(self: &Arc<Self>, job_id: &str, index: usize, req: &RunRequest, plan: &mut CombinedPlan, cancel: &CancellationToken) {
+    #[allow(clippy::too_many_arguments)]
+    async fn push_down(
+        self: &Arc<Self>,
+        job_id: &str,
+        index: usize,
+        req: &RunRequest,
+        plan: &mut CombinedPlan,
+        cancel: &CancellationToken,
+        fresh: bool,
+        limit_with_where: bool,
+    ) -> Vec<bool> {
+        let mut from_cache = vec![false; plan.parts.len()];
         let outer = match Checked::new(plan.outer(&vec!["r0".to_string(); plan.parts.len()]), ConnectorKind::Duckdb).bind(ConnectorKind::Duckdb, &req.params) {
             Ok(o) => o.sql().to_string(),
-            Err(_) => return,
+            Err(_) => return from_cache,
         };
         // Nothing the outer query could push: no part is asked for its types.
         if !crate::pushdown::may_push(&outer) {
-            return;
+            return from_cache;
         }
-        // The parts' types, asked for at once.
+        // The parts' types: kept from an earlier run (unless `fresh`), else
+        // asked for at once.
+        let mut types: Vec<Option<Vec<(String, crate::pushdown::TypeClass)>>> = vec![None; plan.parts.len()];
         let mut asks = tokio::task::JoinSet::new();
         for (i, p) in plan.parts.iter().enumerate() {
+            if !fresh && let Some(t) = self.kept_part_types(&p.connection_id, p.bound.sql()) {
+                types[i] = Some(t);
+                from_cache[i] = true;
+                continue;
+            }
             let (engine, job, req, p, cancel) = (self.clone(), job_id.to_string(), req.clone(), p.clone(), cancel.clone());
             asks.spawn(async move { (i, engine.part_types(&job, index, i, &req, &p, &cancel).await) });
         }
-        let mut types: Vec<Option<Vec<(String, crate::pushdown::TypeClass)>>> = vec![None; plan.parts.len()];
         while let Some(done) = asks.join_next().await {
             if let Ok((i, t)) = done {
+                if let Some(t) = &t {
+                    self.keep_part_types(&plan.parts[i].connection_id, plan.parts[i].bound.sql(), t.clone());
+                }
                 types[i] = t;
             }
         }
@@ -263,8 +291,9 @@ impl QueryEngine {
             .zip(&types)
             .map(|(p, t)| crate::pushdown::PartInput { name: &p.name, kind: p.kind, sql: p.sent.sql(), columns: t.as_deref() })
             .collect();
-        let pushed = crate::pushdown::plan(&outer, &inputs);
-        for (p, x) in plan.parts.iter_mut().zip(pushed) {
+        let pushed = crate::pushdown::plan_with(&outer, &inputs, limit_with_where);
+        for ((p, x), t) in plan.parts.iter_mut().zip(pushed).zip(types) {
+            p.types = t;
             let Some(x) = x else { continue };
             let sent = Checked::new(x.sent, p.kind);
             let one = [PlannedStatement { index: 0, start: 0, end: 0, checked: sent.clone(), combined: false }];
@@ -280,7 +309,72 @@ impl QueryEngine {
                 p.wrapped_at = Some(sent.sql().find(inner).and_then(|at| at.checked_sub(lead)));
                 p.sent = sent;
                 p.pushed = x.what;
+                p.checked_limit = x.checked_limit;
             }
+        }
+        // Kept types matter only where they pushed something.
+        for (c, p) in from_cache.iter_mut().zip(&plan.parts) {
+            *c &= !p.pushed.is_empty();
+        }
+        from_cache
+    }
+
+    /// Whether any part whose types came from the cache (`from_cache`) has
+    /// other types now (described again): those are kept instead. A run
+    /// that used kept types and failed, or whose parts arrived with other
+    /// classes, runs again only then; otherwise its answer (or error) is
+    /// the one an uncached run gives.
+    async fn types_changed(
+        self: &Arc<Self>,
+        job_id: &str,
+        index: usize,
+        req: &RunRequest,
+        plan: &CombinedPlan,
+        from_cache: &[bool],
+        cancel: &CancellationToken,
+    ) -> bool {
+        let mut changed = false;
+        for (i, p) in plan.parts.iter().enumerate().filter(|(i, _)| from_cache[*i]) {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            let now = self.part_types(job_id, index, i, req, p, cancel).await;
+            if now.as_ref() != p.types.as_ref() {
+                match now {
+                    Some(t) => self.keep_part_types(&p.connection_id, p.bound.sql(), t),
+                    None => self.describes.drop_part_types(&p.connection_id, p.bound.sql()),
+                }
+                changed = true;
+            }
+        }
+        changed && !cancel.is_cancelled()
+    }
+
+    /// The classes a part's output arrived with, as `part_types` reads them.
+    fn output_classes(&self, o: &OutputInfo, kind: ConnectorKind) -> Option<Vec<(String, crate::pushdown::TypeClass)>> {
+        let schema = self.results.get(&o.result_id).ok().map(|rs| rs.lock().schema())?;
+        let db: HashMap<&str, Option<&str>> = o.columns.iter().map(|c| (c.name.as_str(), c.db_type.as_deref())).collect();
+        Some(
+            schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), crate::pushdown::TypeClass::of_field(f, db.get(f.name().as_str()).copied().flatten(), kind)))
+                .collect(),
+        )
+    }
+
+    /// Drop what an attempt kept (its parts' outputs and the join's), when
+    /// the statement runs again.
+    fn drop_attempt(&self, outputs: &[OutputInfo], join_result: Option<&str>) {
+        for o in outputs {
+            let _ = self.outputs.remove(&o.handle);
+            self.results.remove(&o.result_id);
+        }
+        if let Some(rid) = join_result {
+            if let Some(o) = self.outputs.list().into_iter().find(|o| o.result_id == rid) {
+                let _ = self.outputs.remove(&o.handle);
+            }
+            self.results.remove(rid);
         }
     }
 
@@ -296,7 +390,8 @@ impl QueryEngine {
         p: &PartPlan,
         cancel: &CancellationToken,
     ) -> Option<Vec<(String, crate::pushdown::TypeClass)>> {
-        let sql = crate::pushdown::describe_sql(p.sent.sql(), p.kind)?;
+        // The part before pushdown (what its types are of).
+        let sql = crate::pushdown::describe_sql(p.bound.sql(), p.kind)?;
         let checked = Checked::new(sql, p.kind);
         if checked.kind() != StatementKind::Read {
             return None;
@@ -348,18 +443,148 @@ impl QueryEngine {
         waiter: Option<&Waiter>,
     ) -> Result<StatementOutcome> {
         let text = &req.sql[stmt.start..stmt.end];
-        let plan = self
-            .plan_combined(text, &req.params, req.origin, &req.connection_id, req.session_key())?
-            .ok_or_else(|| EngineError::new("internal", "the statement is no longer a combined query"))?;
         let results = self.results_connection()?;
         let cap = self.part_rows(req);
-        let mut plan = plan;
-        if self.pushdown_on(req) {
-            self.push_down(job_id, stmt.index, req, &mut plan, &cancel).await;
+        // Asked again when kept types turned out old (`fresh`), or a limit
+        // pushed with filters was filled by rows DuckDB dropped.
+        // A tapped tab (`dbr --csv`) prints rows as they come: never a run
+        // that may be done again (no kept types, no checked limit).
+        let tapped = self.taps.lock().contains_key(&req.tab_id);
+        let (mut fresh, mut limit_with_where) = (tapped, !tapped);
+        let mut notices: Vec<String> = Vec::new();
+        for attempt in 0..3 {
+            // The last attempt can't be checked again: nothing it would check.
+            if attempt == 2 {
+                limit_with_where = false;
+            }
+            let mut plan = self
+                .plan_combined(text, &req.params, req.origin, &req.connection_id, req.session_key())?
+                .ok_or_else(|| EngineError::new("internal", "the statement is no longer a combined query"))?;
+            let mut from_cache = vec![false; plan.parts.len()];
+            if self.pushdown_on(req) {
+                from_cache = self.push_down(job_id, stmt.index, req, &mut plan, &cancel, fresh, limit_with_where).await;
+            }
+            let cached = from_cache.iter().any(|c| *c);
+            // A run that may be done again shows its parts only once it is final.
+            let hold = attempt < 2 && (cached || plan.parts.iter().any(|p| p.checked_limit.is_some()));
+            let (parts, held) = self.run_parts(job_id, req, stmt, &plan, cap, &cancel, waiter, text, hold).await;
+            let emit = |held: Vec<JobEvent>| {
+                for ev in held {
+                    if let Some(w) = waiter {
+                        let _ = w.send(ev.clone());
+                    }
+                    self.events.emit(ev);
+                }
+            };
+            let outs = match parts {
+                Ok(outs) => outs,
+                Err(e) => {
+                    if hold && cached && e.kind != "cancelled" && self.types_changed(job_id, stmt.index, req, &plan, &from_cache, &cancel).await {
+                        self.drop_attempt(&outputs_of(&held), None);
+                        fresh = true;
+                        notices.push(TYPES_CHANGED.into());
+                        continue;
+                    }
+                    emit(held);
+                    return Err(e);
+                }
+            };
+            // Kept types that no longer match what the parts gave: a class
+            // by name, or, for every column (nothing pruned: a CTE that names
+            // its columns reads them by place), their names in order.
+            let stale = plan.parts.iter().zip(&outs).zip(&from_cache).any(|((p, o), c)| {
+                *c && self.output_classes(o, p.kind).is_some_and(|got| {
+                    let kept = p.types.as_deref().unwrap_or(&[]);
+                    let reordered = got.len() == kept.len() && got.iter().zip(kept).any(|((a, _), (b, _))| a != b);
+                    reordered || got.iter().any(|(n, t)| kept.iter().find(|(k, _)| k == n).is_some_and(|(_, kt)| kt != t))
+                })
+            });
+            if hold && stale && self.types_changed(job_id, stmt.index, req, &plan, &from_cache, &cancel).await {
+                self.drop_attempt(&outs, None);
+                fresh = true;
+                notices.push(TYPES_CHANGED.into());
+                continue;
+            }
+            let handles: Vec<String> = outs.iter().map(|o| o.handle.clone()).collect();
+            let outer = match Checked::new(plan.outer(&handles), ConnectorKind::Duckdb).bind(ConnectorKind::Duckdb, &req.params) {
+                Ok(o) if o.kind() == StatementKind::Read => o,
+                Ok(_) => {
+                    emit(held);
+                    return Err(EngineError::new("invalid", "The query that reads the parts must only read (it runs in DuckDB)"));
+                }
+                Err(names) => {
+                    emit(held);
+                    return Err(EngineError::new("invalid", format!("Enter a value for :{}", names.join(", :"))));
+                }
+            };
+            let mut on_results = req.clone();
+            on_results.connection_id = results.id.clone();
+            let ran = outer.sql().to_string();
+            let outer_stmt = PlannedStatement { index: stmt.index, start: stmt.start, end: stmt.end, checked: outer, combined: false };
+            let o = match self.run_statement(job_id, &on_results, &outer_stmt, limit, cancel.clone(), waiter, None).await {
+                Ok(o) => o,
+                Err(e) => {
+                    if e.kind == "connection" || e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED) {
+                        self.drop_session(&results.id, req.session_key());
+                    }
+                    if hold && cached && e.kind != "cancelled" && self.types_changed(job_id, stmt.index, req, &plan, &from_cache, &cancel).await {
+                        self.drop_attempt(&outs, None);
+                        fresh = true;
+                        notices.push(TYPES_CHANGED.into());
+                        continue;
+                    }
+                    emit(held);
+                    return Err(e);
+                }
+            };
+            // A limit pushed with filters, filled by rows DuckDB then dropped:
+            // the server had more; that part is read again without it. A join
+            // that was cut (the tab's row limit, memory) can't tell, and an
+            // export of every row reads it again from the parts: read again too.
+            let joined = o.result.as_ref().map(|r| (r.total_rows, r.truncated));
+            let short = plan
+                .parts
+                .iter()
+                .zip(&outs)
+                .any(|(p, out)| p.checked_limit.is_some_and(|n| out.rows >= n && joined.is_some_and(|(rows, cut)| rows < n || cut)));
+            if hold && short {
+                self.drop_attempt(&outs, o.result.as_ref().map(|r| r.id.as_str()));
+                limit_with_where = false;
+                notices.push("A part's pushed filter kept rows the query then dropped, so its limit wasn't enough: it was read again without the limit".into());
+                continue;
+            }
+            emit(held);
+            let mut o = o;
+            o.notices.extend(notices);
+            // What ran, reading each part as `results.<handle>`: the output's
+            // SQL, so whatever reads the join later (the assistant's policy
+            // and masks, an export of every row) traces it to the parts.
+            return Ok(StatementOutcome { ran_sql: Some(ran), ..o });
         }
+        Err(EngineError::new("internal", "the combined query ran again too often"))
+    }
+
+    /// Run the parts of `plan` (four at once), each an output of the tab.
+    /// With `hold`, their `PartFinished` events are returned instead of sent
+    /// (the statement may run again); else sent as each finishes. A part
+    /// that fails stops the others.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_parts(
+        self: &Arc<Self>,
+        job_id: &str,
+        req: &RunRequest,
+        stmt: &PlannedStatement,
+        plan: &CombinedPlan,
+        cap: Option<usize>,
+        cancel: &CancellationToken,
+        waiter: Option<&Waiter>,
+        text: &str,
+        hold: bool,
+    ) -> (Result<Vec<OutputInfo>>, Vec<JobEvent>) {
         let stop = cancel.child_token();
         let rows = Arc::new(AtomicUsize::new(0));
-        let mut handles: Vec<Option<String>> = vec![None; plan.parts.len()];
+        let mut outs: Vec<Option<OutputInfo>> = vec![None; plan.parts.len()];
+        let mut held: Vec<JobEvent> = Vec::new();
         let mut failure: Option<EngineError> = None;
         let mut tasks = tokio::task::JoinSet::new();
         let mut next = 0;
@@ -375,7 +600,7 @@ impl QueryEngine {
             match done {
                 Ok((i, Ok(output))) => {
                     let p = &plan.parts[i];
-                    handles[i] = Some(output.handle.clone());
+                    outs[i] = Some(output.clone());
                     let ev = JobEvent::PartFinished {
                         job_id: job_id.to_string(),
                         tab_id: req.tab_id.clone(),
@@ -385,10 +610,14 @@ impl QueryEngine {
                         pushed: p.pushed.clone(),
                         output: Box::new(output),
                     };
-                    if let Some(w) = waiter {
-                        let _ = w.send(ev.clone());
+                    if hold {
+                        held.push(ev);
+                    } else {
+                        if let Some(w) = waiter {
+                            let _ = w.send(ev.clone());
+                        }
+                        self.events.emit(ev);
                     }
-                    self.events.emit(ev);
                 }
                 Ok((i, Err(e))) => {
                     // The first real failure says why; a part stopped because
@@ -407,34 +636,12 @@ impl QueryEngine {
             }
         }
         if let Some(e) = failure {
-            return Err(e);
+            return (Err(e), held);
         }
         if cancel.is_cancelled() {
-            return Err(ConnectorError::cancelled().into());
+            return (Err(ConnectorError::cancelled().into()), held);
         }
-        let handles: Vec<String> = handles.into_iter().map(|h| h.expect("every part finished")).collect();
-        let outer = Checked::new(plan.outer(&handles), ConnectorKind::Duckdb)
-            .bind(ConnectorKind::Duckdb, &req.params)
-            .map_err(|names| EngineError::new("invalid", format!("Enter a value for :{}", names.join(", :"))))?;
-        if outer.kind() != StatementKind::Read {
-            return Err(EngineError::new("invalid", "The query that reads the parts must only read (it runs in DuckDB)"));
-        }
-        let mut on_results = req.clone();
-        on_results.connection_id = results.id.clone();
-        let ran = outer.sql().to_string();
-        let outer_stmt = PlannedStatement { index: stmt.index, start: stmt.start, end: stmt.end, checked: outer, combined: false };
-        match self.run_statement(job_id, &on_results, &outer_stmt, limit, cancel, waiter, None).await {
-            // What ran, reading each part as `results.<handle>`: the output's
-            // SQL, so whatever reads the join later (the assistant's policy
-            // and masks, an export of every row) traces it to the parts.
-            Ok(o) => Ok(StatementOutcome { ran_sql: Some(ran), ..o }),
-            Err(e) => {
-                if e.kind == "connection" || e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED) {
-                    self.drop_session(&results.id, req.session_key());
-                }
-                Err(e)
-            }
-        }
+        (Ok(outs.into_iter().map(|o| o.expect("every part finished")).collect()), held)
     }
 
     /// One part: read whole on its connection's session for this tab
@@ -521,6 +728,19 @@ impl QueryEngine {
     }
 }
 
+/// The notice of a run done again because kept part types were old.
+const TYPES_CHANGED: &str = "A part's column types had changed since they were last read: its rows were read again";
+
+/// The outputs a held attempt's part events carry.
+fn outputs_of(held: &[JobEvent]) -> Vec<OutputInfo> {
+    held.iter()
+        .filter_map(|e| match e {
+            JobEvent::PartFinished { output, .. } => Some((**output).clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A part's error as the statement's: it names the part and its
 /// connection, and its position is in the statement.
 fn part_error(text: &str, p: &PartPlan, e: EngineError) -> EngineError {
@@ -602,6 +822,8 @@ mod tests {
             bound: bound.clone(),
             pushed: vec![],
             span: 0..written.len(),
+            types: None,
+            checked_limit: None,
             wrapped_at: None,
         };
         let chars = |s: &str, w: &str| s[..s.find(w).unwrap()].chars().count() as u32 + 1;

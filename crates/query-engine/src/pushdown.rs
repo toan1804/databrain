@@ -86,6 +86,14 @@ impl TypeClass {
         if kind == ConnectorKind::Mysql && matches!(base_type, "timestamp" | "year") {
             return TypeClass::Other;
         }
+        // DuckDB keeps a timestamp's unit: TIMESTAMP_NS holds nanoseconds,
+        // and TIMESTAMP_S / _MS read a finer literal cut to their unit (the
+        // server's microsecond comparison would drop what DuckDB keeps).
+        // Only microseconds are a Timestamp there.
+        if kind == ConnectorKind::Duckdb && matches!(t, DataType::Timestamp(u, None) if *u != databrain_connector_core::arrow::datatypes::TimeUnit::Microsecond)
+        {
+            return TypeClass::Other;
+        }
         match TypeClass::of(t) {
             TypeClass::Text => {
                 let name = db_type.unwrap_or("").trim().to_ascii_lowercase();
@@ -146,6 +154,20 @@ pub(crate) struct Pushed {
     /// What was pushed, for the UI and the history ("columns id, total",
     /// "total > 5", "limit 10").
     pub what: Vec<String>,
+    /// A limit pushed with filters: the server's may keep rows DuckDB then
+    /// drops, so the run checks the answer after it (see
+    /// `QueryEngine::run_combined`). `None` without one, or when no
+    /// filter came with it (then it is exact).
+    pub checked_limit: Option<usize>,
+}
+
+/// Dialects whose timestamps without a time zone hold at most microseconds,
+/// which is what arrives: there `=`, `<=`, `IN` and `BETWEEN` compare what the
+/// server holds. PostgreSQL (also Redshift, which connects as it), MySQL's
+/// `DATETIME` (its `TIMESTAMP` is never pushed), DuckDB's `TIMESTAMP` (its
+/// `TIMESTAMP_NS` is never pushed) and BigQuery's `DATETIME`.
+pub(crate) fn micros_only(kind: ConnectorKind) -> bool {
+    matches!(kind, ConnectorKind::Postgres | ConnectorKind::Mysql | ConnectorKind::Duckdb | ConnectorKind::Bigquery)
 }
 
 /// The alias around a wrapped part.
@@ -154,7 +176,15 @@ const ALIAS: &str = "databrain_part";
 /// For each part (in order), what to send instead of it, or `None` to send
 /// it as written. `outer` is the outer query as DuckDB runs it (each part's
 /// body already a read of its output, the parameters bound).
+#[cfg(test)]
 pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
+    plan_with(outer, parts, true)
+}
+
+/// [`plan`]; `limit_with_where`: a plain one-part query's limit is pushed
+/// with its WHERE when every WHERE term was pushed too (the run checks it
+/// after: [`Pushed::checked_limit`]); off, only without a WHERE.
+pub(crate) fn plan_with(outer: &str, parts: &[PartInput], limit_with_where: bool) -> Vec<Option<Pushed>> {
     let none = || parts.iter().map(|_| None).collect();
     let Ok(mut stmts) = Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, outer) else { return none() };
     if stmts.len() != 1 {
@@ -290,18 +320,25 @@ pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
         }
     }
     let mut filters: Vec<Vec<String>> = vec![Vec::new(); parts.len()];
-    for t in &terms {
+    let mut where_pushed = 0;
+    for (k, t) in terms.iter().enumerate() {
         if let Some((i, text)) = ctx.term(t, parts)
             && pushable[i]
             && !rels.iter().any(|r| r.part == Some(i) && r.nullable)
         {
             filters[i].push(text);
+            where_pushed += usize::from(k < where_terms);
         }
     }
-    // The row limit: `SELECT cols FROM one_part [WHERE pushed] LIMIT n` and nothing else.
-    // Only without WHERE: a pushed term may keep rows DuckDB then drops (a
-    // case-insensitive `=`), which would take places in the limit.
-    let limit = (rels.len() == 1 && where_terms == 0 && plain_select(sel) && q.order_by.is_none() && q.fetch.is_none()).then(|| plain_limit(&q)).flatten();
+    // The row limit: `SELECT cols FROM one_part [WHERE pushed] LIMIT n` and
+    // nothing else. With a WHERE, only when all of it was pushed: a pushed
+    // term may keep rows DuckDB then drops (a case-insensitive `=`), which
+    // would take places in the limit, so the run checks it after.
+    let with_where = where_terms > 0;
+    let limit =
+        (rels.len() == 1 && (!with_where || limit_with_where && where_pushed == where_terms) && plain_select(sel) && q.order_by.is_none() && q.fetch.is_none())
+            .then(|| plain_limit(&q))
+            .flatten();
 
     parts
         .iter()
@@ -333,7 +370,8 @@ pub(crate) fn plan(outer: &str, parts: &[PartInput]) -> Vec<Option<Pushed>> {
                 return None;
             }
             let sent = wrap(p, cols.as_deref(), &filters[i], n)?;
-            Some(Pushed { sent, what })
+            let checked_limit = n.filter(|_| with_where).and_then(|n| usize::try_from(n).ok());
+            Some(Pushed { sent, what, checked_limit })
         })
         .collect()
 }
@@ -438,7 +476,7 @@ impl Ctx<'_> {
                     // one, so DuckDB sees them a little earlier than the server: `>`, `>=`,
                     // `<` and `<>` (with a literal to the microsecond) keep what DuckDB keeps,
                     // `=` and `<=` may not.
-                    TypeClass::Timestamp => matches!(sym, ">" | ">=" | "<" | "<>") && !negated,
+                    TypeClass::Timestamp => micros_only(parts[i].kind) || matches!(sym, ">" | ">=" | "<" | "<>") && !negated,
                     TypeClass::Text => sym == "=",
                     // A single-precision column compares its stored value, not the one that arrives.
                     TypeClass::Float | TypeClass::Other => false,
@@ -454,7 +492,8 @@ impl Ctx<'_> {
                 let ok = match t {
                     TypeClass::Text => !neg,
                     // `IN` is `=` (see the comparison above).
-                    TypeClass::Float | TypeClass::Other | TypeClass::Timestamp => false,
+                    TypeClass::Timestamp => micros_only(parts[i].kind) && (!neg || t.negation_safe()),
+                    TypeClass::Float | TypeClass::Other => false,
                     _ => !neg || t.negation_safe(),
                 };
                 if !ok || list.is_empty() {
@@ -465,9 +504,10 @@ impl Ctx<'_> {
             }
             Expr::Between { expr, negated: not_between, low, high } => {
                 let (i, name, t) = col(expr)?;
-                // Numbers and dates only (negated too): no text, no floats, no
-                // timestamps (its upper bound is `<=`, see the comparison above).
-                let ok = matches!(t, TypeClass::Integer | TypeClass::Decimal | TypeClass::Date);
+                // Numbers and dates (negated too), and timestamps where they
+                // hold no more than a microsecond: no text, no floats (its
+                // upper bound is `<=`, see the comparison above).
+                let ok = matches!(t, TypeClass::Integer | TypeClass::Decimal | TypeClass::Date) || t == TypeClass::Timestamp && micros_only(parts[i].kind);
                 if !ok {
                     return None;
                 }
@@ -883,9 +923,19 @@ mod tests {
         let o = orders();
         let one = |q: &str, kind| run(q, &[("o", kind, "select * from orders", Some(&o))])[0].clone();
         assert!(one("with o as (select * from results.r1) select id from o limit 10", Postgres).unwrap().sent.ends_with(") databrain_part\nLIMIT 10"));
-        // With a WHERE: no limit (a pushed term may keep rows DuckDB drops, which would fill it).
-        let w = one("with o as (select * from results.r1) select id from o where id > 1 limit 10", Postgres).unwrap();
-        assert!(w.sent.ends_with("WHERE \"id\" > 1") && !w.what.iter().any(|x| x.starts_with("limit")), "{w:?}");
+        assert_eq!(one("with o as (select * from results.r1) select id from o limit 10", Postgres).unwrap().checked_limit, None, "exact without a WHERE");
+        // With a WHERE all pushed: the limit too, checked after the run (a
+        // pushed term may keep rows DuckDB drops, which would fill it).
+        let q = "with o as (select * from results.r1) select id from o where id > 1 limit 10";
+        let w = one(q, Postgres).unwrap();
+        assert!(w.sent.ends_with("WHERE \"id\" > 1\nLIMIT 10"), "{w:?}");
+        assert_eq!(w.checked_limit, Some(10));
+        // Asked again without it (the check found the server's filter looser).
+        let again = plan_with(q, &[PartInput { name: "o", kind: Postgres, sql: "select * from orders", columns: Some(&o) }], false)[0].clone().unwrap();
+        assert!(again.sent.ends_with("WHERE \"id\" > 1") && again.checked_limit.is_none(), "{again:?}");
+        // A WHERE term that isn't pushed keeps the limit out.
+        let f = one("with o as (select * from results.r1) select id from o where id > 1 and score > 2 limit 10", Postgres).unwrap();
+        assert!(!f.what.iter().any(|x| x.starts_with("limit")), "{f:?}");
         assert!(one("with o as (select * from results.r1) select id from o limit 10", Mssql).unwrap().sent.starts_with("SELECT TOP (10) [id] FROM"));
         assert!(one("with o as (select * from results.r1) select id from o limit 10", Oracle).unwrap().sent.ends_with("FETCH FIRST 10 ROWS ONLY"));
         for q in [
@@ -995,6 +1045,40 @@ mod tests {
         }
         assert!(!filtered(one("id is null", Sqlite)));
         assert!(filtered(one("id is not null", Sqlite)));
+    }
+
+    /// Where timestamps hold at most a microsecond (what arrives), every
+    /// comparison is pushed on them; elsewhere `=`, `<=`, `IN` and `BETWEEN`
+    /// aren't (a value finer than that arrives cut).
+    #[test]
+    fn timestamps_where_they_hold_microseconds() {
+        let o = cols(&[("id", Integer), ("ts", Timestamp)]);
+        let pushed = |w: &str, k: ConnectorKind| {
+            run(&format!("with o as (select * from results.r1) select id from o where {w}"), &[("o", k, "select * from t", Some(&o))])[0]
+                .clone()
+                .is_some_and(|p| p.sent.contains("WHERE"))
+        };
+        for w in [
+            "ts = '2024-01-01 10:00:00'",
+            "ts <= '2024-01-01'",
+            "ts in ('2024-01-01', '2024-01-02')",
+            "ts between '2024-01-01' and '2024-02-01'",
+            "not (ts <= '2024-01-01')",
+        ] {
+            for k in [Postgres, Mysql, Duckdb, Bigquery] {
+                assert!(pushed(w, k), "{k:?}: {w}");
+            }
+            for k in [Mssql, Oracle, Snowflake, Clickhouse] {
+                assert!(!pushed(w, k), "{k:?}: {w}");
+            }
+        }
+        assert!(pushed("ts > '2024-01-01'", Mssql), "as before");
+        // DuckDB's TIMESTAMP_NS holds nanoseconds: not a microsecond timestamp.
+        use databrain_connector_core::arrow::datatypes::TimeUnit;
+        for u in [TimeUnit::Nanosecond, TimeUnit::Millisecond, TimeUnit::Second] {
+            assert_eq!(TypeClass::of_column(&DataType::Timestamp(u, None), None, Duckdb), Other, "{u:?}");
+        }
+        assert_eq!(TypeClass::of_column(&DataType::Timestamp(TimeUnit::Microsecond, None), None, Duckdb), Timestamp);
     }
 
     /// MySQL's TIMESTAMP (UTC, converted with the session's time zone) and
