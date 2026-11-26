@@ -77,6 +77,15 @@ impl TypeClass {
 
     /// [`Self::of_field`] from the type alone.
     pub(crate) fn of_column(t: &DataType, db_type: Option<&str>, kind: ConnectorKind) -> TypeClass {
+        let base_type = db_type.unwrap_or("").trim().to_ascii_lowercase();
+        let base_type = base_type.split(['(', ' ']).next().unwrap_or("");
+        // MySQL (and MariaDB): a TIMESTAMP is kept in UTC and a literal is
+        // converted with the session's time zone, whose order isn't local
+        // time's around a DST change; a YEAR arrives as an integer, but a
+        // constant compared with it is read as a year (50 → 2050).
+        if kind == ConnectorKind::Mysql && matches!(base_type, "timestamp" | "year") {
+            return TypeClass::Other;
+        }
         match TypeClass::of(t) {
             TypeClass::Text => {
                 let name = db_type.unwrap_or("").trim().to_ascii_lowercase();
@@ -466,8 +475,18 @@ impl Ctx<'_> {
                 Some(format!("{name} {}BETWEEN {} AND {}", if *not_between { "NOT " } else { "" }, literal(low, t, k)?, literal(high, t, k)?))
             }
             Expr::IsNull(c) | Expr::IsNotNull(c) => {
-                let (_, name, t) = col(c)?;
+                let (i, name, t) = col(c)?;
                 if t == TypeClass::Other || negated && !t.negation_safe() {
+                    return None;
+                }
+                // What it keeps is NULLs: a value that doesn't fit its type
+                // arrives as NULL (PostgreSQL's ±infinity dates and
+                // timestamps, numeric NaN, MySQL's zero dates), which the
+                // server's IS NULL drops and DuckDB keeps. SQLite's columns
+                // hold any type. Under a NOT (once or twice: `negated` doesn't
+                // count them) either may mean IS NULL: neither is pushed.
+                let keeps_nulls = matches!(e, Expr::IsNull(_)) || negated;
+                if keeps_nulls && (matches!(t, TypeClass::Date | TypeClass::Timestamp | TypeClass::Decimal) || parts[i].kind == ConnectorKind::Sqlite) {
                     return None;
                 }
                 Some(format!("{name} IS {}NULL", if matches!(e, Expr::IsNotNull(_)) { "NOT " } else { "" }))
@@ -948,6 +967,51 @@ mod tests {
     }
 
     /// Text is text only when the server says so.
+    /// `IS NULL` keeps NULLs, and some values arrive as NULL that the
+    /// server doesn't hold as one (infinity dates, numeric NaN, MySQL zero
+    /// dates): not pushed on dates, timestamps and decimals, nor on SQLite.
+    /// `IS NOT NULL` is (it drops those rows in DuckDB too, so the server
+    /// keeping them is looser).
+    #[test]
+    fn is_null_only_where_nothing_arrives_as_null() {
+        let o = cols(&[("id", Integer), ("total", Decimal), ("note", Text), ("day", Date), ("at", Timestamp), ("ok", Bool)]);
+        let one = |w: &str, k: ConnectorKind| {
+            run(&format!("with o as (select * from results.r1) select id from o where {w}"), &[("o", k, "select * from t", Some(&o))])[0].clone()
+        };
+        let filtered = |p: Option<Pushed>| p.is_some_and(|p| p.sent.contains("WHERE"));
+        for w in [
+            "day is null",
+            "at is null",
+            "total is null",
+            "not (day is not null)",
+            "not (id = 1 and not (day is null))",
+            "not (not (day is null))",
+            "not (day is null)",
+        ] {
+            assert!(!filtered(one(w, Postgres)), "{w}");
+        }
+        for w in ["id is null", "note is null", "ok is null", "day is not null", "total is not null", "not (id is null)"] {
+            assert!(filtered(one(w, Postgres)), "{w}");
+        }
+        assert!(!filtered(one("id is null", Sqlite)));
+        assert!(filtered(one("id is not null", Sqlite)));
+    }
+
+    /// MySQL's TIMESTAMP (UTC, converted with the session's time zone) and
+    /// YEAR (a constant is read as a year) are never pushed; DATETIME is.
+    #[test]
+    fn mysql_timestamp_and_year_are_other() {
+        use databrain_connector_core::arrow::datatypes::TimeUnit;
+        let ts = DataType::Timestamp(TimeUnit::Microsecond, None);
+        assert_eq!(TypeClass::of_column(&ts, Some("timestamp"), Mysql), Other);
+        assert_eq!(TypeClass::of_column(&ts, Some("timestamp(3)"), Mysql), Other);
+        assert_eq!(TypeClass::of_column(&ts, Some("datetime(6)"), Mysql), Timestamp);
+        assert_eq!(TypeClass::of_column(&DataType::Int64, Some("year"), Mysql), Other);
+        assert_eq!(TypeClass::of_column(&DataType::Int64, Some("int"), Mysql), Integer);
+        // Elsewhere a timestamp is a timestamp.
+        assert_eq!(TypeClass::of_column(&ts, Some("timestamp without time zone"), Postgres), Timestamp);
+    }
+
     #[test]
     fn text_only_for_character_types() {
         use databrain_connector_core::arrow::datatypes::DataType::Utf8;

@@ -80,7 +80,11 @@ impl CombinedPlan {
 #[derive(Debug, Clone)]
 pub(crate) struct PartRun {
     pub job_id: String,
+    /// The combined statement's index in the run.
     pub index: usize,
+    /// The part's index in the statement: with `index`, its results' ids
+    /// (`{job}/{index}/{part}`), unique in the run whatever the parts' names.
+    pub part: usize,
     /// Rows read so far by all the statement's parts.
     pub rows: Arc<AtomicUsize>,
 }
@@ -232,7 +236,7 @@ impl QueryEngine {
     /// asked ([`crate::pushdown::plan`]). What is sent is checked again
     /// as a read on its connection; a part whose types aren't known, or
     /// whose sent SQL isn't a read there, runs as written.
-    async fn push_down(self: &Arc<Self>, job_id: &str, req: &RunRequest, plan: &mut CombinedPlan, cancel: &CancellationToken) {
+    async fn push_down(self: &Arc<Self>, job_id: &str, index: usize, req: &RunRequest, plan: &mut CombinedPlan, cancel: &CancellationToken) {
         let outer = match Checked::new(plan.outer(&vec!["r0".to_string(); plan.parts.len()]), ConnectorKind::Duckdb).bind(ConnectorKind::Duckdb, &req.params) {
             Ok(o) => o.sql().to_string(),
             Err(_) => return,
@@ -245,7 +249,7 @@ impl QueryEngine {
         let mut asks = tokio::task::JoinSet::new();
         for (i, p) in plan.parts.iter().enumerate() {
             let (engine, job, req, p, cancel) = (self.clone(), job_id.to_string(), req.clone(), p.clone(), cancel.clone());
-            asks.spawn(async move { (i, engine.part_types(&job, &req, &p, &cancel).await) });
+            asks.spawn(async move { (i, engine.part_types(&job, index, i, &req, &p, &cancel).await) });
         }
         let mut types: Vec<Option<Vec<(String, crate::pushdown::TypeClass)>>> = vec![None; plan.parts.len()];
         while let Some(done) = asks.join_next().await {
@@ -279,9 +283,12 @@ impl QueryEngine {
 
     /// A part's output columns and their classes, from its query wrapped to
     /// return no row; `None` when it can't be asked so.
+    #[allow(clippy::too_many_arguments)]
     async fn part_types(
         self: &Arc<Self>,
         job_id: &str,
+        index: usize,
+        part: usize,
         req: &RunRequest,
         p: &PartPlan,
         cancel: &CancellationToken,
@@ -295,9 +302,9 @@ impl QueryEngine {
         on.connection_id = p.connection_id.clone();
         on.session_key = Some(SessionRole::Part { tab: req.session_key().to_string(), name: p.name.clone() }.key());
         on.output_masks = None;
-        let run = PartRun { job_id: job_id.to_string(), index: 0, rows: Arc::new(AtomicUsize::new(0)) };
+        let run = PartRun { job_id: job_id.to_string(), index, part, rows: Arc::new(AtomicUsize::new(0)) };
         let stmt = PlannedStatement { index: 0, start: 0, end: 0, checked, combined: false };
-        let job = format!("{job_id}/{}/types", p.name);
+        let job = format!("{job_id}/{index}/{part}/types");
         let out = self.run_statement(&job, &on, &stmt, Some(1), cancel.child_token(), None, Some(&run)).await.ok()?;
         let r = out.result?;
         let schema = self.results.get(&r.id).ok().map(|rs| rs.lock().schema());
@@ -345,7 +352,7 @@ impl QueryEngine {
         let cap = self.part_rows(req);
         let mut plan = plan;
         if self.pushdown_on(req) {
-            self.push_down(job_id, req, &mut plan, &cancel).await;
+            self.push_down(job_id, stmt.index, req, &mut plan, &cancel).await;
         }
         let stop = cancel.child_token();
         let rows = Arc::new(AtomicUsize::new(0));
@@ -357,7 +364,7 @@ impl QueryEngine {
             while next < plan.parts.len() && tasks.len() < PARALLEL_PARTS && failure.is_none() && !stop.is_cancelled() {
                 let (engine, part, i) = (self.clone(), plan.parts[next].clone(), next);
                 let (req, stop) = (req.clone(), stop.clone());
-                let run = PartRun { job_id: job_id.to_string(), index: stmt.index, rows: rows.clone() };
+                let run = PartRun { job_id: job_id.to_string(), index: stmt.index, part: i, rows: rows.clone() };
                 tasks.spawn(async move { (i, engine.run_part(&req, &part, run, cap, stop).await) });
                 next += 1;
             }
@@ -437,8 +444,9 @@ impl QueryEngine {
         on.connection_id = p.connection_id.clone();
         on.session_key = Some(key.clone());
         on.output_masks = None;
-        // Results of its own (`{job}/{n}:0`): never one of the run's statements.
-        let part_job = format!("{}/{}", run.job_id, p.name);
+        // Results of its own (`{job}/{statement}/{part}:0`): never one of the
+        // run's statements, nor another statement's part of the same name.
+        let part_job = format!("{}/{}/{}", run.job_id, run.index, run.part);
         let stmt = PlannedStatement { index: 0, start: 0, end: 0, checked: p.sent.clone(), combined: false };
         let started_at = now_ms();
         let t0 = Instant::now();

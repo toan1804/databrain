@@ -439,3 +439,28 @@ async fn errors_point_where_they_are_written() {
     let out = s.run(r).await.unwrap();
     assert_eq!(out[0].error.as_ref().and_then(|e| e.position), Some(part.find("nope").unwrap() as u32 + 1), "{:?}", out[0].error);
 }
+
+/// Two combined statements of one run, each with a part of the same name:
+/// each part keeps its own result (their ids carry the statement and the
+/// part's place, not its name), and each join reads its own part.
+#[tokio::test(flavor = "multi_thread")]
+async fn parts_of_one_name_in_two_statements_keep_their_own_rows() {
+    let s = setup().await;
+    let script = "with o as (@\"Sales DB\" select id from orders where id = 1) select id from o;\n\
+                  with o as (@\"Sales DB\" select id from orders where id = 3) select id from o";
+    let out = s.run(req(&s.sales, "k2", script)).await.unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(s.rows(&out[0]), ["1"]);
+    assert_eq!(s.rows(&out[1]), ["3"]);
+    let parts: Vec<(String, String)> =
+        s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "k2" && o.part.is_some()).map(|o| (o.result_id.clone(), o.sql.clone())).collect();
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    assert_ne!(parts[0].0, parts[1].0, "two results, not one replaced");
+    for (rid, sql) in &parts {
+        let rs = s.st.engine.results().get(rid).unwrap();
+        let mut g = rs.lock();
+        let page = g.page(&databrain_result_store::ViewSpec::default(), 0, 10).unwrap();
+        let want = if sql.contains("id = 1") { "1" } else { "3" };
+        assert_eq!(page.rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), [want], "{sql}");
+    }
+}
