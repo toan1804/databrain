@@ -212,6 +212,17 @@ const NO_DATABASE_PROMPT: &str = "You are DataBrain's assistant, embedded in a d
     that could not be set up (its settings and error are in the message). Explain the error, the likely causes and what to change, \
     concisely. You have no tools and no access to any database for this question: answer from the message only.";
 
+/// The note on a turn that has other connections attached: how to work on
+/// each, and that a question over them is a combined query.
+fn connections_hint(current: &str, others: &[ConnectionProfile]) -> String {
+    let names: Vec<String> = others.iter().map(|p| format!("\"{}\" ({})", p.name, p.config.kind.dialect_name())).collect();
+    format!(
+        "\n\n[Connections for this question: \"{}\" (current) and {}. Pass `connection` to list_tables, search_schema, describe_table and run_query to work on another one, in its own dialect. To join or compare them, write a combined query for the user to run (WITH parts starting with @\"Name\", joined in DuckDB); for a quick look, combine run_query outputs with query_outputs over results.<handle>.]",
+        current,
+        names.join(", ")
+    )
+}
+
 pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mode, retrieved: &knowledge::Retrieved, examples: &[(String, String)]) -> String {
     let kind = profile.config.kind;
     let mut s = format!(
@@ -251,14 +262,15 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          whose parts start with @connection and run on that connection, in its own dialect; the query around them is DuckDB SQL \
          that joins the parts by their CTE names, e.g.\n\
          WITH a AS (@\"Sales PG\" SELECT id, total FROM orders WHERE created_at >= '2024-01-01'), \
-         b AS (@crm SELECT order_id, amount FROM invoices) \
+         b AS (@\"CRM\" SELECT order_id, amount FROM invoices) \
          SELECT a.id, a.total, b.amount FROM a FULL OUTER JOIN b ON a.id = b.order_id WHERE a.total IS DISTINCT FROM b.amount\n\
-         Use each connection's exact name from list_connections (@name when it is one word, else @\"Name\", or @id:<id>); \
-         check each part's tables with search_schema / describe_table (connection argument). Each part must be one read (not on MongoDB or Neo4j); \
-         it is read whole (it fails past 1,000,000 rows), so keep parts filtered and narrow (only the columns and rows needed) and \
+         Always write a part's connection as @\"Name\" with its exact name from list_connections (a \" in the name is \
+         written twice); an unquoted @name ends at the first character that isn't a letter, digit, _, -, . or $. \
+         Check each part's tables with search_schema / describe_table (connection argument). Each part must be one read (not on MongoDB or Neo4j); \
+         it is read whole (by default it fails past 1,000,000 rows: setting combined_part_rows), so keep parts filtered and narrow (only the columns and rows needed) and \
          do the joins and comparisons in the outer query. For a comparison, a FULL OUTER JOIN on the key with a status column \
          (only_in_a, only_in_b, different) works well. You cannot run a combined query yourself: the user runs it from a query \
-         tab (any tab), so say so. For a quick look you may still run_query each connection and compare the outputs with \
+         tab, whatever the tab's connection (not from a notebook or dashboard), so say so. For a quick look you may still run_query each connection and compare the outputs with \
          query_outputs over results.<handle>. Propose a job only when the user wants it saved, kept, loaded into a table, \
          exported to a file or scheduled: one query step per connection, a Results (DuckDB) step that joins/compares them, \
          then optionally a load or export step. Explain the plan first, create_job (the user approves), then offer run_job and \
@@ -637,12 +649,7 @@ impl Agent {
             }
         }
         if !others.is_empty() {
-            let names: Vec<String> = others.iter().map(|p| format!("\"{}\" ({})", p.name, p.config.kind.dialect_name())).collect();
-            turn_text.push_str(&format!(
-                "\n\n[Connections for this question: \"{}\" (current) and {}. Pass `connection` to list_tables, search_schema, describe_table and run_query to work on another one, in its own dialect; combine their outputs with query_outputs over results.<handle>.]",
-                profile.name,
-                names.join(", ")
-            ));
+            turn_text.push_str(&connections_hint(&profile.name, &others));
         }
         let turn = Message::user(turn_text);
         ws.add_ai_message(&sid, "user", &serde_json::to_value(&turn).unwrap_or_default(), (None, None))?;
@@ -856,11 +863,32 @@ mod tests {
         };
         let retrieved = knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![], learned_joins: 0 };
         let p = system_prompt(&profile, None, Mode::Chat, &retrieved, &[]);
-        for needle in ["write one combined query", "start with @connection", "@\"Sales PG\"", "@id:<id>", "1,000,000 rows", "the user runs it from a query"] {
+        for needle in [
+            "write one combined query",
+            "start with @connection",
+            "Always write a part's connection as @\"Name\"",
+            "combined_part_rows",
+            "the user runs it from a query",
+        ] {
             assert!(p.contains(needle), "prompt lacks {needle}");
         }
         assert!(p.contains("Propose a job only when the user wants it saved"));
         assert!(!p.contains("propose a job instead"), "jobs are no longer the default across connections");
+        // The example is a combined query that parses: two parts, on the
+        // connections it names.
+        let start = p.find("WITH a AS (@").expect("an example");
+        let example = &p[start..start + p[start..].find('\n').unwrap()];
+        let mut seen = vec![];
+        let c = databrain_connector_core::sql::parse_combined(example, &mut |r| {
+            seen.push(r.to_string());
+            Ok(ConnectorKind::Postgres)
+        })
+        .unwrap()
+        .expect("a combined query");
+        assert_eq!(c.parts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(seen, ["Sales PG", "CRM"]);
+        let hint = connections_hint("Shop", std::slice::from_ref(&profile));
+        assert!(hint.contains("write a combined query") && hint.contains("for a quick look"), "{hint}");
     }
 
     /// A conversation stopped mid tool batch: the unanswered calls get a
