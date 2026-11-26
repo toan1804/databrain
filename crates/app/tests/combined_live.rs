@@ -175,6 +175,45 @@ async fn pushdown_gives_the_same_rows_on_real_servers() {
         // A limit on a plain one-part query.
         let out = run(&st, &p.id, &format!("with t as ({part}) select id from t limit 2"), Some(true)).await;
         assert_eq!(rows(&st, &out).len(), 2, "{kind:?}");
+        // Values a server holds but that arrive as NULL (PostgreSQL's
+        // infinity), MySQL's TIMESTAMP (time zone) and YEAR (a constant is
+        // a year): the same rows with pushdown on and off.
+        let edge: Vec<(&str, Vec<String>)> = match kind {
+            ConnectorKind::Postgres => vec![
+                ("insert into dbr_pd (id, day, ts) values (5, 'infinity', '-infinity')", vec![]),
+                (
+                    "",
+                    vec![
+                        format!("with t as ({part}) select count(*) from t where day is null"),
+                        format!("with t as ({part}) select count(*) from t where ts is null"),
+                        format!("with t as ({part}) select id from t where day > '2024-01-01'"),
+                    ],
+                ),
+            ],
+            ConnectorKind::Mysql => vec![
+                ("alter table dbr_pd add column at_utc timestamp null, add column y year null", vec![]),
+                ("update dbr_pd set at_utc = '2024-03-10 02:30:00', y = 2050 where id = 1", vec![]),
+                (
+                    "",
+                    vec![
+                        format!("with t as ({part}) select id from t where y > 50"),
+                        format!("with t as ({part}) select id from t where at_utc > '2024-03-10 01:00:00'"),
+                        format!("with t as ({part}) select count(*) from t where at_utc is null"),
+                    ],
+                ),
+            ],
+            _ => vec![],
+        };
+        for (setup, qs) in &edge {
+            if !setup.is_empty() {
+                run(&st, &p.id, setup, None).await;
+            }
+            for q in qs {
+                let on = rows(&st, &run(&st, &p.id, q, Some(true)).await);
+                let off = rows(&st, &run(&st, &p.id, q, Some(false)).await);
+                assert_eq!(on, off, "{kind:?}: {q}");
+            }
+        }
         let drop = if *kind == ConnectorKind::Mssql { "drop table dbo.dbr_pd" } else { "drop table dbr_pd" };
         run(&st, &p.id, drop, None).await;
     }
