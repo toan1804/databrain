@@ -63,6 +63,17 @@ pub(crate) fn classify_with(sql: &str, kind: ConnectorKind, parse: Option<&Parse
     if kind == ConnectorKind::Mysql && (sql.contains("/*!") || sql.contains("/*M!") || sql.contains("/*m!")) {
         return Classification { kind: c.kind.max(StatementKind::Unknown), ..c };
     }
+    // MySQL takes `--` for a comment only before an ASCII space or control
+    // character; the parser also before any other whitespace (a no-break
+    // space), and then reads code that runs as a comment:
+    // `select 1 --\u{a0}c into outfile '/tmp/x'` writes a file. Asked about.
+    if kind == ConnectorKind::Mysql && sql.contains("--") {
+        let code = super::code_text(sql, kind);
+        let hidden = code.match_indices("--").any(|(at, _)| code[at + 2..].chars().next().is_some_and(|c| c.is_whitespace() && !c.is_ascii()));
+        if hidden {
+            return Classification { kind: c.kind.max(StatementKind::Unknown), ..c };
+        }
+    }
     // BigQuery and ClickHouse read ``\` `` inside a quoted name as an
     // escaped backtick; the parser ends the name there. The text as the
     // server splits it decides: ``select 1 `a\`, `; drop table t`` is two.
@@ -1300,6 +1311,21 @@ mod tests {
             let c = classify(sql, k);
             assert_eq!(c.kind, StatementKind::Session, "{k:?}: {sql}");
             assert!(crate::sql::read_only_allows(sql, &c), "{k:?}: {sql}");
+        }
+    }
+
+    /// MySQL: `--` is a comment only before an ASCII space or control
+    /// character. Before a no-break space MySQL reads code the parser takes
+    /// for a comment, so it is asked about; a real comment stays a read.
+    #[test]
+    fn mysql_dashes_before_other_spaces_are_asked_about() {
+        let k = ConnectorKind::Mysql;
+        let hidden = "select * from (select 1 x, 2 `\u{a0}c`) t where x = 1 --\u{a0}c into outfile '/tmp/x'";
+        let c = classify(hidden, k);
+        assert!(c.kind >= StatementKind::Unknown, "{c:?}");
+        assert!(!crate::sql::read_only_allows(hidden, &c));
+        for read in ["select 1 -- a comment", "select 1 --\tx", "select '--\u{a0}' as s", "select 1 -- \u{a0}x"] {
+            assert_eq!(classify(read, k).kind, StatementKind::Read, "{read}");
         }
     }
 }
