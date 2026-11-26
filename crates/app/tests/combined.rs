@@ -543,7 +543,7 @@ async fn parts_share_the_statements_memory() {
     s.ok(
         &s.sales,
         "create table wide (id integer, s text, amount numeric(12,2), at text); \
-         with recursive n(i) as (select 1 union all select i + 1 from n where i < 60000) \
+         with recursive n(i) as (select 1 union all select i + 1 from n where i < 30000) \
          insert into wide select i, hex(randomblob(40)), i / 100.0, datetime('2024-01-01', '+' || i || ' seconds') from n",
     )
     .await;
@@ -556,12 +556,21 @@ async fn parts_share_the_statements_memory() {
     databrain_app::api::set_results_spill(&s.st.engine, dir.path());
     s.st.engine.outputs().set_budget(0); // the 16 MB floor: 8 MB a statement
     let small = s.run(off).await.unwrap();
+    // One part alone fits in the statement's memory.
+    let alone = "with a as (@\"Sales DB\" select id, s, amount from wide) select count(*) from a";
+    let mut one = req(&s.sales, "m2", alone);
+    one.pushdown = Some(false);
+    s.run(one).await.unwrap();
+    let single: Vec<_> = s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "m2" && o.part.is_some() && o.active).collect();
+    assert_eq!(single.iter().filter(|o| o.spilled).count(), 0, "{:?}", single.iter().map(|o| (o.bytes, o.spilled)).collect::<Vec<_>>());
     assert!(small[0].error.is_none(), "{:?}", small[0].error);
     assert_eq!(s.rows(&small[0]), s.rows(&large[0]));
     assert_eq!(small[0].result.as_ref().unwrap().columns, large[0].result.as_ref().unwrap().columns);
     let parts: Vec<_> = s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "m1" && o.part.is_some() && o.active).collect();
     assert_eq!(parts.len(), 2);
-    assert!(parts.iter().any(|o| o.spilled), "one part on disk: {:?}", parts.iter().map(|o| (o.bytes, o.spilled)).collect::<Vec<_>>());
+    // On disk: one alone fits (above), together they don't (both may go
+    // when they pass the cap at once).
+    assert!(parts.iter().any(|o| o.spilled), "{:?}", parts.iter().map(|o| (o.bytes, o.spilled)).collect::<Vec<_>>());
     assert!(parts.iter().all(|o| !o.truncated));
 }
 

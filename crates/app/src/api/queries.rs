@@ -163,8 +163,10 @@ pub async fn estimate_cost(
     auto: bool,
 ) -> Result<databrain_connector_core::CostEstimate> {
     // A combined query: its parts, each bound and estimated on its connection.
-    if databrain_connector_core::sql::looks_combined(sql) {
-        return state.engine.estimate_combined(connection_id, session_key, sql, params, auto).await;
+    if databrain_connector_core::sql::looks_combined(sql)
+        && let Some(e) = state.engine.estimate_combined(connection_id, session_key, sql, params, auto).await?
+    {
+        return Ok(e);
     }
     let kind = state.workspace.get_connection(connection_id)?.config.kind;
     let sql = databrain_connector_core::sql::substitute_parameters(sql, kind, params)

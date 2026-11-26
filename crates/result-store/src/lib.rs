@@ -881,9 +881,24 @@ impl ResultStore {
         self.size_of(id).0
     }
 
-    /// Bytes in memory of every result whose id starts with `prefix`.
-    pub fn bytes_with_prefix(&self, prefix: &str) -> usize {
-        let rs: Vec<_> = self.results.lock().iter().filter(|(k, _)| k.starts_with(prefix)).map(|(_, r)| r.clone()).collect();
+    /// Bytes in memory of a run's results before statement `index`: its
+    /// statements' (`{job}:{i}`) and their parts' (`{job}/{i}/…`), in one pass.
+    pub fn bytes_before(&self, job: &str, index: usize) -> usize {
+        if index == 0 {
+            return 0;
+        }
+        let rs: Vec<_> = self
+            .results
+            .lock()
+            .iter()
+            .filter(|(k, _)| {
+                k.strip_prefix(job).is_some_and(|rest| {
+                    let n = rest.strip_prefix(':').or_else(|| rest.strip_prefix('/')).map(|r| r.split(['/', ':']).next().unwrap_or(""));
+                    n.and_then(|n| n.parse::<usize>().ok()).is_some_and(|i| i < index)
+                })
+            })
+            .map(|(_, r)| r.clone())
+            .collect();
         rs.iter().map(|r| r.lock().memory_bytes()).sum()
     }
 

@@ -573,8 +573,7 @@ impl QueryEngine {
         // Earlier combined statements' parts (`{job}/{i}/{k}`) count too; a
         // part counts from its statement's place in the run.
         let (run_job, index) = part.map_or((job_id, stmt.index), |p| (p.job_id.as_str(), p.index));
-        let earlier: usize =
-            (0..index).map(|i| self.results.bytes_of(&format!("{run_job}:{i}")) + self.results.bytes_with_prefix(&format!("{run_job}/{i}/"))).sum();
+        let earlier = self.results.bytes_before(run_job, index);
         // A job step's result counts against the job budget, less what the
         // other steps hold or reserved, so a job never takes the memory the
         // tabs' results have; past it the result goes to disk. Where results

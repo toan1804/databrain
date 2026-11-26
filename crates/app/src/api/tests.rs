@@ -2127,6 +2127,13 @@ async fn cost_of_a_combined_query_is_per_part() {
     assert_eq!(e.parts.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     assert!(e.parts.iter().all(|x| x.connection == "shop" && x.bytes.is_none() && x.note.as_deref().is_some_and(|n| n.contains("SQLite"))), "{e:?}");
     assert_eq!(e.bytes, None);
+    // A `@` that isn't a part (in a string, a BigQuery parameter): estimated as any statement.
+    let plain = estimate_cost(&st, &p.id, "tab", "with u as (select 'a@b.com' x) select * from u", &Default::default(), false).await.unwrap_err();
+    assert_eq!(plain.kind, "unsupported", "{}", plain.message);
+    assert!(plain.message.contains("SQLite gives no cost estimate"), "{}", plain.message);
+    // One statement at a time.
+    let two = estimate_cost(&st, &p.id, "tab", "with a as (@shop select 1 x) select * from a; select 2", &Default::default(), false).await.unwrap_err();
+    assert!(two.message.contains("one statement at a time"), "{}", two.message);
     // A part that writes is refused as a run would refuse it.
     let w = estimate_cost(&st, &p.id, "tab", "with a as (@shop delete from t returning id) select * from a", &Default::default(), false).await.unwrap_err();
     assert!(w.message.contains("must be a query that only reads"), "{}", w.message);
