@@ -29,8 +29,28 @@ fn utf16_offsets() {
     assert_eq!(byte_to_utf16(t, 6), 3);
     assert_eq!(utf16_to_byte(t, 3), 6);
     assert_eq!(utf16_to_byte(t, 99), t.len());
-    let s = statement_at_cursor(ConnectorKind::Sqlite, "select 'é';\nselect 2;", 13).unwrap();
+    let (st, _sink, _dir) = state();
+    let s = statement_at_cursor(&st, ConnectorKind::Sqlite, "select 'é';\nselect 2;", 13).unwrap();
     assert_eq!((s.start, s.end, s.sql.as_str()), (12, 20, "select 2"));
+}
+
+/// The editor splits a combined query as the run does: a MySQL part's
+/// `\'` on a SQLite tab doesn't end the statement; a part on an unknown
+/// connection reads as the tab does.
+#[test]
+fn the_editor_splits_parts_in_their_dialects() {
+    let (st, _sink, _dir) = state();
+    let mut c = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::None);
+    c.host = Some("db.invalid".into());
+    save_profile(&st, "my", c, None);
+    let text = "with a as (@my select 'a\\'; select 3; x' y) select * from a;\nselect 2";
+    let spans = statement_spans(&st, ConnectorKind::Sqlite, text);
+    assert_eq!(spans.len(), 2, "{spans:?}");
+    assert_eq!(split_statements(text, ConnectorKind::Sqlite).len(), 3, "the tab's dialect alone splits it elsewhere");
+    let s = statement_at_cursor(&st, ConnectorKind::Sqlite, text, 30).unwrap();
+    assert!(s.sql.starts_with("with a as") && s.sql.ends_with("from a"), "{}", s.sql);
+    let unknown = text.replace("@my", "@nope");
+    assert_eq!(statement_spans(&st, ConnectorKind::Sqlite, &unknown).len(), split_statements(&unknown, ConnectorKind::Sqlite).len());
 }
 
 #[derive(Default)]

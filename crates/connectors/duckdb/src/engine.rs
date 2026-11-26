@@ -222,4 +222,20 @@ mod bundled_extensions {
         let norm = |s: &str| s.replace('\\', "/");
         assert!(norm(&path).starts_with(&norm(&dir.to_string_lossy())), "{path}");
     }
+
+    /// DuckDB nests block comments, as `SqlSyntax::nested_block_comments`
+    /// says (the splitter, the parameter finder and the sandbox's checks
+    /// read DuckDB's text so): an upgrade that changes it fails here.
+    #[test]
+    fn block_comments_nest() {
+        engine().unwrap();
+        let c = duckdb::Connection::open_in_memory().unwrap();
+        let v: i64 = c.query_row("/* a /* b */ select 1 */ select 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 2);
+        assert!(databrain_connector_core::ConnectorKind::Duckdb.traits().syntax.nested_block_comments);
+        // What the sandbox reads as code is what DuckDB runs.
+        let code =
+            databrain_connector_core::sql::code_text("/* a /* b */ create view v as select 1 */ select 2", databrain_connector_core::ConnectorKind::Duckdb);
+        assert!(!code.to_ascii_lowercase().contains("create"), "{code}");
+    }
 }

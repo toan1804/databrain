@@ -42,7 +42,7 @@ pub use params::ParamSet;
 pub use paths::{path_parts, quote_name, split_reference, table_path};
 pub use session_role::{AiPart, SessionRole};
 
-pub use connection_lookup::find_connection;
+pub use connection_lookup::{find_connection, part_kind};
 pub use connections::{AiPolicy, ConnectionProfile, EnvTag, RunQueryPolicy};
 pub use history::{
     AI_HISTORY_RETENTION_SETTING, HISTORY_LIMIT, HISTORY_RETENTION_DEFAULT_DAYS, HISTORY_RETENTION_SETTING, HistoryClear, HistoryEntry, HistoryQuery,
