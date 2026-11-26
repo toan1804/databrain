@@ -327,22 +327,13 @@ impl OracleSession {
                 let table = self.dict_opt(ddl::TABLE_SQL, None, owner, name).await;
                 let constraints = self.dict_opt(ddl::CONSTRAINTS_SQL, Some(ddl::CONSTRAINTS_SQL_12_1), owner, name).await;
                 // What most tables don't have isn't asked for: a foreign
-                // key's referenced columns, index expressions, partitions.
+                // key's referenced columns, index expressions.
                 let has_fk = constraints.iter().any(|r| r.get(1).cloned().flatten().as_deref() == Some("R"));
                 let ref_keys = if has_fk { self.dict_opt(ddl::REF_KEYS_SQL, None, owner, name).await } else { vec![] };
                 let indexes = self.dict_opt(ddl::INDEXES_SQL, None, owner, name).await;
                 let index_expressions = self.index_expressions(&indexes, owner, name).await;
                 let comments = self.dict_opt(ddl::COMMENTS_SQL, None, owner, name).await;
-                // ALL_TABLES says whether it is partitioned; without its row
-                // (not readable) the partitioning view is asked.
-                let partitioned = table.first().is_none_or(|r| r.get(3).cloned().flatten().as_deref() != Some("NO"));
-                let part = if partitioned { self.dict_opt(ddl::PART_SQL, Some(ddl::PART_SQL_10G), owner, name).await } else { vec![] };
-                let (part_keys, first_partition) = if part.is_empty() {
-                    (vec![], vec![])
-                } else {
-                    (self.dict_opt(ddl::PART_KEYS_SQL, None, owner, name).await, self.dict_opt(ddl::FIRST_PARTITION_SQL, None, owner, name).await)
-                };
-                let parts = ddl::TableParts { columns, table, constraints, ref_keys, indexes, index_expressions, comments, part, part_keys, first_partition };
+                let parts = ddl::TableParts { columns, table, constraints, ref_keys, indexes, index_expressions, comments };
                 ddl::table_ddl(owner, name, &parts)
             }
         })

@@ -33,8 +33,10 @@ pub const COLUMNS_SQL: &str = "select c.column_name, c.data_type, to_char(c.data
 pub const COLUMNS_SQL_11G: &str = "select c.column_name, c.data_type, to_char(c.data_length), to_char(c.data_precision), to_char(c.data_scale), \
        to_char(c.char_length), c.char_used, c.nullable, c.data_default, c.virtual_column, 'NO', null \
      from all_tab_cols c where c.owner = :o and c.table_name = :n and c.hidden_column = 'NO' order by c.column_id";
-/// Table properties (its comment comes with [`COMMENTS_SQL`]).
-pub const TABLE_SQL: &str = "select t.temporary, t.duration, t.iot_type, t.partitioned from all_tables t where t.owner = :o and t.table_name = :n";
+/// Table properties (its comment comes with [`COMMENTS_SQL`]). Partitioning
+/// isn't part of the DDL: the table's Partitions part shows it, and reading
+/// it took up to three more statements.
+pub const TABLE_SQL: &str = "select t.temporary, t.duration, t.iot_type from all_tables t where t.owner = :o and t.table_name = :n";
 /// Constraints with their columns. A foreign key's referenced columns are
 /// [`REF_KEYS_SQL`], a query of its own: joining ALL_CONS_COLUMNS a second
 /// time here (paired by position) takes Oracle about ten times longer to
@@ -76,19 +78,6 @@ pub const INDEX_EXPRESSIONS_SQL: &str = "select index_owner, index_name, to_char
 pub const COMMENTS_SQL: &str = "select column_name, comments from all_col_comments \
      where owner = :o and table_name = :n and comments is not null \
      union all select null, comments from all_tab_comments where owner = :o and table_name = :n and comments is not null";
-/// Partitioning: type, subpartitioning type, interval.
-pub const PART_SQL: &str = "select partitioning_type, subpartitioning_type, interval, to_char(partition_count) from all_part_tables \
-     where owner = :o and table_name = :n";
-/// The first partition: a RANGE or LIST table needs one in its DDL (the
-/// rest aren't listed: each bound is a LONG, read a row at a time).
-pub const FIRST_PARTITION_SQL: &str = "select partition_name, high_value from all_tab_partitions \
-     where table_owner = :o and table_name = :n and partition_position = 1";
-pub const PART_SQL_10G: &str = "select partitioning_type, subpartitioning_type, null, to_char(partition_count) from all_part_tables \
-     where owner = :o and table_name = :n";
-/// Partition and subpartition key columns (object_type TABLE).
-pub const PART_KEYS_SQL: &str = "select 'P', column_name, column_position from all_part_key_columns where owner = :o and name = :n and object_type = 'TABLE' \
-     union all select 'S', column_name, column_position from all_subpart_key_columns where owner = :o and name = :n and object_type = 'TABLE' \
-     order by 1, 3";
 pub const VIEW_SQL: &str = "select v.text, (select c.comments from all_tab_comments c where c.owner = v.owner and c.table_name = v.view_name) \
      from all_views v where v.owner = :o and v.view_name = :n";
 pub const VIEW_COLUMNS_SQL: &str = "select column_name from all_tab_columns where owner = :o and table_name = :n order by column_id";
@@ -153,10 +142,6 @@ pub struct TableParts {
     pub index_expressions: Rows,
     /// Column comments and the table's (see [`COMMENTS_SQL`]).
     pub comments: Rows,
-    pub part: Rows,
-    pub part_keys: Rows,
-    /// The first partition (see [`FIRST_PARTITION_SQL`]).
-    pub first_partition: Rows,
 }
 
 struct Constraint<'a> {
@@ -256,55 +241,7 @@ fn constraint_line(owner: &str, c: &Constraint) -> Option<String> {
     Some(s)
 }
 
-/// Oracle's partition count of an INTERVAL table: the most it may have.
-const INTERVAL_COUNT: &str = "1048575";
-
-fn partition_clause(p: &TableParts) -> Option<String> {
-    let r = p.part.first()?;
-    let kind = get(r, 0)?;
-    let keys = |k: &str| {
-        let l: Vec<&str> = p.part_keys.iter().filter(|r| get(r, 0) == Some(k)).filter_map(|r| get(r, 1)).collect();
-        if l.is_empty() { String::new() } else { format!(" {}", col_list(l.into_iter())) }
-    };
-    let interval = get(r, 2).map(str::trim).filter(|i| !i.is_empty());
-    let count = get(r, 3).filter(|n| *n != "0" && *n != INTERVAL_COUNT).and_then(|n| n.parse::<u64>().ok());
-    let mut s = format!("PARTITION BY {kind}{}", keys("P"));
-    if let Some(i) = interval {
-        s.push_str(&format!(" INTERVAL ({i})"));
-    }
-    if let Some(sub) = get(r, 1).filter(|s| *s != "NONE") {
-        s.push_str(&format!("\nSUBPARTITION BY {sub}{}", keys("S")));
-    }
-    match kind {
-        "HASH" | "SYSTEM" => {
-            if let Some(n) = count {
-                s.push_str(&format!("\nPARTITIONS {n}"));
-            }
-        }
-        // The partitions aren't all listed (DBeaver lists them apart too):
-        // the first one, which the statement needs, and how many more.
-        _ => {
-            if let Some(f) = p.first_partition.first() {
-                let name = qi(get(f, 0)?);
-                let hv = get(f, 1).map(str::trim).unwrap_or("");
-                let first = match kind {
-                    "RANGE" => format!("    PARTITION {name} VALUES LESS THAN ({hv})"),
-                    "LIST" => format!("    PARTITION {name} VALUES ({hv})"),
-                    _ => format!("    PARTITION {name}"),
-                };
-                let more = match count {
-                    Some(n) if n > 1 => format!("\n    -- and {} more: the table's Partitions part lists them", n - 1),
-                    Some(_) => String::new(),
-                    None => "\n    -- the table's Partitions part lists them all".into(),
-                };
-                s.push_str(&format!("\n(\n{first}{more}\n)"));
-            }
-        }
-    }
-    Some(s)
-}
-
-/// CREATE TABLE with constraints, partitioning, indexes and comments.
+/// CREATE TABLE with constraints, indexes and comments (no partitioning).
 /// `None` when the table isn't visible (no columns).
 pub fn table_ddl(owner: &str, name: &str, p: &TableParts) -> Option<String> {
     if p.columns.is_empty() {
@@ -347,10 +284,6 @@ pub fn table_ddl(owner: &str, name: &str, p: &TableParts) -> Option<String> {
     }
     if iot {
         ddl.push_str("\nORGANIZATION INDEX");
-    }
-    if let Some(pc) = partition_clause(p) {
-        ddl.push('\n');
-        ddl.push_str(&pc);
     }
     ddl.push(';');
 
@@ -518,7 +451,7 @@ mod tests {
                 row(&[Some("AMOUNT"), Some("NUMBER"), Some("22"), Some("12"), Some("2"), Some("0"), n, Some("N"), n, Some("NO"), Some("NO"), n]),
                 row(&[Some("CUST_ID"), Some("NUMBER"), Some("22"), n, n, Some("0"), n, Some("Y"), n, Some("NO"), Some("NO"), n]),
             ],
-            table: vec![row(&[Some("N"), n, n, Some("YES")])],
+            table: vec![row(&[Some("N"), n, n])],
             constraints: vec![
                 row(&[Some("PK_O"), Some("P"), n, n, Some("ENABLED"), Some("USER NAME"), Some("PK_O"), Some("ID"), Some("NOT DEFERRABLE"), Some("IMMEDIATE")]),
                 row(&[Some("FK_C"), Some("R"), n, Some("CASCADE"), Some("ENABLED"), Some("USER NAME"), n, Some("CUST_ID"), n, n]),
@@ -558,9 +491,6 @@ mod tests {
                 row(&[Some("APP"), Some("IX_NAME"), Some("1"), Some("UPPER(\"NAME\")")]),
             ],
             comments: vec![row(&[Some("NAME"), Some("it's the name")]), row(&[n, Some("Orders")])],
-            part: vec![row(&[Some("RANGE"), Some("NONE"), n, Some("2")])],
-            part_keys: vec![row(&[Some("P"), Some("ID"), Some("1")])],
-            first_partition: vec![row(&[Some("P1"), Some("100")])],
         };
         let d = table_ddl("APP", "ORDERS", &p).unwrap();
         let want = r#"CREATE TABLE "APP"."ORDERS" (
@@ -572,11 +502,6 @@ mod tests {
     CONSTRAINT "FK_C" FOREIGN KEY ("CUST_ID") REFERENCES "CUSTOMERS" ("ID") ON DELETE CASCADE,
     CONSTRAINT "FK_P" FOREIGN KEY ("ID", "CUST_ID") REFERENCES "OTHER"."PAIRS" ("A", "B") DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT "CK_AMT" CHECK (amount >= 0)
-)
-PARTITION BY RANGE ("ID")
-(
-    PARTITION "P1" VALUES LESS THAN (100)
-    -- and 1 more: the table's Partitions part lists them
 );
 
 CREATE INDEX "APP"."IX_NAME" ON "APP"."ORDERS" (UPPER("NAME"), "AMOUNT");
@@ -611,52 +536,9 @@ COMMENT ON COLUMN "APP"."ORDERS"."NAME" IS 'it''s the name';"#;
                     indexes: vec![],
                     index_expressions: vec![],
                     comments: vec![],
-                    part: vec![],
-                    part_keys: vec![],
-                    first_partition: vec![]
                 }
             )
             .is_none()
-        );
-    }
-
-    #[test]
-    fn partitioning_without_listing_every_partition() {
-        let n = None;
-        let parts = |part: &[Option<&str>], keys: Rows, first: Rows| TableParts {
-            columns: vec![],
-            table: vec![],
-            constraints: vec![],
-            ref_keys: vec![],
-            indexes: vec![],
-            index_expressions: vec![],
-            comments: vec![],
-            part: vec![row(part)],
-            part_keys: keys,
-            first_partition: first,
-        };
-        let k = || vec![row(&[Some("P"), Some("ID"), Some("1")])];
-        // HASH and SYSTEM: the count is the statement.
-        assert_eq!(partition_clause(&parts(&[Some("HASH"), Some("NONE"), n, Some("8")], k(), vec![])).unwrap(), "PARTITION BY HASH (\"ID\")\nPARTITIONS 8");
-        assert_eq!(partition_clause(&parts(&[Some("SYSTEM"), Some("NONE"), n, Some("4")], vec![], vec![])).unwrap(), "PARTITION BY SYSTEM\nPARTITIONS 4");
-        // INTERVAL: Oracle's count is the most it may have, not said.
-        let i = partition_clause(&parts(
-            &[Some("RANGE"), Some("NONE"), Some("NUMTOYMINTERVAL(1,'MONTH')"), Some("1048575")],
-            k(),
-            vec![row(&[Some("P0"), Some("DATE '2020-01-01'")])],
-        ))
-        .unwrap();
-        assert!(
-            i.contains("INTERVAL (NUMTOYMINTERVAL(1,'MONTH'))")
-                && i.contains("VALUES LESS THAN (DATE '2020-01-01')")
-                && i.contains("lists them all")
-                && !i.contains("1048575"),
-            "{i}"
-        );
-        // LIST with one partition: nothing more to say.
-        assert_eq!(
-            partition_clause(&parts(&[Some("LIST"), Some("NONE"), n, Some("1")], k(), vec![row(&[Some("P_EU"), Some("'EU'")])])).unwrap(),
-            "PARTITION BY LIST (\"ID\")\n(\n    PARTITION \"P_EU\" VALUES ('EU')\n)"
         );
     }
 

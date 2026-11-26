@@ -1199,9 +1199,9 @@ mod tests {
         assert_eq!(all_fks, fks, "{driver}");
         run("drop table kb_fk_child purge").await.unwrap();
         run("drop table kb_fk_parent purge").await.unwrap();
-        // A partitioned table's DDL: its first partition and how many more,
-        // and it runs (an INTERVAL table needs a partition in it). Checks
-        // come without a LONG on 12.2+.
+        // A partitioned table's DDL has no partitioning (the table's
+        // Partitions part shows it) and runs as a plain table. Checks come
+        // without a LONG on 12.2+.
         let _ = run("drop table kb_part purge").await;
         run("create table kb_part (id number, d date not null, constraint kb_part_ck check (id > 0)) \
              partition by range (d) interval (numtoyminterval(1, 'MONTH')) (partition p0 values less than (date '2020-01-01'))")
@@ -1210,11 +1210,7 @@ mod tests {
         run("insert into kb_part values (1, date '2024-05-01')").await.unwrap();
         run("insert into kb_part values (2, date '2024-07-01')").await.unwrap();
         let p = s.object_ddl(&me, "KB_PART", ObjectKind::Table).await.unwrap().unwrap();
-        assert!(
-            p.contains("PARTITION BY RANGE (\"D\") INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))") && p.contains("PARTITION \"P0\" VALUES LESS THAN (TO_DATE"),
-            "{driver}: {p}"
-        );
-        assert!(p.contains("lists them all") && !p.contains("1048575") && p.contains("CHECK (id > 0)"), "{driver}: {p}");
+        assert!(!p.to_uppercase().contains("PARTITION") && p.contains("CHECK (id > 0)") && p.contains("\"D\" DATE NOT NULL"), "{driver}: {p}");
         run("drop table kb_part purge").await.unwrap();
         let create = p.split(";\n").next().unwrap().to_string();
         s.execute(databrain_connector_core::Statement::internal(&create), ExecOptions::default())

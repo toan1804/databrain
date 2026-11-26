@@ -6,7 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
-- Oracle: a table's DDL, description and structure open faster. A foreign key's referenced columns are read in a statement of their own (Oracle took about ten times longer to plan the one that read them together with the constraints, and could plan it badly), index expressions and partitions are read only for tables that have them, and the structure's index statement is planned once instead of once per table.
+- Oracle: a table's DDL, description and structure open faster. A foreign key's referenced columns are read in a statement of their own (Oracle took about ten times longer to plan the one that read them together with the constraints, and could plan it badly), index expressions are read only for tables that have them, and the structure's index statement is planned once instead of once per table. A partitioned table's DDL no longer has its `PARTITION BY` clause (the table's Partitions part shows the partitioning), which saved up to three more statements.
 - Oracle: `&` inside quoted text (`'&a'`, `'b&a'`, `'Tom & Jerry'`) is no longer taken for a substitution variable, so the editor doesn't ask for a value; `&name` in code still is.
 
 ### Added
