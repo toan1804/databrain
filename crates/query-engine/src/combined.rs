@@ -47,9 +47,12 @@ pub(crate) struct PartPlan {
     pub pushed: Vec<String>,
     /// The part's SQL in the statement (byte range): error positions.
     pub span: Range<usize>,
-    /// `sent` is the text as written (no parameter changed it): a
-    /// server's position in it is one in the statement.
-    pub as_written: bool,
+    /// The part with its parameters bound, before pushdown: where a
+    /// server's position maps back to the part as written.
+    pub bound: Checked,
+    /// Pushdown wrapped it: where `bound`'s text starts in `sent` (bytes).
+    /// `None` when it runs as bound (`sent` is `bound`), or wasn't found.
+    pub wrapped_at: Option<Option<usize>>,
 }
 
 /// A combined statement, checked: its parts and how the outer query reads them.
@@ -169,8 +172,11 @@ impl QueryEngine {
                 ));
             }
             let one = [PlannedStatement { index: 0, start: 0, end: 0, checked: sent.clone(), combined: false }];
-            Self::check_intent(profile, &Intent::Run { plan: &one, confirmed: true })
-                .map_err(|e| EngineError { message: format!("{on}: {}", e.message), ..e })?;
+            Self::check_intent(profile, &Intent::Run { plan: &one, confirmed: true }).map_err(|e| EngineError {
+                message: format!("{on}: {}", e.message),
+                position: Some(position_at(text, at)),
+                ..e
+            })?;
             if profile.id == tab_connection && self.in_transaction(tab_connection, session_key) {
                 return Err(refused(
                     text,
@@ -178,16 +184,16 @@ impl QueryEngine {
                     format!("{on} runs on a session of its own, which wouldn't see this tab's open transaction: commit or roll it back first"),
                 ));
             }
-            let as_written = sent.sql() == p.sql;
             parts.push(PartPlan {
                 name: p.name.clone(),
                 connection_id: profile.id.clone(),
                 connection_name: profile.name.clone(),
                 kind: p.kind,
+                bound: sent.clone(),
                 sent,
                 pushed: Vec::new(),
                 span: p.sql_span.clone(),
-                as_written,
+                wrapped_at: None,
             });
         }
         let plan = CombinedPlan { parts, parsed, text: text.to_string() };
@@ -263,10 +269,10 @@ impl QueryEngine {
                 .get_connection(&p.connection_id)
                 .is_ok_and(|prof| Self::check_intent(&prof, &Intent::Run { plan: &one, confirmed: true }).is_ok());
             if sent.kind() == StatementKind::Read && allowed {
+                // Positions now count in the wrapper, around the part's text.
+                p.wrapped_at = Some(sent.sql().find(p.bound.sql()));
                 p.sent = sent;
                 p.pushed = x.what;
-                // Positions now count in the wrapper: the part's start is shown.
-                p.as_written = false;
             }
         }
     }
@@ -513,9 +519,29 @@ fn part_error(text: &str, p: &PartPlan, e: EngineError) -> EngineError {
     let before = text.get(..p.span.start).map_or(0, |t| t.chars().count()) as u32;
     EngineError {
         message: format!("Part `{}` (on \"{}\"): {}", p.name, p.connection_name, e.message),
-        position: Some(e.position.filter(|_| p.as_written).map_or(before + 1, |pos| before + pos)),
+        position: Some(e.position.and_then(|pos| written_in_part(p, pos)).map_or(before + 1, |pos| before + pos)),
         ..e
     }
+}
+
+/// A server's 1-based character position in what a part sent, as one in
+/// the part as written: out of pushdown's wrapper, then through its
+/// parameters. `None` when it is in the wrapper (the part's start is shown).
+fn written_in_part(p: &PartPlan, pos: u32) -> Option<u32> {
+    let in_bound = match p.wrapped_at {
+        None => pos,
+        Some(at) => {
+            let at = at?;
+            let sent = p.sent.sql();
+            let byte = sent.char_indices().nth(pos.saturating_sub(1) as usize).map_or(sent.len(), |(b, _)| b);
+            let len = p.bound.sql().len();
+            if byte < at || byte >= at + len {
+                return None;
+            }
+            p.bound.sql()[..byte - at].chars().count() as u32 + 1
+        }
+    };
+    Some(p.bound.written_position(in_bound))
 }
 
 fn kind_words(k: StatementKind) -> &'static str {
@@ -546,6 +572,40 @@ fn group_digits(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server's position in what a part sent maps to the part as
+    /// written: through pushdown's wrapper and the part's parameters; in
+    /// the wrapper itself there is none (the part's start is shown).
+    #[test]
+    fn part_positions_through_the_wrapper_and_parameters() {
+        let params = HashMap::from([("v".to_string(), databrain_connector_core::sql::ParamValue { value: "a long value".into(), raw: false })]);
+        let written = "select :v, nope from t";
+        let bound = Checked::new(written, ConnectorKind::Postgres).bind(ConnectorKind::Postgres, &params).unwrap();
+        let wrapper = format!("SELECT \"x\" FROM (\n{}\n) databrain_part WHERE \"x\" > 1", bound.sql());
+        let mut p = PartPlan {
+            name: "a".into(),
+            connection_id: "c".into(),
+            connection_name: "c".into(),
+            kind: ConnectorKind::Postgres,
+            sent: bound.clone(),
+            bound: bound.clone(),
+            pushed: vec![],
+            span: 0..written.len(),
+            wrapped_at: None,
+        };
+        let chars = |s: &str, w: &str| s[..s.find(w).unwrap()].chars().count() as u32 + 1;
+        // As bound.
+        assert_eq!(written_in_part(&p, chars(bound.sql(), "nope")), Some(chars(written, "nope")));
+        // Wrapped.
+        p.wrapped_at = Some(wrapper.find(bound.sql()));
+        p.sent = Checked::new(wrapper.clone(), ConnectorKind::Postgres);
+        assert_eq!(written_in_part(&p, chars(&wrapper, "nope")), Some(chars(written, "nope")));
+        assert_eq!(written_in_part(&p, chars(&wrapper, "databrain_part")), None, "in the wrapper");
+        assert_eq!(written_in_part(&p, chars(&wrapper, "long value")), Some(chars(written, ":v")), "in a value");
+        // Wrapped, but the part's text wasn't found in it.
+        p.wrapped_at = Some(None);
+        assert_eq!(written_in_part(&p, 3), None);
+    }
 
     #[test]
     fn digits_are_grouped() {

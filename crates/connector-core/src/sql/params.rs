@@ -203,16 +203,53 @@ pub fn quote_string(t: &str, kind: ConnectorKind) -> String {
 
 /// Replace every parameter of `sql`. Errors with the names that have no value.
 pub fn substitute_parameters(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>) -> Result<String, Vec<String>> {
-    substitute(sql, kind, values, false)
+    substitute(sql, kind, values, false, None)
+}
+
+/// Where values replaced parameters: each `(written, bound)` byte range,
+/// in the text as written and in the bound text, in order.
+pub type ParamMap = Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>;
+
+/// [`substitute_parameters`], and where each value went ([`ParamMap`]):
+/// a server's error position in the bound text maps back to the written one
+/// ([`written_position`]).
+pub fn substitute_with_map(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>) -> Result<(String, ParamMap), Vec<String>> {
+    let mut map = ParamMap::new();
+    substitute(sql, kind, values, false, Some(&mut map)).map(|s| (s, map))
+}
+
+/// A 1-based character position in `bound` (a server's error position) as
+/// one in `written`, through `map`; inside a value, the parameter's start.
+pub fn written_position(written: &str, bound: &str, map: &ParamMap, pos: u32) -> u32 {
+    let byte = bound.char_indices().nth(pos.saturating_sub(1) as usize).map_or(bound.len(), |(b, _)| b);
+    let mut delta: isize = 0;
+    for (w, b) in map {
+        if byte < b.start {
+            break;
+        }
+        if byte < b.end {
+            return written.get(..w.start).map_or(1, |t| t.chars().count() as u32 + 1);
+        }
+        delta += w.len() as isize - b.len() as isize;
+    }
+    let at = (byte as isize + delta).clamp(0, written.len() as isize) as usize;
+    let at = (0..=at).rev().find(|&k| written.is_char_boundary(k)).unwrap_or(0);
+    written[..at].chars().count() as u32 + 1
 }
 
 /// Replace the parameters of `sql` that `values` has; the others stay as
 /// written (`:name`), for a preview of some of them.
 pub fn substitute_known_parameters(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>) -> String {
-    substitute(sql, kind, values, true).unwrap_or_else(|_| sql.to_string())
+    substitute(sql, kind, values, true, None).unwrap_or_else(|_| sql.to_string())
 }
 
-fn substitute(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>, keep_missing: bool) -> Result<String, Vec<String>> {
+fn substitute(
+    sql: &str,
+    kind: ConnectorKind,
+    values: &std::collections::HashMap<String, ParamValue>,
+    keep_missing: bool,
+    mut map: Option<&mut ParamMap>,
+) -> Result<String, Vec<String>> {
     let spans = find_parameters(sql, kind);
     if spans.is_empty() {
         return Ok(sql.to_string());
@@ -229,6 +266,7 @@ fn substitute(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap
         match lit {
             Some(lit) => {
                 out.push_str(&sql[at..s.start]);
+                let from = out.len();
                 // A value must not join the text around it into a comment
                 // marker: `1-:p` with `-1` is `1- -1`, not `1--1` (the rest
                 // of the line a comment, a WHERE losing its conditions).
@@ -239,6 +277,9 @@ fn substitute(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap
                 out.push_str(&lit);
                 if joins(lit.chars().last(), sql[s.end..].chars().next()) {
                     out.push(' ');
+                }
+                if let Some(m) = map.as_deref_mut() {
+                    m.push((s.start..s.end, from..out.len()));
                 }
                 at = s.end;
             }
@@ -260,6 +301,30 @@ mod param_tests {
     use super::*;
     use ConnectorKind as K;
     use std::collections::HashMap;
+
+    /// A server's position in the bound text maps back to the written one:
+    /// before, between and after values of other lengths, and inside one
+    /// (its parameter's start); characters, not bytes.
+    #[test]
+    fn positions_map_back_through_values() {
+        let written = "select :long, 'é', :x from t where oops";
+        let mut v = HashMap::new();
+        v.insert("long".to_string(), ParamValue { value: "1".into(), raw: false });
+        v.insert("x".to_string(), ParamValue { value: "a much longer value".into(), raw: false });
+        let (bound, map) = substitute_with_map(written, K::Postgres, &v).unwrap();
+        assert_eq!(bound, "select 1, 'é', 'a much longer value' from t where oops");
+        let pos_of = |s: &str, w: &str| s[..s.find(w).unwrap()].chars().count() as u32 + 1;
+        // `oops` after both values, `'é'` between them, `select` before.
+        for w in ["oops", "'é'", "select", "from"] {
+            assert_eq!(written_position(written, &bound, &map, pos_of(&bound, w)), pos_of(written, w), "{w}");
+        }
+        // Inside a value: its parameter's start.
+        assert_eq!(written_position(written, &bound, &map, pos_of(&bound, "much")), pos_of(written, ":x"));
+        // Unchanged text: the same position.
+        assert_eq!(written_position("select 1", "select 1", &ParamMap::new(), 3), 3);
+        // Past the end: clamped to the end.
+        assert!(written_position(written, &bound, &map, 999) <= written.chars().count() as u32 + 1);
+    }
 
     /// A value next to a `-` or `/` doesn't make a comment marker.
     #[test]

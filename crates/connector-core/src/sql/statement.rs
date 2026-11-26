@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use super::{Classification, ParamValue, StatementKind, classify, substitute_parameters};
+use super::{Classification, ParamValue, StatementKind, classify};
 use crate::types::ConnectorKind;
 
 /// SQL handed to a session: made only by [`Checked::statement`] or
@@ -40,6 +40,11 @@ impl<'a> Statement<'a> {
 pub struct Checked {
     sql: String,
     classification: Classification,
+    /// Bound from other text: it and where its values went, so a server's
+    /// error position maps back to what was written.
+    #[serde(skip)]
+    #[ts(skip)]
+    written: Option<(String, super::params::ParamMap)>,
 }
 
 impl Checked {
@@ -47,14 +52,23 @@ impl Checked {
     pub fn new(sql: impl Into<String>, kind: ConnectorKind) -> Self {
         let sql = sql.into();
         let classification = classify(&sql, kind);
-        Self { sql, classification }
+        Self { sql, classification, written: None }
     }
 
     /// With the values of its `:name` parameters put in, classified again;
     /// the names without a value when some are missing.
     pub fn bind(self, kind: ConnectorKind, params: &HashMap<String, ParamValue>) -> Result<Self, Vec<String>> {
-        let sql = substitute_parameters(&self.sql, kind, params)?;
-        Ok(if sql == self.sql { self } else { Self::new(sql, kind) })
+        let (sql, map) = super::params::substitute_with_map(&self.sql, kind, params)?;
+        Ok(if sql == self.sql { self } else { Self { written: Some((self.sql, map)), ..Self::new(sql, kind) } })
+    }
+
+    /// A server's 1-based character position in this text as one in the
+    /// text as written (before its parameters were bound).
+    pub fn written_position(&self, pos: u32) -> u32 {
+        match &self.written {
+            Some((w, map)) => super::params::written_position(w, &self.sql, map, pos),
+            None => pos,
+        }
     }
 
     pub fn sql(&self) -> &str {
@@ -87,7 +101,11 @@ impl Checked {
             }
             any = true;
         }
-        any.then(|| Self { sql: sql.into(), classification: Classification { kind: StatementKind::Read, missing_where: false, keyword: "WITH".into() } })
+        any.then(|| Self {
+            sql: sql.into(),
+            classification: Classification { kind: StatementKind::Read, missing_where: false, keyword: "WITH".into() },
+            written: None,
+        })
     }
 
     /// As the table explorer runs it: Databricks' `DESCRIBE HISTORY` and

@@ -24,14 +24,22 @@ let loadFails = false;
 
 vi.mock("./lib/api", () => ({
   isTauri: () => false,
-  toError: (e: unknown) => ({ kind: "internal", message: String(e) }),
+  announceSshHostKey: () => {},
+  toError: (e: unknown) => (e && typeof e === "object" && "message" in e ? { kind: "internal", ...e } : { kind: "internal", message: String(e) }),
   onJobEvent: async () => () => {},
   onAuthEvent: async () => () => {},
   api: {
     runQuery: async (req: RunRequest) => {
       if (gate) await gate;
+      // A refusal before the run, of the script's second statement (after "select 1;\n").
+      if (req.sql.includes("delete")) {
+        const start = req.base_offset + 10;
+        throw { kind: "invalid", message: "Part `a` must only read", position: 16, statement: { index: 1, start, end: req.base_offset + req.sql.length } };
+      }
       const job_id = `job-${++jobSeq}`;
-      const plan = { index: 0, sql: req.sql, start: 0, end: req.sql.length, classification: { kind: "read", missing_where: false, keyword: "SELECT" } };
+      // What ran: `:v` bound to a longer value.
+      const sql = req.sql.replace(":v", "'a long value'");
+      const plan = { index: 0, sql, start: req.base_offset, end: req.base_offset + req.sql.length, classification: { kind: "read", missing_where: false, keyword: "SELECT" } };
       if (emitBeforeResolve) {
         const t = req.tab_id;
         handler?.({ type: "statement_started", job_id, tab_id: t, index: 0, sql: req.sql });
@@ -121,6 +129,35 @@ describe("job event ordering", () => {
     cancelResult.value = true;
     await useStore.getState().cancelTab(key);
     expect(useStore.getState().runs[key].running).toBe(true);
+  });
+});
+
+describe("errors where they are written", () => {
+  it("marks a refusal before the run in its statement, over the last run's mark", async () => {
+    emitBeforeResolve = false;
+    const key = "tab-refused";
+    const sql = "select 1;\nwith a as (@pg delete from t returning id) select * from a";
+    expect(await useStore.getState().runSql(key, "conn", sql, 5)).toBe(false);
+    // Position 16 of the second statement (`delete`), in the editor (the run started at offset 5).
+    const from = 5 + 10 + 15;
+    expect(useStore.getState().preRunErrors[key]).toEqual({ from, to: from + "delete".length });
+    // The next run clears it.
+    await useStore.getState().runSql(key, "conn", "select 2");
+    expect(useStore.getState().preRunErrors[key]).toBeUndefined();
+  });
+
+  it("counts a server's position in the text as written, not as bound", async () => {
+    emitBeforeResolve = false;
+    const key = "tab-bound";
+    const sql = "select :v, nope from t";
+    await useStore.getState().runSql(key, "conn", sql, 100);
+    const run = useStore.getState().runs[key];
+    expect(run.statements[0].written).toBe(sql);
+    expect(run.statements[0].plan.sql).toContain("'a long value'");
+    // The engine maps the server's position back to the written text.
+    const position = sql.indexOf("nope") + 1;
+    handler?.({ type: "statement_failed", job_id: run.jobId!, tab_id: key, index: 0, error: { kind: "query", message: "no such column", position }, duration_ms: 1, statement_start: 100 } as never);
+    expect(useStore.getState().runs[key].errorRange).toEqual({ from: 100 + sql.indexOf("nope"), to: 100 + sql.indexOf("nope") + 4 });
   });
 });
 

@@ -80,10 +80,18 @@ fn run_query_replacing(state: &AppState, mut req: RunRequest, replaces: Option<&
     // The engine works in bytes; the UI's base offset is UTF-16.
     let base_utf16 = req.base_offset;
     req.base_offset = 0;
-    let mut resp = match replaces {
-        Some(h) => state.engine.rerun_output(req, h)?,
-        None => state.engine.run(req)?,
+    let started = match replaces {
+        Some(h) => state.engine.rerun_output(req, h),
+        None => state.engine.run(req),
     };
+    // A refusal before the run names its statement in the UI's offsets too.
+    let mut resp = started.map_err(|mut e| {
+        if let Some(s) = e.statement.as_mut() {
+            s.start = base_utf16 + byte_to_utf16(&text, s.start);
+            s.end = base_utf16 + byte_to_utf16(&text, s.end);
+        }
+        e
+    })?;
     let statements = match &mut resp {
         RunResponse::Started { statements, .. } => statements,
         RunResponse::NeedsConfirmation { statements, .. } => statements,

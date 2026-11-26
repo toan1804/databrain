@@ -95,6 +95,12 @@ export type StatementStatus = "pending" | "running" | "done" | "error" | "cancel
 
 export interface StatementRun {
   plan: PlannedStatement;
+  /**
+   * The statement as written in the editor when it was run (`plan.sql` is
+   * what ran: parameters bound): editor positions count in this. Absent in
+   * a run restored after a restart.
+   */
+  written?: string;
   status: StatementStatus;
   result?: ResultInfo;
   output?: OutputInfo;

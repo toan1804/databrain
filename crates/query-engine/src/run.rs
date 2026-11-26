@@ -60,8 +60,12 @@ impl QueryEngine {
         for p in plan.iter_mut() {
             let text = &req.sql[p.start..p.end];
             let planned = self.plan_combined(text, &req.params, req.origin, &req.connection_id, req.session_key()).map_err(|e| {
-                // Positions are in the statement (as the editor maps them).
-                EngineError { message: if plan_len_hint(req, p) { format!("Statement {}: {}", p.index + 1, e.message) } else { e.message }, ..e }
+                // Positions are in the statement, which the editor marks.
+                EngineError {
+                    message: if plan_len_hint(req, p) { format!("Statement {}: {}", p.index + 1, e.message) } else { e.message },
+                    statement: Some(crate::StatementAt { index: p.index, start: p.start, end: p.end }),
+                    ..e
+                }
             })?;
             if let Some(c) = planned {
                 p.checked = Checked::combined(text, c.parts.iter().map(|x| &x.sent)).ok_or_else(|| EngineError::new("internal", "a part isn't a read"))?;
@@ -410,6 +414,10 @@ impl QueryEngine {
                     if !stmt.combined && (matches!(e.kind.as_str(), "connection") || e.code.as_deref() == Some(databrain_connector_core::SESSION_ENDED)) {
                         self.drop_session(&req.connection_id, req.session_key());
                     }
+                    // The server's position is in the bound text: in the
+                    // statement as written, as the editor shows it (a
+                    // combined statement's parts map their own).
+                    let e = if stmt.combined { e } else { EngineError { position: e.position.map(|p| stmt.checked.written_position(p)), ..e } };
                     emit(JobEvent::StatementFailed {
                         job_id: job_id.clone(),
                         tab_id: req.tab_id.clone(),
