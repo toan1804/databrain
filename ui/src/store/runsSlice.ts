@@ -243,12 +243,16 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     get().forgetRuns(keys);
   },
   forgetRuns: (keys, prefix) => {
-    const gone = Object.keys(get().runs).filter((k) => keys.includes(k) || (prefix !== undefined && k.startsWith(prefix)));
-    if (!gone.length) return;
+    const of = (k: string) => keys.includes(k) || (prefix !== undefined && k.startsWith(prefix));
+    const gone = Object.keys(get().runs).filter(of);
+    const refused = Object.keys(get().preRunErrors).filter(of);
+    if (!gone.length && !refused.length) return;
     set((s) => {
       const runs = { ...s.runs };
       for (const k of gone) delete runs[k];
-      return { runs };
+      const preRunErrors = { ...s.preRunErrors };
+      for (const k of refused) delete preRunErrors[k];
+      return { runs, preRunErrors };
     });
   },
   txOpen: {},
@@ -456,11 +460,19 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           return false;
         }
         // A refusal before the run (a part that writes, an unknown
-        // connection, a read-only connection) is marked where it is.
-        if (err.statement) {
+        // connection, a read-only connection) is marked where it is, and
+        // the last run's mark goes (it would come back once this one is
+        // cleared). Not for a refreshed result: its SQL isn't the editor's.
+        if (err.statement && replaces === undefined) {
           const { start, end } = err.statement;
           const range = errorRange({ start, end, sql: sql.slice(start - base, end - base) }, err.position ?? undefined);
-          set((st) => ({ preRunErrors: { ...st.preRunErrors, [runKey]: range } }));
+          set((st) => {
+            const prev = st.runs[runKey];
+            return {
+              preRunErrors: { ...st.preRunErrors, [runKey]: range },
+              ...(prev?.errorRange ? { runs: { ...st.runs, [runKey]: { ...prev, errorRange: undefined } } } : {}),
+            };
+          });
         }
         get().toast(err.message, "error");
         return false;

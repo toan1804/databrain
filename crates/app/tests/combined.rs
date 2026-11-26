@@ -423,8 +423,15 @@ async fn errors_point_where_they_are_written() {
     assert_eq!((at.index, &script[at.start..at.end]), (1, &script[10..]));
     assert_eq!(e.position, Some(script[10..].find("delete").unwrap() as u32 + 1));
     // A read-only connection's refusal names its statement too.
-    let e = s.run(req(&s.crm, "t9", "select 1;\ndelete from customers")).await.unwrap_err();
+    let ro = "select 1;\ndelete from customers";
+    let e = s.run(req(&s.crm, "t9", ro)).await.unwrap_err();
+    let at = e.statement.expect("its statement");
+    assert_eq!((at.index, &ro[at.start..at.end]), (1, "delete from customers"), "{e:?}");
+    // An unknown connection: the part's statement and where its name is.
+    let unknown = "select 1;\nwith a as (@nope select 1) select * from a";
+    let e = s.run(req(&s.sales, "t9", unknown)).await.unwrap_err();
     assert_eq!(e.statement.map(|a| a.index), Some(1), "{e:?}");
+    assert_eq!(e.position, Some(unknown[10..].find("@nope").unwrap() as u32 + 1));
     // A value longer than its `:name` before the error: the position is the written one.
     let long = HashMap::from([("v".to_string(), ParamValue { value: "a much longer value than the name".into(), raw: false })]);
     let plain = "select :v, nope from orders";

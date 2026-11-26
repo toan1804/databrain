@@ -144,6 +144,13 @@ describe("errors where they are written", () => {
     // The next run clears it.
     await useStore.getState().runSql(key, "conn", "select 2");
     expect(useStore.getState().preRunErrors[key]).toBeUndefined();
+    // A refusal also takes the last run's mark away (it isn't shown again once cleared).
+    useStore.setState((st) => ({ runs: { ...st.runs, [key]: { ...st.runs[key], errorRange: { from: 1, to: 2 } } } }));
+    await useStore.getState().runSql(key, "conn", sql, 5);
+    expect(useStore.getState().runs[key].errorRange).toBeUndefined();
+    // A closed tab's mark goes with its run.
+    useStore.getState().forgetRuns([key]);
+    expect(useStore.getState().preRunErrors[key]).toBeUndefined();
   });
 
   it("counts a server's position in the text as written, not as bound", async () => {

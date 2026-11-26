@@ -274,7 +274,10 @@ impl QueryEngine {
                 .is_ok_and(|prof| Self::check_intent(&prof, &Intent::Run { plan: &one, confirmed: true }).is_ok());
             if sent.kind() == StatementKind::Read && allowed {
                 // Positions now count in the wrapper, around the part's text.
-                p.wrapped_at = Some(sent.sql().find(p.bound.sql()));
+                // `wrap` puts the part in trimmed (and without a last `;`).
+                let inner = p.bound.sql().trim().trim_end_matches(';').trim_end();
+                let lead = p.bound.sql().len() - p.bound.sql().trim_start().len();
+                p.wrapped_at = Some(sent.sql().find(inner).and_then(|at| at.checked_sub(lead)));
                 p.sent = sent;
                 p.pushed = x.what;
             }
