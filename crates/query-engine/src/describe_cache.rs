@@ -18,9 +18,17 @@ type Key = (String, String, String);
 /// while it asks the server.
 type Slot = Arc<tokio::sync::Mutex<Option<(Instant, ObjectDetail)>>>;
 
+/// A combined query's part's column classes, by (connection, the part's SQL
+/// with its parameters bound): pushdown asks for them only once.
+type PartTypes = HashMap<(String, String), Vec<(String, crate::pushdown::TypeClass)>>;
+
+/// Parts' column classes kept at most (an arbitrary one goes past it).
+const PART_TYPES_KEEP: usize = 256;
+
 #[derive(Default)]
 pub(crate) struct DescribeCache {
     slots: Mutex<HashMap<Key, Slot>>,
+    part_types: Mutex<PartTypes>,
     /// Entries past which old ones are dropped (doubles when they are all
     /// young, so the sweep isn't run on every call while indexing).
     prune_at: Mutex<usize>,
@@ -41,6 +49,21 @@ impl DescribeCache {
     /// Forget a connection's descriptions (DDL ran, reconnect, disconnect).
     pub(crate) fn forget(&self, connection_id: &str) {
         self.slots.lock().retain(|(c, _, _), _| c != connection_id);
+        self.part_types.lock().retain(|(c, _), _| c != connection_id);
+    }
+
+    pub(crate) fn part_types(&self, connection_id: &str, sql: &str) -> Option<Vec<(String, crate::pushdown::TypeClass)>> {
+        self.part_types.lock().get(&(connection_id.to_string(), sql.to_string())).cloned()
+    }
+
+    pub(crate) fn keep_part_types(&self, connection_id: &str, sql: &str, types: Vec<(String, crate::pushdown::TypeClass)>) {
+        let mut g = self.part_types.lock();
+        if g.len() >= PART_TYPES_KEEP
+            && let Some(k) = g.keys().next().cloned()
+        {
+            g.remove(&k);
+        }
+        g.insert((connection_id.to_string(), sql.to_string()), types);
     }
 }
 
@@ -90,6 +113,14 @@ impl QueryEngine {
     /// Forget the connection's table descriptions (see [`DescribeCache`]).
     pub fn forget_descriptions(&self, connection_id: &str) {
         self.describes.forget(connection_id);
+    }
+
+    pub(crate) fn kept_part_types(&self, connection_id: &str, sql: &str) -> Option<Vec<(String, crate::pushdown::TypeClass)>> {
+        self.describes.part_types(connection_id, sql)
+    }
+
+    pub(crate) fn keep_part_types(&self, connection_id: &str, sql: &str, types: Vec<(String, crate::pushdown::TypeClass)>) {
+        self.describes.keep_part_types(connection_id, sql, types)
     }
 
     /// Something run on the connection may have changed its tables (DDL,

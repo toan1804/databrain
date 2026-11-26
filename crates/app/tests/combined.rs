@@ -471,3 +471,65 @@ async fn parts_of_one_name_in_two_statements_keep_their_own_rows() {
         assert_eq!(page.rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), [want], "{sql}");
     }
 }
+
+/// A limit pushed with a WHERE, which a server may read more loosely
+/// (here SQLite's `COLLATE NOCASE`): when its rows were all taken by ones the
+/// query then dropped, the part is read again without the limit, and the
+/// answer is the one without pushdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limit_filled_by_rows_the_query_drops_is_read_again() {
+    let s = setup().await;
+    s.ok(&s.sales, "create table people (id integer, name text collate nocase); insert into people values (1, 'Ann'), (2, 'ANN'), (3, 'ann'), (4, 'Bo')").await;
+    let q = "with p as (@\"Sales DB\" select * from people) select id from p where name = 'ann' limit 2";
+    let on = s.run(req(&s.sales, "l1", q)).await.unwrap();
+    let mut off_req = req(&s.sales, "l1", q);
+    off_req.pushdown = Some(false);
+    let off = s.run(off_req).await.unwrap();
+    assert_eq!(s.rows(&on[0]), s.rows(&off[0]));
+    assert_eq!(s.rows(&on[0]), ["3"]);
+    assert!(on[0].notices.iter().any(|n| n.contains("read again without the limit")), "{:?}", on[0].notices);
+    // A filter the server reads as DuckDB does: the limit holds, nothing is read again.
+    let exact = s.run(req(&s.sales, "l1", "with p as (@\"Sales DB\" select * from people) select id from p where id > 1 limit 2")).await.unwrap();
+    assert_eq!(s.rows(&exact[0]).len(), 2);
+    assert!(exact[0].notices.is_empty(), "{:?}", exact[0].notices);
+    let sent: Vec<String> = s
+        .events
+        .0
+        .lock()
+        .iter()
+        .filter_map(|e| match e {
+            JobEvent::PartFinished { output, .. } => Some(output.sql.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(sent.iter().any(|x| x.contains("\"id\" > 1") && x.contains("LIMIT 2")), "{sent:?}");
+}
+
+/// A part's column types are read once and kept: a later run uses them,
+/// and one whose part arrives with other types (the table changed behind
+/// DataBrain's back) is run again with them read anew, to the same rows as
+/// without pushdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_part_types_that_changed_are_read_again() {
+    let s = setup().await;
+    let q = "with o as (@\"Sales DB\" select * from orders) select id from o where customer_id = 10 order by id";
+    let first = s.run(req(&s.sales, "c1", q)).await.unwrap();
+    assert_eq!(s.rows(&first[0]), ["1", "2"]);
+    assert!(first[0].notices.is_empty());
+    // Changed behind the run loop: customer_id is text now.
+    let sess = s.st.engine.session_for_tests(&s.sales).await.unwrap();
+    for stmt in [
+        "drop table orders",
+        "create table orders (id integer, customer_id text, total real)",
+        "insert into orders values (1, '10', 5.5), (2, '10', 4.5), (3, '20', 7)",
+    ] {
+        sess.execute(databrain_connector_core::Statement::internal(stmt), Default::default()).await.unwrap().collect().await.unwrap();
+    }
+    let again = s.run(req(&s.sales, "c1", q)).await.unwrap();
+    assert!(again[0].error.is_none(), "{:?}", again[0].error);
+    let mut off_req = req(&s.sales, "c1", q);
+    off_req.pushdown = Some(false);
+    let off = s.run(off_req).await.unwrap();
+    assert_eq!(s.rows(&again[0]), s.rows(&off[0]), "{:?}", again[0].error);
+    assert!(again[0].notices.iter().any(|n| n.contains("column types had changed")), "{:?}", again[0].notices);
+}

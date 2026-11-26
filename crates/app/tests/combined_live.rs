@@ -150,6 +150,10 @@ async fn pushdown_gives_the_same_rows_on_real_servers() {
             format!("with t as ({part}) select id from t where id <> 2 and amount is not null"),
             format!("with t as ({part}) select id, name from t where id in (1, 3)"),
             format!("with t as ({part}) select count(*) from t where name is null"),
+            // Every operator on timestamps where they hold microseconds (PostgreSQL, MySQL's DATETIME).
+            format!("with t as ({part}) select id from t where ts = '2024-01-01 10:00:00'"),
+            format!("with t as ({part}) select id from t where ts between '2024-01-01 09:00:00' and '2024-01-01 10:00:00'"),
+            format!("with t as ({part}) select id from t where ts in ('2024-01-01 09:00:00', '2024-01-02 08:30:00')"),
         ];
         for q in &queries {
             let on = rows(&st, &run(&st, &p.id, q, Some(true)).await);
@@ -167,6 +171,13 @@ async fn pushdown_gives_the_same_rows_on_real_servers() {
                 _ => None,
             })
             .collect();
+        let ts_eq = if *kind == ConnectorKind::Mssql { None } else { Some(" = TIMESTAMP '2024-01-01 10:00:00'") };
+        if let Some(t) = ts_eq {
+            assert!(
+                sent.iter().any(|s| s.contains("BETWEEN") && s.contains("ts")) || sent.iter().any(|s| s.contains(t)),
+                "{kind:?}: no timestamp `=`/BETWEEN pushed: {sent:?}"
+            );
+        }
         for needle in ["databrain_part", "> 10", "BETWEEN 5 AND 13", "IS NOT NULL"] {
             assert!(sent.iter().any(|s| s.contains(needle)), "{kind:?}: nothing sent holds {needle}: {sent:?}");
         }
