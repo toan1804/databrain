@@ -18,8 +18,22 @@ export function fmtBytes(b: number): string {
 /** Scans this large are worth a second look before running. */
 export const LARGE_SCAN_BYTES = 10 * 1024 ** 3;
 
+/**
+ * Whether `sql` may be a combined query (a `WITH` whose CTE body starts
+ * with `@connection`): the backend decides; this only shows the Cost
+ * button and asks it.
+ */
+export function looksCombined(sql: string): boolean {
+  return /\bwith\b[\s\S]*\(\s*@/i.test(sql);
+}
+
 /** One line: what the statement would scan. */
 export function costSummary(e: CostEstimate): string {
+  if (e.parts?.length) {
+    const asked = e.parts.filter((p) => p.bytes != null).length;
+    if (e.bytes == null) return `no part estimated (${e.parts.length} part${e.parts.length === 1 ? "" : "s"})`;
+    return `reads ${fmtBytes(e.bytes)} across ${asked} of ${e.parts.length} parts, as written`;
+  }
   const parts: string[] = [];
   if (e.cache_hit) parts.push("from cache, 0 B billed");
   else if (e.bytes != null) parts.push(`${e.method === "EXPLAIN COST" ? "reads about" : "scans"} ${fmtBytes(e.bytes)}`);

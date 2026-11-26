@@ -881,6 +881,12 @@ impl ResultStore {
         self.size_of(id).0
     }
 
+    /// Bytes in memory of every result whose id starts with `prefix`.
+    pub fn bytes_with_prefix(&self, prefix: &str) -> usize {
+        let rs: Vec<_> = self.results.lock().iter().filter(|(k, _)| k.starts_with(prefix)).map(|(_, r)| r.clone()).collect();
+        rs.iter().map(|r| r.lock().memory_bytes()).sum()
+    }
+
     /// Bytes `id` keeps in memory, and whether its rows are on disk.
     pub fn size_of(&self, id: &str) -> (usize, bool) {
         let rs = self.results.lock().get(id).cloned();

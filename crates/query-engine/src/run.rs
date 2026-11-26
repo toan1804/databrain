@@ -556,7 +556,11 @@ impl QueryEngine {
         // Half the outputs budget, less what this run's earlier results hold
         // in memory: a script's results are all active (never freed), so
         // together they stay within it too (see `result_memory_cap`).
-        let earlier: usize = (0..stmt.index).map(|i| self.results.bytes_of(&format!("{job_id}:{i}"))).sum();
+        // Earlier combined statements' parts (`{job}/{i}/{k}`) count too; a
+        // part counts from its statement's place in the run.
+        let (run_job, index) = part.map_or((job_id, stmt.index), |p| (p.job_id.as_str(), p.index));
+        let earlier: usize =
+            (0..index).map(|i| self.results.bytes_of(&format!("{run_job}:{i}")) + self.results.bytes_with_prefix(&format!("{run_job}/{i}/"))).sum();
         // A job step's result counts against the job budget, less what the
         // other steps hold or reserved, so a job never takes the memory the
         // tabs' results have; past it the result goes to disk. Where results
@@ -638,7 +642,9 @@ impl QueryEngine {
                         // again for each batch (a job step's cut comes later than
                         // its share: each try would rewrite the rows so far).
                         let refused = low_disk.is_some() || spill_failed.is_some();
-                        let spilled = if !refused && (bytes + size > max_bytes || low.is_some()) {
+                        // A part: its rows and the statement's other parts' together.
+                        let others = part.map_or(0, |p| p.bytes.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(bytes));
+                        let spilled = if !refused && (bytes + others + size > max_bytes || low.is_some()) {
                             self.spill(rs, &result_id, &batch, job_tab)
                         } else {
                             Spilled::NotHere
@@ -653,6 +659,10 @@ impl QueryEngine {
                         }
                         if moved {
                             on_disk = true;
+                            // Its rows left memory: the other parts may keep more.
+                            if let Some(p) = part {
+                                p.bytes.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+                            }
                         } else if let Some(free) = low {
                             // Can't spill: stop before taking more, keeping the rows so far.
                             low_free = Some(free);
@@ -673,7 +683,11 @@ impl QueryEngine {
                     let batch_rows = batch.num_rows();
                     rows += batch_rows;
                     if !on_disk {
-                        bytes += databrain_connector_core::memory_size([&batch]);
+                        let kept = databrain_connector_core::memory_size([&batch]);
+                        bytes += kept;
+                        if let Some(p) = part {
+                            p.bytes.fetch_add(kept, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     // Handed on as read, when the tab is tapped (`dbr --csv`):
                     // the rows kept after the row limit and the cuts above (a

@@ -343,8 +343,8 @@ export const api = {
   explainPlan: (connectionId: string, sessionKey: string, sql: string, analyze: boolean, params?: Record<string, ParamValue>) =>
     call<QueryPlan>("explain_plan", { connectionId, sessionKey, sql, analyze, params: params ?? null }),
   /** What one statement would scan, without running it (BigQuery dry run, Snowflake/Databricks EXPLAIN). */
-  estimateCost: (connectionId: string, sessionKey: string, sql: string, params?: Record<string, ParamValue>) =>
-    call<CostEstimate>("estimate_cost", { connectionId, sessionKey, sql, params: params ?? null }),
+  estimateCost: (connectionId: string, sessionKey: string, sql: string, params?: Record<string, ParamValue>, auto = false) =>
+    call<CostEstimate>("estimate_cost", { connectionId, sessionKey, sql, params: params ?? null, auto }),
   /** The query for the rows a link leads to (one value list per row, in `link.columns` order). */
   relatedRowsSql: (resultId: string, link: ResultLink, rows: (string | null)[][]) => call<string>("related_rows_sql", { resultId, link, rows }),
   /** Copy a result's fetched rows into a table (job load code). */

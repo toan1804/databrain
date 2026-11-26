@@ -93,6 +93,9 @@ pub(crate) struct PartRun {
     pub part: usize,
     /// Rows read so far by all the statement's parts.
     pub rows: Arc<AtomicUsize>,
+    /// Bytes all the statement's parts hold in memory: a part moves to disk
+    /// when its rows and the others' pass the statement's cap.
+    pub bytes: Arc<AtomicUsize>,
 }
 
 /// 1-based character position of byte `at` of `text` (an error's position).
@@ -393,7 +396,7 @@ impl QueryEngine {
         on.connection_id = p.connection_id.clone();
         on.session_key = Some(SessionRole::Part { tab: req.session_key().to_string(), name: p.name.clone() }.key());
         on.output_masks = None;
-        let run = PartRun { job_id: job_id.to_string(), index, part, rows: Arc::new(AtomicUsize::new(0)) };
+        let run = PartRun { job_id: job_id.to_string(), index, part, rows: Arc::new(AtomicUsize::new(0)), bytes: Arc::new(AtomicUsize::new(0)) };
         let stmt = PlannedStatement { index: 0, start: 0, end: 0, checked, combined: false };
         let job = format!("{job_id}/{index}/{part}/types");
         let out = self.run_statement(&job, &on, &stmt, Some(1), cancel.child_token(), None, Some(&run)).await.ok()?;
@@ -557,6 +560,7 @@ impl QueryEngine {
     ) -> (Result<Vec<OutputInfo>>, Vec<JobEvent>) {
         let stop = cancel.child_token();
         let rows = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
         let mut outs: Vec<Option<OutputInfo>> = vec![None; plan.parts.len()];
         let mut held: Vec<JobEvent> = Vec::new();
         let mut failure: Option<EngineError> = None;
@@ -566,7 +570,7 @@ impl QueryEngine {
             while next < plan.parts.len() && tasks.len() < PARALLEL_PARTS && failure.is_none() && !stop.is_cancelled() {
                 let (engine, part, i) = (self.clone(), plan.parts[next].clone(), next);
                 let (req, stop) = (req.clone(), stop.clone());
-                let run = PartRun { job_id: job_id.to_string(), index: stmt.index, part: i, rows: rows.clone() };
+                let run = PartRun { job_id: job_id.to_string(), index: stmt.index, part: i, rows: rows.clone(), bytes: bytes.clone() };
                 tasks.spawn(async move { (i, engine.run_part(&req, &part, run, cap, stop).await) });
                 next += 1;
             }

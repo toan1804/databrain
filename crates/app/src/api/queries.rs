@@ -150,7 +150,12 @@ pub async fn estimate_cost(
     session_key: &str,
     sql: &str,
     params: &std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
+    auto: bool,
 ) -> Result<databrain_connector_core::CostEstimate> {
+    // A combined query: its parts, each bound and estimated on its connection.
+    if databrain_connector_core::sql::looks_combined(sql) {
+        return state.engine.estimate_combined(connection_id, session_key, sql, params, auto).await;
+    }
     let kind = state.workspace.get_connection(connection_id)?.config.kind;
     let sql = databrain_connector_core::sql::substitute_parameters(sql, kind, params)
         .map_err(|names| invalid(format!("Enter a value for {}", names.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "))))?;

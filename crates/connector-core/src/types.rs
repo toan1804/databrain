@@ -649,6 +649,34 @@ pub struct CostEstimate {
     /// What to know about the estimate.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// A combined query's parts, each estimated on its connection (`bytes`
+    /// above is their sum); empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<PartEstimate>>", optional)]
+    pub parts: Vec<PartEstimate>,
+}
+
+/// One part of a combined query's cost preview.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
+pub struct PartEstimate {
+    /// The part's name (its CTE) and connection.
+    pub name: String,
+    pub connection: String,
+    /// What the part as written would read (before pushdown: at most).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
+    pub bytes: Option<u64>,
+    /// Its connection's byte cap, when over it (the run would fail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
+    pub over_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Why it wasn't estimated, or what to know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl TableLayout {

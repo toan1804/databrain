@@ -533,3 +533,34 @@ async fn kept_part_types_that_changed_are_read_again() {
     assert_eq!(s.rows(&again[0]), s.rows(&off[0]), "{:?}", again[0].error);
     assert!(again[0].notices.iter().any(|n| n.contains("column types had changed")), "{:?}", again[0].notices);
 }
+
+/// A combined statement's parts share its memory: two that each fit but
+/// not together are both read whole, one of them on disk, and the join's
+/// rows and types are the ones it has with a large budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn parts_share_the_statements_memory() {
+    let s = setup().await;
+    s.ok(
+        &s.sales,
+        "create table wide (id integer, s text, amount numeric(12,2), at text); \
+         with recursive n(i) as (select 1 union all select i + 1 from n where i < 60000) \
+         insert into wide select i, hex(randomblob(40)), i / 100.0, datetime('2024-01-01', '+' || i || ' seconds') from n",
+    )
+    .await;
+    let q = "with a as (@\"Sales DB\" select id, s, amount from wide), b as (@\"Sales DB\" select id, s, at from wide) \
+             select count(*), round(sum(a.amount), 2), min(b.at) from a join b using (id)";
+    let mut off = req(&s.sales, "m1", q);
+    off.pushdown = Some(false);
+    let large = s.run(off.clone()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    databrain_app::api::set_results_spill(&s.st.engine, dir.path());
+    s.st.engine.outputs().set_budget(0); // the 16 MB floor: 8 MB a statement
+    let small = s.run(off).await.unwrap();
+    assert!(small[0].error.is_none(), "{:?}", small[0].error);
+    assert_eq!(s.rows(&small[0]), s.rows(&large[0]));
+    assert_eq!(small[0].result.as_ref().unwrap().columns, large[0].result.as_ref().unwrap().columns);
+    let parts: Vec<_> = s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "m1" && o.part.is_some() && o.active).collect();
+    assert_eq!(parts.len(), 2);
+    assert!(parts.iter().any(|o| o.spilled), "one part on disk: {:?}", parts.iter().map(|o| (o.bytes, o.spilled)).collect::<Vec<_>>());
+    assert!(parts.iter().all(|o| !o.truncated));
+}

@@ -190,6 +190,76 @@ impl QueryEngine {
     }
 }
 
+impl QueryEngine {
+    /// The cost preview of a combined query: each part whose connection
+    /// estimates is estimated there as written (before pushdown, so an upper
+    /// bound of what it reads), on that connection's metadata session, four
+    /// at once, 60 s each; `bytes` is their sum ("data read across parts";
+    /// the parts' result rows say nothing of the join's, so no `rows`).
+    /// `auto` (asked while typing): only BigQuery parts, whose dry run is
+    /// free (a stopped Snowflake or Databricks warehouse would start).
+    pub async fn estimate_combined(
+        self: &Arc<Self>,
+        tab_connection: &str,
+        session_key: &str,
+        sql: &str,
+        params: &std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
+        auto: bool,
+    ) -> Result<databrain_connector_core::CostEstimate> {
+        use databrain_connector_core::{CostEstimate, PartEstimate};
+        let text = sql.trim().trim_end_matches(';').trim();
+        let plan = self
+            .plan_combined(text, params, databrain_workspace::Origin::User, tab_connection, session_key)?
+            .ok_or_else(|| EngineError::new("invalid", "Not a combined query"))?;
+        let meta = crate::meta_tab();
+        let four = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut asks = tokio::task::JoinSet::new();
+        for (i, p) in plan.parts.into_iter().enumerate() {
+            let (engine, meta, four) = (self.clone(), meta.clone(), four.clone());
+            asks.spawn(async move {
+                let _turn = four.acquire().await;
+                let base = PartEstimate { name: p.name.clone(), connection: p.connection_name.clone(), ..Default::default() };
+                let traits = p.kind.traits();
+                if !traits.cost_preview {
+                    return (i, PartEstimate { note: Some(format!("not estimated: {} gives no estimate before a run", traits.name)), ..base });
+                }
+                if auto && p.kind != ConnectorKind::Bigquery {
+                    return (i, PartEstimate { note: Some("not estimated while typing (its warehouse could start): press Cost".into()), ..base });
+                }
+                let checked = p.bound.clone();
+                let run = engine.with_tab(&p.connection_id, &meta, move |s| {
+                    let checked = checked.clone();
+                    async move { s.estimate_cost(&checked).await }
+                });
+                let est = match tokio::time::timeout(std::time::Duration::from_secs(60), run).await {
+                    Ok(Ok(Some(e))) => PartEstimate { bytes: e.bytes, over_limit: e.over_limit, method: Some(e.method), ..base },
+                    Ok(Ok(None)) => PartEstimate { note: Some(format!("not estimated: {} gave no estimate", traits.name)), ..base },
+                    Ok(Err(e)) => PartEstimate { note: Some(format!("not estimated: {}", e.message)), ..base },
+                    Err(_) => PartEstimate { note: Some("not estimated: no answer in 60 s".into()), ..base },
+                };
+                (i, est)
+            });
+        }
+        let mut parts: Vec<(usize, PartEstimate)> = Vec::new();
+        while let Some(done) = asks.join_next().await {
+            if let Ok(x) = done {
+                parts.push(x);
+            }
+        }
+        parts.sort_by_key(|(i, _)| *i);
+        let parts: Vec<PartEstimate> = parts.into_iter().map(|(_, p)| p).collect();
+        let known: Vec<u64> = parts.iter().filter_map(|p| p.bytes).collect();
+        Ok(CostEstimate {
+            method: "each part, as written".into(),
+            bytes: (!known.is_empty()).then(|| known.iter().sum()),
+            over_limit: parts.iter().find_map(|p| p.over_limit),
+            notes: vec!["Data read across parts, each as written: pushdown (columns, filters) can only read less.".into()],
+            parts,
+            ..Default::default()
+        })
+    }
+}
+
 /// `stuck` is set when the session is left in a mode where statements don't
 /// run (SQL Server's showplan could not be turned off): the caller drops it.
 async fn explain_on(

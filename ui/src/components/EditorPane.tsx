@@ -1,3 +1,4 @@
+import { looksCombined } from "../lib/cost";
 import { lazy, memo, Suspense, useEffect, useRef, useState } from "react";
 import { ChevronsDownUp, FileCode2, FileText, Gauge, GitCompare, GitFork, LayoutDashboard, Network, Share2, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
@@ -386,7 +387,8 @@ function Toolbar() {
   const [more, setMore] = useState<{ x: number; y: number } | null>(null);
 
   if (!tab) return null;
-  const canCost = !!conn && traitsOf(conn.config.kind).cost_preview;
+  // A combined query's parts are estimated on their own connections.
+  const canCost = !!conn && (traitsOf(conn.config.kind).cost_preview || looksCombined(tab.sql ?? ""));
   const costTitle =
     conn && AUTO_COST_KINDS.has(conn.config.kind)
       ? "What the statement would scan (BigQuery dry run: free, nothing runs). Also checked as you type"
