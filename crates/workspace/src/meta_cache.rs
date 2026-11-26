@@ -37,6 +37,16 @@ pub struct CachedListing {
     pub listed_at: i64,
 }
 
+/// A table's cached whole description ([`Workspace::meta_described`]).
+#[derive(Debug, Clone)]
+pub struct DescribedTable {
+    pub object: DbObject,
+    pub columns: Vec<ColumnInfo>,
+    pub foreign_keys: Vec<ForeignKey>,
+    /// When it was read from the server (ms).
+    pub seen_at: i64,
+}
+
 /// What DataBrain knows of a table without asking the database: the newer
 /// of the explorer cache and the AI index ([`Workspace::meta_table`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -622,14 +632,29 @@ impl Workspace {
     /// A table as described by the server: columns, and its foreign keys
     /// when the caller has them (`None` records them as not known).
     pub fn meta_put_table(&self, connection_id: &str, schema: &str, table: &str, columns: &[ColumnInfo], foreign_keys: Option<&[ForeignKey]>) -> Result<()> {
+        self.meta_put_table_read_at(connection_id, schema, table, columns, foreign_keys, now_ms())
+    }
+
+    /// [`Self::meta_put_table`] for a description read from the server at
+    /// `read_at` (ms; saved later, from a queue): a change DataBrain ran
+    /// between the read and the save is then seen to be newer.
+    pub fn meta_put_table_read_at(
+        &self,
+        connection_id: &str,
+        schema: &str,
+        table: &str,
+        columns: &[ColumnInfo],
+        foreign_keys: Option<&[ForeignKey]>,
+        read_at: i64,
+    ) -> Result<()> {
         let fks = foreign_keys.map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".into()));
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         tx.execute(
-            "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+            "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json, described) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
-             fks_json = excluded.fks_json, stale = 0",
-            params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), now_ms(), fks],
+             fks_json = excluded.fks_json, stale = 0, described = excluded.described",
+            params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), read_at, fks, foreign_keys.is_some()],
         )?;
         // The AI's search row of the table, when it may use it.
         Self::kept_described_tx(&tx, connection_id, schema, table)?;
@@ -652,7 +677,7 @@ impl Workspace {
             tx.execute(
                 "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
-                 fks_json = coalesce(excluded.fks_json, meta_columns.fks_json), stale = 0",
+                 fks_json = coalesce(excluded.fks_json, meta_columns.fks_json), stale = 0, described = 0",
                 params![connection_id, schema, t.table, serde_json::to_string(&t.columns).unwrap_or_else(|_| "[]".into()), now, fks],
             )?;
             Self::kept_described_tx(&tx, connection_id, schema, &t.table)?;
@@ -760,6 +785,46 @@ impl Workspace {
             )
             .optional()?;
         Ok(row.map(|(j, stale)| CachedColumns { columns: serde_json::from_str(&j).unwrap_or_default(), stale }))
+    }
+
+    /// A table's whole description as last read from the server (columns,
+    /// foreign keys, and its object row's comment and row estimate), when
+    /// the cache holds one that is still current: the table tab opens from
+    /// it. `None` when it was never described, may be out of date, or came
+    /// from a schema-wide read (which may lack defaults or keys). Exact
+    /// schema and table names.
+    pub fn meta_described(&self, connection_id: &str, schema: &str, table: &str) -> Result<Option<DescribedTable>> {
+        let row: Option<(String, Option<String>, bool, i64)> = {
+            let c = self.conn.lock();
+            c.query_row(
+                &format!(
+                    "SELECT m.columns_json, m.fks_json, {STALE_SQL}, m.seen_at FROM meta_columns m \
+                     WHERE m.connection_id = ?1 AND m.schema_name = ?2 AND m.table_name = ?3 AND m.described = 1"
+                ),
+                params![connection_id, schema, table, now_ms() - UNLISTED_COLUMNS_TTL_MS],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+        };
+        let Some((columns, Some(fks), false, seen_at)) = row else { return Ok(None) };
+        let (Ok(columns), Ok(fks)) = (serde_json::from_str::<Vec<ColumnInfo>>(&columns), serde_json::from_str::<Vec<ForeignKey>>(&fks)) else {
+            return Ok(None);
+        };
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let Some(object) = self.meta_object(connection_id, schema, table)?.filter(|o| o.name == table && o.schema == schema && o.kind.is_relation()) else {
+            return Ok(None);
+        };
+        Ok(Some(DescribedTable { object, columns, foreign_keys: fks, seen_at }))
+    }
+
+    /// Something may have changed a connection's tables (DDL run on it
+    /// from DataBrain): every cached table of it counts as stale, so the
+    /// next look reads it again.
+    pub fn meta_columns_may_have_changed(&self, connection_id: &str) -> Result<()> {
+        self.conn.lock().execute("UPDATE meta_columns SET stale = 1 WHERE connection_id = ?1 AND stale = 0", params![connection_id])?;
+        Ok(())
     }
 
     /// Cached column names of a table (exact schema id, any-case name).

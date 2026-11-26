@@ -536,6 +536,12 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
     DROP TABLE kn_objects;
     "#,
+    // v27: whether a table's cached columns are a whole description
+    // (describe: defaults, keys, comments), which the table tab opens
+    // from, or a schema-wide read's, which may lack some of it.
+    r#"
+    ALTER TABLE meta_columns ADD COLUMN described INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Workspace {

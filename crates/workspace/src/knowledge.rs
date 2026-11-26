@@ -566,7 +566,8 @@ impl Workspace {
         tx.prepare_cached(
             "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, \
-             seen_at = excluded.seen_at, fks_json = CASE WHEN excluded.fks_json = '[]' AND NOT ?7 THEN fks_json ELSE excluded.fks_json END, stale = 0",
+             seen_at = excluded.seen_at, fks_json = CASE WHEN excluded.fks_json = '[]' AND NOT ?7 THEN fks_json ELSE excluded.fks_json END, stale = 0, \
+             described = 0",
         )?
         .execute(params![
             connection_id,

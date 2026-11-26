@@ -18,7 +18,7 @@ Main files:
    - `meta_catalogs`: catalogs of three-level engines, with `schemas_at` when that catalog's schema list is complete.
    - `meta_schemas`: schema list (`pos`; `pos = 1000000000` marks a schema seen only through a search hit), plus `listed_at` (a complete table listing exists) and `listed_fp` (the schema fingerprint it was listed at).
    - `meta_objects`: tables, views, routines, sequences per schema, with `version` (from `object_versions`) where the engine has one.
-   - `meta_columns`: `columns_json` per table, `fks_json` (its foreign keys; NULL when not known, e.g. rows cached before v19 or written by `meta_put_columns`) and a `stale` flag. No indexes or DDL.
+   - `meta_columns`: `columns_json` per table, `fks_json` (its foreign keys; NULL when not known, e.g. rows cached before v19 or written by `meta_put_columns`), a `stale` flag, and `described` (v27: the row is a whole describe, with defaults and keys, saved with the time it was read; a schema-wide read sets it back to 0). No indexes or DDL.
    - `meta_conn_state`: `checked_at`, `catalogs_at`, `schemas_at` and `identity` (which server the connection pointed at).
 2. **Zustand store** (`explorerSlice.ts`), for the session: `catalogs`, `catalogSchemas`, `schemas`, `objects` (`conn|schema`), `columns` (`conn|schema|table`) and `explorer[conn]` (`checkedAt`, `checking`, `offline`, `fingerprints`, `deferred`). Once a key is in the store, `loadObjects` and `loadColumns` return it without asking the backend again (a schema in `deferred` is refreshed once in the background when opened). `columns` keeps at most `MAX_COLUMN_TABLES` (3,000) tables; the ones loaded first are dropped and read back from the cache when needed.
 
@@ -53,6 +53,11 @@ expand table ──► loadColumns
           (stale: the schema changed since, or the schema was never listed
           in full and the columns are older than 24 h)
    miss → describe (live); meta_put_columns queued (clears stale)
+
+open a table tab ──► describe_object (api::describe_with)
+   meta_described hit (described, not stale, keys known, its meta_objects
+   row there, read after the connection's last DDL in DataBrain) → no query
+   else → describe (live), saved described; Refresh always asks the server
 ```
 
 - **Connect.** There is no separate connect step for the explorer: the first engine call opens the connection's metadata session (`with_meta`, tab key `__meta__` in `crates/query-engine/src/sessions.rs`). A failed call with a connection error reconnects once.
@@ -68,7 +73,7 @@ expand table ──► loadColumns
 - **Fingerprints** (`Session::explorer_fingerprints`, `None` when an engine has none): one catalog query, one opaque value per schema. Equal to `listed_fp` means the cached listing is right and nothing is read. Postgres counts row estimates coarsely (power of two of `reltuples`): when a table's estimate doubles or halves the fingerprint moves while no object version does, and `refresh_schema_at` lists the schema once for the estimates (columns stay fresh); the AI index re-reads it on its next run. Refresh does the same listing.
 - **Object versions** (`Session::object_versions`): one value per object (`kind:name`). `refresh_schema_at` compares them to `meta_objects.version`, fetches only new or changed objects with `list_objects_named` (500 names per call), deletes gone ones and marks the changed tables' columns stale (`meta_apply_changes`). Above 30 % changed and more than 20 objects (`FULL_RELIST_SHARE`) one full listing is cheaper.
 - **No versions:** a changed schema is listed again (`meta_put_listing`) and every table's columns become stale, unless the fingerprint is unchanged.
-- **`stale` on columns** means "show, but describe again when online". It is set only by the listing paths above (`columns_changed`), and cleared by any describe that writes the cache (`api::describe`, grid edits in `query-engine/src/edit.rs`).
+- **`stale` on columns** means "show, but describe again when online". It is set by the listing paths above (`columns_changed`) and, for every table of the connection, by DDL (or a call or block) run on it from DataBrain, a query tab or a load (`QueryEngine::tables_may_have_changed`, which also records the time, so a description read before it and saved after isn't taken as current). It is cleared by any describe that writes the cache (`api::describe`, grid edits in `query-engine/src/edit.rs`).
 - **Deferred schemas:** changed schemas over the 40-per-run cap, schemas that failed to refresh, and, on engines without fingerprints, every listed schema that was not open. The UI refreshes a deferred schema when it is next loaded from the cache.
 
 ### Per engine

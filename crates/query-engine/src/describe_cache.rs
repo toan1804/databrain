@@ -21,6 +21,10 @@ type Slot = Arc<tokio::sync::Mutex<Option<(Instant, ObjectDetail)>>>;
 #[derive(Default)]
 pub(crate) struct DescribeCache {
     slots: Mutex<HashMap<Key, Slot>>,
+    /// When DataBrain last ran something on a connection that may have
+    /// changed its tables (ms): a cached description saved before that
+    /// isn't current, even if its stale mark was written over meanwhile.
+    changed_at: Mutex<HashMap<String, i64>>,
     /// Entries past which old ones are dropped (doubles when they are all
     /// young, so the sweep isn't run on every call while indexing).
     prune_at: Mutex<usize>,
@@ -90,5 +94,23 @@ impl QueryEngine {
     /// Forget the connection's table descriptions (see [`DescribeCache`]).
     pub fn forget_descriptions(&self, connection_id: &str) {
         self.describes.forget(connection_id);
+    }
+
+    /// Something run on the connection may have changed its tables (DDL,
+    /// a call or block, a load that creates a table): its kept
+    /// descriptions go, and the explorer cache's tables of it count as
+    /// stale, so neither the explorer nor a table tab shows them as current.
+    pub fn tables_may_have_changed(&self, connection_id: &str) {
+        self.forget_descriptions(connection_id);
+        self.describes.changed_at.lock().insert(connection_id.to_string(), databrain_workspace::now_ms());
+        if let Err(e) = self.workspace.meta_columns_may_have_changed(connection_id) {
+            tracing::warn!(error = %e, "could not mark cached tables stale");
+        }
+    }
+
+    /// When [`Self::tables_may_have_changed`] last ran for the connection
+    /// in this process (ms), if it did.
+    pub fn tables_changed_at(&self, connection_id: &str) -> Option<i64> {
+        self.describes.changed_at.lock().get(connection_id).copied()
     }
 }

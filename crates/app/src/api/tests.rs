@@ -651,6 +651,77 @@ async fn er_diagram_works_offline_from_the_cache() {
     assert!(schema_tables(&st, &p.id, "other").await.is_err());
 }
 
+/// The table tab opens from the explorer cache's description: once a
+/// table was described, opening it again asks the server nothing (a
+/// change made outside DataBrain shows after Refresh, as the explorer's
+/// own check would find it). DDL run in DataBrain, a cache filled by a
+/// schema-wide read (no defaults on some engines), and Refresh ask the
+/// server.
+#[tokio::test]
+async fn table_tab_opens_from_the_cached_description() {
+    let (st, _sink, dir) = state();
+    let db = dir.path().join("t.db");
+    let mut cfg = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    cfg.file_path = Some(db.to_string_lossy().into());
+    let p = save_profile(&st, "t", cfg, None);
+    exec(
+        &st,
+        &p.id,
+        "create table parent (id integer primary key); create table t (id integer primary key, name text default 'x', pid integer references parent (id))",
+    )
+    .await;
+    let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
+    list_objects(&st, &p.id, &main).await.unwrap();
+    let names = |d: &ObjectDetail| d.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    let first = describe_with(&st, &p.id, &main, "t", false).await.unwrap();
+    assert_eq!(names(&first), ["id", "name", "pid"]);
+    flush_explorer_cache(&st).await;
+
+    // Changed behind the run loop's back (as by another program): the cached description.
+    exec(&st, &p.id, "alter table t add column outside text").await;
+    st.engine.forget_descriptions(&p.id);
+    let cached = describe_with(&st, &p.id, &main, "t", false).await.unwrap();
+    assert_eq!(names(&cached), ["id", "name", "pid"], "from the cache");
+    assert_eq!(cached.columns[1].default.as_deref(), first.columns[1].default.as_deref(), "with what describe read");
+    assert_eq!(cached.foreign_keys.len(), 1);
+    assert_eq!((cached.object.name.as_str(), cached.object.kind), ("t", databrain_connector_core::ObjectKind::Table));
+    // Refresh asks the server.
+    let fresh = describe_with(&st, &p.id, &main, "t", true).await.unwrap();
+    assert_eq!(names(&fresh), ["id", "name", "pid", "outside"]);
+    flush_explorer_cache(&st).await;
+
+    // DDL run in DataBrain: its tables count as changed; the next open asks the server.
+    let ddl = RunRequest {
+        connection_id: p.id.clone(),
+        tab_id: "t1".into(),
+        sql: "alter table t add column inside text".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Default::default(),
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+        part_rows: None,
+        pushdown: None,
+    };
+    st.engine.run_and_wait(&st.hub, ddl, None).await.unwrap();
+    assert!(st.workspace.meta_described(&p.id, &main, "t").unwrap().is_none(), "marked stale");
+    let after = describe_with(&st, &p.id, &main, "t", false).await.unwrap();
+    assert_eq!(names(&after), ["id", "name", "pid", "outside", "inside"]);
+    flush_explorer_cache(&st).await;
+    assert!(st.workspace.meta_described(&p.id, &main, "t").unwrap().is_some(), "described again: current");
+
+    // A schema-wide read (the ER diagram) replaces it with less: not a description.
+    schema_tables(&st, &p.id, &main).await.unwrap();
+    flush_explorer_cache(&st).await;
+    assert!(st.workspace.meta_described(&p.id, &main, "t").unwrap().is_none(), "a schema-wide read isn't a description");
+    exec(&st, &p.id, "alter table t add column late text").await;
+    st.engine.forget_descriptions(&p.id);
+    assert_eq!(names(&describe_with(&st, &p.id, &main, "t", false).await.unwrap()).last().map(String::as_str), Some("late"), "asked the server");
+}
+
 fn save_profile_update(st: &AppState, p: ConnectionProfile) {
     save_connection(st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
 }
