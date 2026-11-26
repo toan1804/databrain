@@ -6,6 +6,6 @@
 export type ParamSpan = { name: string, start: number, end: number, 
 /**
  * Oracle substitution variable (`&name`, `&&name`, SQL*Plus style): the
- * value replaces the text as typed (also inside `'…'`), not as a literal.
+ * value replaces the text as typed, not as a literal.
  */
 textual: boolean, };
