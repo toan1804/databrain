@@ -56,6 +56,10 @@ impl DescribeCache {
         self.part_types.lock().get(&(connection_id.to_string(), sql.to_string())).cloned()
     }
 
+    pub(crate) fn drop_part_types(&self, connection_id: &str, sql: &str) {
+        self.part_types.lock().remove(&(connection_id.to_string(), sql.to_string()));
+    }
+
     pub(crate) fn keep_part_types(&self, connection_id: &str, sql: &str, types: Vec<(String, crate::pushdown::TypeClass)>) {
         let mut g = self.part_types.lock();
         if g.len() >= PART_TYPES_KEEP

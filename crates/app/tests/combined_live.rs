@@ -154,6 +154,9 @@ async fn pushdown_gives_the_same_rows_on_real_servers() {
             format!("with t as ({part}) select id from t where ts = '2024-01-01 10:00:00'"),
             format!("with t as ({part}) select id from t where ts between '2024-01-01 09:00:00' and '2024-01-01 10:00:00'"),
             format!("with t as ({part}) select id from t where ts in ('2024-01-01 09:00:00', '2024-01-02 08:30:00')"),
+            // A limit with a WHERE the server may read case-insensitively (MySQL's and SQL Server's collations).
+            format!("with t as ({part}) select id from t where name = 'A' limit 1"),
+            format!("with t as ({part}) select id from t where name in ('A', 'b') limit 1"),
         ];
         for q in &queries {
             let on = rows(&st, &run(&st, &p.id, q, Some(true)).await);

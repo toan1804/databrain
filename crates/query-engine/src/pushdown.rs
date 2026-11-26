@@ -86,9 +86,12 @@ impl TypeClass {
         if kind == ConnectorKind::Mysql && matches!(base_type, "timestamp" | "year") {
             return TypeClass::Other;
         }
-        // DuckDB's TIMESTAMP_NS holds nanoseconds: not one of the
-        // microsecond timestamps `micros_only` pushes more on.
-        if kind == ConnectorKind::Duckdb && matches!(t, DataType::Timestamp(databrain_connector_core::arrow::datatypes::TimeUnit::Nanosecond, None)) {
+        // DuckDB keeps a timestamp's unit: TIMESTAMP_NS holds nanoseconds,
+        // and TIMESTAMP_S / _MS read a finer literal cut to their unit (the
+        // server's microsecond comparison would drop what DuckDB keeps).
+        // Only microseconds are a Timestamp there.
+        if kind == ConnectorKind::Duckdb && matches!(t, DataType::Timestamp(u, None) if *u != databrain_connector_core::arrow::datatypes::TimeUnit::Microsecond)
+        {
             return TypeClass::Other;
         }
         match TypeClass::of(t) {
@@ -1072,7 +1075,9 @@ mod tests {
         assert!(pushed("ts > '2024-01-01'", Mssql), "as before");
         // DuckDB's TIMESTAMP_NS holds nanoseconds: not a microsecond timestamp.
         use databrain_connector_core::arrow::datatypes::TimeUnit;
-        assert_eq!(TypeClass::of_column(&DataType::Timestamp(TimeUnit::Nanosecond, None), None, Duckdb), Other);
+        for u in [TimeUnit::Nanosecond, TimeUnit::Millisecond, TimeUnit::Second] {
+            assert_eq!(TypeClass::of_column(&DataType::Timestamp(u, None), None, Duckdb), Other, "{u:?}");
+        }
         assert_eq!(TypeClass::of_column(&DataType::Timestamp(TimeUnit::Microsecond, None), None, Duckdb), Timestamp);
     }
 
