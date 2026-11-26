@@ -483,8 +483,9 @@ impl Ctx<'_> {
                 // arrives as NULL (PostgreSQL's ±infinity dates and
                 // timestamps, numeric NaN, MySQL's zero dates), which the
                 // server's IS NULL drops and DuckDB keeps. SQLite's columns
-                // hold any type.
-                let keeps_nulls = matches!(e, Expr::IsNull(_)) != negated;
+                // hold any type. Under a NOT (once or twice: `negated` doesn't
+                // count them) either may mean IS NULL: neither is pushed.
+                let keeps_nulls = matches!(e, Expr::IsNull(_)) || negated;
                 if keeps_nulls && (matches!(t, TypeClass::Date | TypeClass::Timestamp | TypeClass::Decimal) || parts[i].kind == ConnectorKind::Sqlite) {
                     return None;
                 }
@@ -978,10 +979,18 @@ mod tests {
             run(&format!("with o as (select * from results.r1) select id from o where {w}"), &[("o", k, "select * from t", Some(&o))])[0].clone()
         };
         let filtered = |p: Option<Pushed>| p.is_some_and(|p| p.sent.contains("WHERE"));
-        for w in ["day is null", "at is null", "total is null", "not (day is not null)"] {
+        for w in [
+            "day is null",
+            "at is null",
+            "total is null",
+            "not (day is not null)",
+            "not (id = 1 and not (day is null))",
+            "not (not (day is null))",
+            "not (day is null)",
+        ] {
             assert!(!filtered(one(w, Postgres)), "{w}");
         }
-        for w in ["id is null", "note is null", "ok is null", "day is not null", "total is not null", "not (day is null)"] {
+        for w in ["id is null", "note is null", "ok is null", "day is not null", "total is not null", "not (id is null)"] {
             assert!(filtered(one(w, Postgres)), "{w}");
         }
         assert!(!filtered(one("id is null", Sqlite)));

@@ -214,6 +214,20 @@ async fn pushdown_gives_the_same_rows_on_real_servers() {
                 assert_eq!(on, off, "{kind:?}: {q}");
             }
         }
+        // MySQL's TIMESTAMP and YEAR are never pushed (on a UTC server the
+        // rows would match anyway; what was sent says so).
+        if *kind == ConnectorKind::Mysql {
+            let all: Vec<String> = events
+                .0
+                .lock()
+                .iter()
+                .filter_map(|e| match e {
+                    JobEvent::PartFinished { output, .. } => Some(output.sql.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(all.iter().all(|s| !s.contains("`at_utc` >") && !s.contains("`y` >")), "{all:?}");
+        }
         let drop = if *kind == ConnectorKind::Mssql { "drop table dbo.dbr_pd" } else { "drop table dbr_pd" };
         run(&st, &p.id, drop, None).await;
     }
