@@ -212,6 +212,17 @@ const NO_DATABASE_PROMPT: &str = "You are DataBrain's assistant, embedded in a d
     that could not be set up (its settings and error are in the message). Explain the error, the likely causes and what to change, \
     concisely. You have no tools and no access to any database for this question: answer from the message only.";
 
+/// The note on a turn that has other connections attached: how to work on
+/// each, and that a question over them is a combined query.
+fn connections_hint(current: &str, others: &[ConnectionProfile]) -> String {
+    let names: Vec<String> = others.iter().map(|p| format!("\"{}\" ({})", p.name, p.config.kind.dialect_name())).collect();
+    format!(
+        "\n\n[Connections for this question: \"{}\" (current) and {}. Pass `connection` to list_tables, search_schema, describe_table and run_query to work on another one, in its own dialect. To join or compare them, write a combined query for the user to run (WITH parts starting with @\"Name\", joined in DuckDB); for a quick look, combine run_query outputs with query_outputs over results.<handle>.]",
+        current,
+        names.join(", ")
+    )
+}
+
 pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mode, retrieved: &knowledge::Retrieved, examples: &[(String, String)]) -> String {
     let kind = profile.config.kind;
     let mut s = format!(
@@ -246,12 +257,24 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          failing statement, and the job's spec), find the cause (describe_table on the step's connection, run_query to test a \
          corrected SELECT), then update_job with the complete corrected spec; never create a second job to fix one. \
          To run a job (or some of its steps) and read its outputs: run_job; the user approves each run, so say what it will do.\n\n\
-         Comparing or checking data across connections (row counts, missing or different rows, totals, reconciliations): for a \
-         quick one-off look, run_query on each connection (narrow, filtered queries) and compare the outputs with query_outputs \
-         over results.<handle>. When the user wants it repeatable, kept, saved to a file or a table, scheduled, or the data is \
-         large, propose a job instead: one query step per connection, a Results (DuckDB) step that joins/compares them (e.g. FULL \
-         OUTER JOIN on the key with a status column: only_in_a, only_in_b, different), then optionally a load or export step. \
-         Explain the plan first, create_job (the user approves), then offer run_job and summarise the comparison step's output.\n",
+         Questions over several connections (joining, comparing or checking data across connections: row counts, missing or \
+         different rows, totals, reconciliations): write one combined query for the user in a ```sql block. It is a WITH list \
+         whose parts start with @connection and run on that connection, in its own dialect; the query around them is DuckDB SQL \
+         that joins the parts by their CTE names, e.g.\n\
+         WITH a AS (@\"Sales PG\" SELECT id, total FROM orders WHERE created_at >= '2024-01-01'), \
+         b AS (@\"CRM\" SELECT order_id, amount FROM invoices) \
+         SELECT a.id, a.total, b.amount FROM a FULL OUTER JOIN b ON a.id = b.order_id WHERE a.total IS DISTINCT FROM b.amount\n\
+         Always write a part's connection as @\"Name\" with its exact name from list_connections (a \" in the name is \
+         written twice); an unquoted @name ends at the first character that isn't a letter, digit, _, -, . or $. \
+         Check each part's tables with search_schema / describe_table (connection argument). Each part must be one read (not on MongoDB or Neo4j); \
+         it is read whole (by default it fails past 1,000,000 rows: setting combined_part_rows), so keep parts filtered and narrow (only the columns and rows needed) and \
+         do the joins and comparisons in the outer query. For a comparison, a FULL OUTER JOIN on the key with a status column \
+         (only_in_a, only_in_b, different) works well. You cannot run a combined query yourself: the user runs it from a query \
+         tab, whatever the tab's connection (not from a notebook or dashboard), so say so. For a quick look you may still run_query each connection and compare the outputs with \
+         query_outputs over results.<handle>. Propose a job only when the user wants it saved, kept, loaded into a table, \
+         exported to a file or scheduled: one query step per connection, a Results (DuckDB) step that joins/compares them, \
+         then optionally a load or export step. Explain the plan first, create_job (the user approves), then offer run_job and \
+         summarise the comparison step's output.\n",
         profile.name,
         kind.dialect_name(),
         server.map(|v| format!(" ({v})")).unwrap_or_default(),
@@ -626,12 +649,7 @@ impl Agent {
             }
         }
         if !others.is_empty() {
-            let names: Vec<String> = others.iter().map(|p| format!("\"{}\" ({})", p.name, p.config.kind.dialect_name())).collect();
-            turn_text.push_str(&format!(
-                "\n\n[Connections for this question: \"{}\" (current) and {}. Pass `connection` to list_tables, search_schema, describe_table and run_query to work on another one, in its own dialect; combine their outputs with query_outputs over results.<handle>.]",
-                profile.name,
-                names.join(", ")
-            ));
+            turn_text.push_str(&connections_hint(&profile.name, &others));
         }
         let turn = Message::user(turn_text);
         ws.add_ai_message(&sid, "user", &serde_json::to_value(&turn).unwrap_or_default(), (None, None))?;
@@ -824,6 +842,54 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Over several connections the assistant writes a combined query for
+    /// the user to run, and proposes a job only to keep or schedule it.
+    #[test]
+    fn prompt_writes_combined_queries_across_connections() {
+        use databrain_auth::AuthMethod;
+        use databrain_connector_core::{ConnectionConfig, ConnectorKind};
+        let profile = ConnectionProfile {
+            id: "c1".into(),
+            name: "Shop".into(),
+            config: ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "u".into() }),
+            color: None,
+            env: databrain_workspace::EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let retrieved = knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![], learned_joins: 0 };
+        let p = system_prompt(&profile, None, Mode::Chat, &retrieved, &[]);
+        for needle in [
+            "write one combined query",
+            "start with @connection",
+            "Always write a part's connection as @\"Name\"",
+            "combined_part_rows",
+            "the user runs it from a query",
+        ] {
+            assert!(p.contains(needle), "prompt lacks {needle}");
+        }
+        assert!(p.contains("Propose a job only when the user wants it saved"));
+        assert!(!p.contains("propose a job instead"), "jobs are no longer the default across connections");
+        // The example is a combined query that parses: two parts, on the
+        // connections it names.
+        let start = p.find("WITH a AS (@").expect("an example");
+        let example = &p[start..start + p[start..].find('\n').unwrap()];
+        let mut seen = vec![];
+        let c = databrain_connector_core::sql::parse_combined(example, &mut |r| {
+            seen.push(r.to_string());
+            Ok(ConnectorKind::Postgres)
+        })
+        .unwrap()
+        .expect("a combined query");
+        assert_eq!(c.parts.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(seen, ["Sales PG", "CRM"]);
+        let hint = connections_hint("Shop", std::slice::from_ref(&profile));
+        assert!(hint.contains("write a combined query") && hint.contains("for a quick look"), "{hint}");
+    }
 
     /// A conversation stopped mid tool batch: the unanswered calls get a
     /// result, results without their call are dropped, duplicates removed.
