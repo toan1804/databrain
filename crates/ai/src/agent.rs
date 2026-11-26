@@ -246,12 +246,23 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          failing statement, and the job's spec), find the cause (describe_table on the step's connection, run_query to test a \
          corrected SELECT), then update_job with the complete corrected spec; never create a second job to fix one. \
          To run a job (or some of its steps) and read its outputs: run_job; the user approves each run, so say what it will do.\n\n\
-         Comparing or checking data across connections (row counts, missing or different rows, totals, reconciliations): for a \
-         quick one-off look, run_query on each connection (narrow, filtered queries) and compare the outputs with query_outputs \
-         over results.<handle>. When the user wants it repeatable, kept, saved to a file or a table, scheduled, or the data is \
-         large, propose a job instead: one query step per connection, a Results (DuckDB) step that joins/compares them (e.g. FULL \
-         OUTER JOIN on the key with a status column: only_in_a, only_in_b, different), then optionally a load or export step. \
-         Explain the plan first, create_job (the user approves), then offer run_job and summarise the comparison step's output.\n",
+         Questions over several connections (joining, comparing or checking data across connections: row counts, missing or \
+         different rows, totals, reconciliations): write one combined query for the user in a ```sql block. It is a WITH list \
+         whose parts start with @connection and run on that connection, in its own dialect; the query around them is DuckDB SQL \
+         that joins the parts by their CTE names, e.g.\n\
+         WITH a AS (@\"Sales PG\" SELECT id, total FROM orders WHERE created_at >= '2024-01-01'), \
+         b AS (@crm SELECT order_id, amount FROM invoices) \
+         SELECT a.id, a.total, b.amount FROM a FULL OUTER JOIN b ON a.id = b.order_id WHERE a.total IS DISTINCT FROM b.amount\n\
+         Use each connection's exact name from list_connections (@name when it is one word, else @\"Name\", or @id:<id>); \
+         check each part's tables with search_schema / describe_table (connection argument). Each part must be one read (not on MongoDB or Neo4j); \
+         it is read whole (it fails past 1,000,000 rows), so keep parts filtered and narrow (only the columns and rows needed) and \
+         do the joins and comparisons in the outer query. For a comparison, a FULL OUTER JOIN on the key with a status column \
+         (only_in_a, only_in_b, different) works well. You cannot run a combined query yourself: the user runs it from a query \
+         tab (any tab), so say so. For a quick look you may still run_query each connection and compare the outputs with \
+         query_outputs over results.<handle>. Propose a job only when the user wants it saved, kept, loaded into a table, \
+         exported to a file or scheduled: one query step per connection, a Results (DuckDB) step that joins/compares them, \
+         then optionally a load or export step. Explain the plan first, create_job (the user approves), then offer run_job and \
+         summarise the comparison step's output.\n",
         profile.name,
         kind.dialect_name(),
         server.map(|v| format!(" ({v})")).unwrap_or_default(),
@@ -824,6 +835,33 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Over several connections the assistant writes a combined query for
+    /// the user to run, and proposes a job only to keep or schedule it.
+    #[test]
+    fn prompt_writes_combined_queries_across_connections() {
+        use databrain_auth::AuthMethod;
+        use databrain_connector_core::{ConnectionConfig, ConnectorKind};
+        let profile = ConnectionProfile {
+            id: "c1".into(),
+            name: "Shop".into(),
+            config: ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "u".into() }),
+            color: None,
+            env: databrain_workspace::EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let retrieved = knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![], learned_joins: 0 };
+        let p = system_prompt(&profile, None, Mode::Chat, &retrieved, &[]);
+        for needle in ["write one combined query", "start with @connection", "@\"Sales PG\"", "@id:<id>", "1,000,000 rows", "the user runs it from a query"] {
+            assert!(p.contains(needle), "prompt lacks {needle}");
+        }
+        assert!(p.contains("Propose a job only when the user wants it saved"));
+        assert!(!p.contains("propose a job instead"), "jobs are no longer the default across connections");
+    }
 
     /// A conversation stopped mid tool batch: the unanswered calls get a
     /// result, results without their call are dropped, duplicates removed.
