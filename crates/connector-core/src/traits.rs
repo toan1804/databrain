@@ -135,6 +135,17 @@ pub struct SqlSyntax {
     pub slash_comment: bool,
     /// `[…]` is quoted text.
     pub brackets: bool,
+    /// …where `]]` is an escaped `]` (SQL Server; SQLite's brackets have no
+    /// escape).
+    pub bracket_doubling: bool,
+    /// `/* a /* b */ c */` is one comment (SQL Server, DuckDB). Off where
+    /// unsure: reading a nesting the server doesn't do would take code
+    /// that runs for a comment. Off for the `Postgres` kind, which also
+    /// connects Redshift, CockroachDB and Greenplum.
+    pub nested_block_comments: bool,
+    /// `--` starts a comment only before whitespace, a control character or
+    /// the end (MySQL, MariaDB): `5--1` is `5 - -1`.
+    pub dash_comment_needs_space: bool,
     pub dollar: DollarQuotes,
     /// `'''…'''` / `"""…"""`.
     pub triple_quotes: bool,
@@ -408,6 +419,9 @@ pub const STANDARD_SYNTAX: SqlSyntax = SqlSyntax {
     hash_comment: false,
     slash_comment: false,
     brackets: false,
+    bracket_doubling: false,
+    nested_block_comments: false,
+    dash_comment_needs_space: false,
     dollar: DollarQuotes::None,
     triple_quotes: false,
     escape_strings: false,
@@ -557,6 +571,7 @@ pub const MYSQL: SourceTraits = SourceTraits {
         backslash_in_double_quotes: true,
         backtick: true,
         hash_comment: true,
+        dash_comment_needs_space: true,
         delimiter_directive: true,
         // Bodies without DELIMITER: BEGIN … END; (as most clients accept).
         block_end: BlockEnd::EndWord,
@@ -591,6 +606,8 @@ pub const MSSQL: SourceTraits = SourceTraits {
     formatter: "transactsql",
     syntax: SqlSyntax {
         brackets: true,
+        bracket_doubling: true,
+        nested_block_comments: true,
         block_end: BlockEnd::GoLine,
         block_objects: &["PROCEDURE", "PROC", "FUNCTION", "TRIGGER", "VIEW"],
         block_on_alter: true,
@@ -806,7 +823,7 @@ pub const DUCKDB: SourceTraits = SourceTraits {
     explain: Some("EXPLAIN "),
     local: true,
     formatter: "duckdb",
-    syntax: SqlSyntax { dollar: DollarQuotes::Tagged, escape_strings: true, ..STANDARD_SYNTAX },
+    syntax: SqlSyntax { dollar: DollarQuotes::Tagged, escape_strings: true, nested_block_comments: true, ..STANDARD_SYNTAX },
     // Local, in one transaction: fewer, larger statements to parse.
     load: Some(LoadTraits {
         types: TypeNames { timestamp_tz: "TIMESTAMPTZ", ..STANDARD_TYPES },

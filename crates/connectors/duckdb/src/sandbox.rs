@@ -275,6 +275,8 @@ mod tests {
             "create table t2 as select * from t",
             "select * from results.sales",
             "create macro twice(x) as x * 2",
+            // All of it a comment in DuckDB (comments nest): nothing is kept.
+            "/* a /* b */ create view v as select * from results.sales */ select 1",
         ] {
             assert!(refuse_shared_views(sql).is_ok(), "{sql}");
         }
@@ -287,6 +289,8 @@ mod tests {
             "create macro m() as table select * from results.sales",
             "create or replace function f() as table select * from results.sales",
             "/* note */ create view v as select * from results.sales",
+            // A nested comment's first `*/` doesn't end it, and what follows it runs.
+            "/* a /* b */ c */ create view v as select * from results.sales",
             "alter view v rename to results",
         ] {
             let e = refuse_shared_views(sql).expect_err(sql);

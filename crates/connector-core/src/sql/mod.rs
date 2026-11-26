@@ -21,13 +21,13 @@ mod statement;
 
 pub(crate) use classify::keyword_kind;
 pub use classify::{Classification, StatementKind, classify, delta_describe};
-pub use combined::{Combined, CombinedError, CombinedPart, ConnectionRef, looks_combined, parse_combined};
+pub use combined::{Combined, CombinedError, CombinedPart, ConnectionRef, looks_combined, parse_combined, with_list_end};
 pub use mark::MarkType;
 pub use params::{ParamSpan, ParamValue, find_parameters, quote_string, render_param, substitute_known_parameters, substitute_parameters};
 pub use parsed::{ParsedStatement, parse_script};
 pub use read_only::{read_only_allows, unknown_functions};
 pub use redact::{redact_key_values, redact_secrets, redact_text, redact_url_passwords};
-pub use splitter::{StatementSpan, code_text, leading_keyword, split_statements, split_with, statement_at};
+pub use splitter::{StatementSpan, code_text, leading_keyword, split_statements, split_statements_with_parts, split_with, statement_at};
 pub(crate) use splitter::{code_text_values, skip_token, words};
 pub use statement::{Checked, Statement};
 
