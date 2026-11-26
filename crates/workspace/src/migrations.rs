@@ -539,8 +539,13 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     // v27: whether a table's cached columns are a whole description
     // (describe: defaults, keys, comments), which the table tab opens
     // from, or a schema-wide read's, which may lack some of it.
+    // `meta_tables_changed`: when DataBrain last ran something on a
+    // connection that may have changed its tables (DDL, a call, COMMIT);
+    // cached columns read before it count as stale (one row a write, not
+    // an update of every cached table).
     r#"
     ALTER TABLE meta_columns ADD COLUMN described INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE meta_tables_changed (connection_id TEXT PRIMARY KEY, changed_at INTEGER NOT NULL);
     "#,
 ];
 

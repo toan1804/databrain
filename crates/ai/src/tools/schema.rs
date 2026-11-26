@@ -72,11 +72,13 @@ impl ToolContext {
             if recently_unreachable(&target.id) {
                 offline = true;
             } else {
+                // Before the read: saved with it, a change run meanwhile is newer.
+                let read_at = databrain_workspace::now_ms();
                 match self.engine.describe(&target.id, &o.schema, &o.name).await {
                     Ok(d) => {
                         set_unreachable(&target.id, false);
                         if !d.columns.is_empty() {
-                            ws.meta_put_table(&target.id, &o.schema, &o.name, &d.columns, Some(&d.foreign_keys))?;
+                            ws.meta_put_table_read_at(&target.id, &o.schema, &o.name, &d.columns, Some(&d.foreign_keys), read_at)?;
                             if let Some(fresh) = tables.get(&o.full_name())? {
                                 o = fresh;
                             }

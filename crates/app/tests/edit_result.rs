@@ -166,6 +166,8 @@ async fn edits_rows_of_a_single_table_result() {
     // table, so the table is read once more first.
     let ws = st.engine.workspace();
     assert!(ws.meta_columns(&conn, "main", "people").unwrap().is_some_and(|c| c.stale), "DDL ran since");
+    // (A read in the same millisecond as the change counts as before it.)
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     api::edit_target(&st, &info.id).await.unwrap();
     assert!(ws.meta_columns(&conn, "main", "people").unwrap().is_some_and(|c| !c.stale && c.columns.iter().any(|c| c.is_primary_key)));
     run(&st, &conn, "drop view adults").await;

@@ -56,7 +56,7 @@ expand table ──► loadColumns
 
 open a table tab ──► describe_object (api::describe_with)
    meta_described hit (described, not stale, keys known, its meta_objects
-   row there, read after the connection's last DDL in DataBrain) → no query
+   row there, read after the connection's last change in DataBrain) → no query
    else → describe (live), saved described; Refresh always asks the server
 ```
 
@@ -73,7 +73,7 @@ open a table tab ──► describe_object (api::describe_with)
 - **Fingerprints** (`Session::explorer_fingerprints`, `None` when an engine has none): one catalog query, one opaque value per schema. Equal to `listed_fp` means the cached listing is right and nothing is read. Postgres counts row estimates coarsely (power of two of `reltuples`): when a table's estimate doubles or halves the fingerprint moves while no object version does, and `refresh_schema_at` lists the schema once for the estimates (columns stay fresh); the AI index re-reads it on its next run. Refresh does the same listing.
 - **Object versions** (`Session::object_versions`): one value per object (`kind:name`). `refresh_schema_at` compares them to `meta_objects.version`, fetches only new or changed objects with `list_objects_named` (500 names per call), deletes gone ones and marks the changed tables' columns stale (`meta_apply_changes`). Above 30 % changed and more than 20 objects (`FULL_RELIST_SHARE`) one full listing is cheaper.
 - **No versions:** a changed schema is listed again (`meta_put_listing`) and every table's columns become stale, unless the fingerprint is unchanged.
-- **`stale` on columns** means "show, but describe again when online". It is set by the listing paths above (`columns_changed`) and, for every table of the connection, by DDL (or a call or block) run on it from DataBrain, a query tab or a load (`QueryEngine::tables_may_have_changed`, which also records the time, so a description read before it and saved after isn't taken as current). It is cleared by any describe that writes the cache (`api::describe`, grid edits in `query-engine/src/edit.rs`).
+- **`stale` on columns** means "show, but describe again when online". It is set by the listing paths above (`columns_changed`). A row also counts as stale when it was read no later than `meta_tables_changed.changed_at`: the time DataBrain last ran DDL (or a call or block, a COMMIT from the toolbar, a load that creates a table) on the connection or another connection to the same database or file (`QueryEngine::tables_may_have_changed`; one row per connection, saved, so a description read before the change and saved after it, or a restart, doesn't make it current). Descriptions are saved with the time they were read. It is cleared by any describe that writes the cache (`api::describe`, grid edits in `query-engine/src/edit.rs`).
 - **Deferred schemas:** changed schemas over the 40-per-run cap, schemas that failed to refresh, and, on engines without fingerprints, every listed schema that was not open. The UI refreshes a deferred schema when it is next loaded from the cache.
 
 ### Per engine

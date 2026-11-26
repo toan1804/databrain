@@ -420,7 +420,12 @@ pub async fn describe_with(state: &AppState, id: &str, schema: &str, name: &str,
     if !d.columns.is_empty() {
         let (ws, id2, s2, n2, cols, fks) =
             (state.workspace.clone(), id.to_string(), schema.to_string(), name.to_string(), d.columns.clone(), d.foreign_keys.clone());
-        state.meta.push_blocking(move || drop(ws.meta_put_table_read_at(&id2, &s2, &n2, &cols, Some(&fks), read_at)));
+        // Its comment and row estimate too: the tab opened from the cache shows them.
+        let object = databrain_connector_core::DbObject { schema: schema.to_string(), name: name.to_string(), ..d.object.clone() };
+        state.meta.push_blocking(move || {
+            let _ = ws.meta_put_described_object(&id2, &object);
+            drop(ws.meta_put_table_read_at(&id2, &s2, &n2, &cols, Some(&fks), read_at))
+        });
     }
     Ok(d)
 }
@@ -436,9 +441,6 @@ fn described_from_cache(state: &AppState, id: &str, schema: &str, name: &str) ->
         return None;
     }
     let t = state.engine.workspace().meta_described(id, schema, name).ok().flatten()?;
-    if state.engine.tables_changed_at(id).is_some_and(|at| t.seen_at <= at) {
-        return None;
-    }
     Some(ObjectDetail { object: t.object, columns: t.columns, ddl: None, foreign_keys: t.foreign_keys })
 }
 

@@ -663,7 +663,9 @@ async fn table_tab_opens_from_the_cached_description() {
     let db = dir.path().join("t.db");
     let mut cfg = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
     cfg.file_path = Some(db.to_string_lossy().into());
-    let p = save_profile(&st, "t", cfg, None);
+    let p = save_profile(&st, "t", cfg.clone(), None);
+    // Another connection to the same file: DDL run on one is a change for both.
+    let twin = save_profile(&st, "t twin", cfg, None);
     exec(
         &st,
         &p.id,
@@ -672,6 +674,7 @@ async fn table_tab_opens_from_the_cached_description() {
     .await;
     let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
     list_objects(&st, &p.id, &main).await.unwrap();
+    list_objects(&st, &twin.id, &main).await.unwrap();
     let names = |d: &ObjectDetail| d.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
     let first = describe_with(&st, &p.id, &main, "t", false).await.unwrap();
     assert_eq!(names(&first), ["id", "name", "pid"]);
@@ -706,8 +709,14 @@ async fn table_tab_opens_from_the_cached_description() {
         part_rows: None,
         pushdown: None,
     };
+    describe_with(&st, &twin.id, &main, "t", false).await.unwrap();
+    flush_explorer_cache(&st).await;
+    assert!(st.workspace.meta_described(&twin.id, &main, "t").unwrap().is_some());
     st.engine.run_and_wait(&st.hub, ddl, None).await.unwrap();
     assert!(st.workspace.meta_described(&p.id, &main, "t").unwrap().is_none(), "marked stale");
+    assert!(st.workspace.meta_described(&twin.id, &main, "t").unwrap().is_none(), "the same file's other connection too");
+    // A read in the same millisecond as the change counts as before it.
+    tokio::time::sleep(Duration::from_millis(3)).await;
     let after = describe_with(&st, &p.id, &main, "t", false).await.unwrap();
     assert_eq!(names(&after), ["id", "name", "pid", "outside", "inside"]);
     flush_explorer_cache(&st).await;
