@@ -29,3 +29,17 @@ describe("cost preview", () => {
     expect(costLevel(est({ partitions_assigned: 1, partitions_total: 1 }))).toBe("info");
   });
 });
+
+describe("combined queries", () => {
+  it("say what was read across their parts, and which weren't estimated", async () => {
+    const { costSummary, looksCombined } = await import("./cost");
+    const part = (name: string, bytes: number | null, note?: string) => ({ name, connection: "c", bytes, over_limit: null, method: bytes ? "dry run" : null, note: note ?? null });
+    const e = { method: "each part, as written", bytes: 3 * 1024 ** 2, cache_hit: false, notes: [], parts: [part("a", 3 * 1024 ** 2), part("b", null, "not estimated: MySQL gives no estimate")] };
+    expect(costSummary(e)).toBe("reads 3.0 MiB across 1 of 2 parts, as written");
+    expect(costSummary({ ...e, bytes: null, parts: [part("b", null)] })).toBe("no part estimated (1 part)");
+    expect(looksCombined("with a as (@pg select 1) select * from a")).toBe(true);
+    expect(looksCombined("WITH a AS (\n  @\"Sales\" select 1) select * from a")).toBe(true);
+    expect(looksCombined("select @x")).toBe(false);
+    expect(looksCombined("with a as (select 1) select * from a")).toBe(false);
+  });
+});

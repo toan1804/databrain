@@ -1,6 +1,6 @@
 import { AlertTriangle, Gauge, Loader2, RefreshCw, X } from "lucide-react";
 import { estimateCost, useCost } from "../../costPreview";
-import { costLevel, costSummary } from "../../lib/cost";
+import { costLevel, costSummary, fmtBytes } from "../../lib/cost";
 import { sqlPreview } from "../../lib/util";
 
 /** The cost preview of the tab's statement, next to the slow-query tips. */
@@ -41,6 +41,17 @@ export function CostBar({ tabId }: { tabId: string }) {
             {sqlPreview(s.sql, 80)}
           </span>
         </div>
+        {s.status === "ready" && (s.estimate.parts?.length ?? 0) > 0 && (
+          <ul className="text-[11.5px]" aria-label="Parts">
+            {s.estimate.parts!.map((p) => (
+              <li key={p.name} className={p.over_limit != null ? "text-warning" : undefined}>
+                <span className="font-mono">{p.name}</span> <span className="text-muted">on {p.connection}:</span>{" "}
+                {p.bytes != null ? `${fmtBytes(p.bytes)}${p.method ? ` (${p.method})` : ""}` : <span className="text-muted">{p.note ?? "not estimated"}</span>}
+                {p.over_limit != null && ` — over its limit of ${fmtBytes(p.over_limit)}`}
+              </li>
+            ))}
+          </ul>
+        )}
         {s.status === "ready" && s.estimate.notes.length > 0 && (
           <ul className="text-[11.5px] text-muted">
             {s.estimate.notes.map((n) => (

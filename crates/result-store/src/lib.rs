@@ -881,6 +881,27 @@ impl ResultStore {
         self.size_of(id).0
     }
 
+    /// Bytes in memory of a run's results before statement `index`: its
+    /// statements' (`{job}:{i}`) and their parts' (`{job}/{i}/…`), in one pass.
+    pub fn bytes_before(&self, job: &str, index: usize) -> usize {
+        if index == 0 {
+            return 0;
+        }
+        let rs: Vec<_> = self
+            .results
+            .lock()
+            .iter()
+            .filter(|(k, _)| {
+                k.strip_prefix(job).is_some_and(|rest| {
+                    let n = rest.strip_prefix(':').or_else(|| rest.strip_prefix('/')).map(|r| r.split(['/', ':']).next().unwrap_or(""));
+                    n.and_then(|n| n.parse::<usize>().ok()).is_some_and(|i| i < index)
+                })
+            })
+            .map(|(_, r)| r.clone())
+            .collect();
+        rs.iter().map(|r| r.lock().memory_bytes()).sum()
+    }
+
     /// Bytes `id` keeps in memory, and whether its rows are on disk.
     pub fn size_of(&self, id: &str) -> (usize, bool) {
         let rs = self.results.lock().get(id).cloned();

@@ -44,8 +44,9 @@ pub(crate) async fn estimate_cost(
     session_key: String,
     sql: String,
     params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>,
+    auto: Option<bool>,
 ) -> R<databrain_connector_core::CostEstimate> {
-    api::estimate_cost(&state, &connection_id, &session_key, &sql, &params.unwrap_or_default()).await
+    api::estimate_cost(&state, &connection_id, &session_key, &sql, &params.unwrap_or_default(), auto.unwrap_or(false)).await
 }
 
 #[tauri::command]

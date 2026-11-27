@@ -5,6 +5,7 @@
 // their EXPLAIN uses the warehouse, and a stopped Databricks warehouse starts.
 // Shown next to the slow-query tips, above the result.
 
+import { looksCombined } from "./lib/cost";
 import { create } from "zustand";
 import { editorBridge } from "./editorBridge";
 import { api, toError } from "./lib/api";
@@ -102,11 +103,17 @@ export async function estimateCost(tabId: string, auto = false): Promise<void> {
     return;
   }
   const kind = conn.config.kind;
-  if (!traitsOf(kind).cost_preview) {
+  // A combined query is estimated part by part, whatever the tab's connection.
+  const mayCombine = looksCombined(useStore.getState().tabs.find((t) => t.id === tabId)?.sql ?? "");
+  if (!traitsOf(kind).cost_preview && !mayCombine) {
     if (!auto) st.toast(`${traitsOf(kind).name} gives no cost estimate before a run: use Plan for its query plan`, "info");
     return;
   }
   const sql = (await statementOf(tabId, kind)).trim();
+  if (!traitsOf(kind).cost_preview && !looksCombined(sql)) {
+    if (!auto) st.toast(`${traitsOf(kind).name} gives no cost estimate before a run: use Plan for its query plan`, "info");
+    return;
+  }
   if (!sql) {
     if (!auto) st.toast("Nothing to estimate: put the cursor in a statement", "info");
     return;
@@ -124,7 +131,7 @@ export async function estimateCost(tabId: string, auto = false): Promise<void> {
   // Only the latest request of the tab may land, and only while the tab is still on its connection.
   const current = () => useCost.getState().byTab[tabId] === req && useStore.getState().tabs.find((t) => t.id === tabId)?.connection_id === conn.id;
   try {
-    const estimate = await api.estimateCost(conn.id, tabId, sql, params);
+    const estimate = await api.estimateCost(conn.id, tabId, sql, params, auto);
     if (current()) useCost.getState().set(tabId, { ...base, status: "ready", estimate });
   } catch (e) {
     if (current()) useCost.getState().set(tabId, { ...base, status: "error", message: toError(e).message });

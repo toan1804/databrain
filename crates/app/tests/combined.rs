@@ -534,6 +534,46 @@ async fn kept_part_types_that_changed_are_read_again() {
     assert!(again[0].notices.iter().any(|n| n.contains("column types had changed")), "{:?}", again[0].notices);
 }
 
+/// A combined statement's parts share its memory: two that each fit but
+/// not together are both read whole, one of them on disk, and the join's
+/// rows and types are the ones it has with a large budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn parts_share_the_statements_memory() {
+    let s = setup().await;
+    s.ok(
+        &s.sales,
+        "create table wide (id integer, s text, amount numeric(12,2), at text); \
+         with recursive n(i) as (select 1 union all select i + 1 from n where i < 30000) \
+         insert into wide select i, hex(randomblob(40)), i / 100.0, datetime('2024-01-01', '+' || i || ' seconds') from n",
+    )
+    .await;
+    let q = "with a as (@\"Sales DB\" select id, s, amount from wide), b as (@\"Sales DB\" select id, s, at from wide) \
+             select count(*), round(sum(a.amount), 2), min(b.at) from a join b using (id)";
+    let mut off = req(&s.sales, "m1", q);
+    off.pushdown = Some(false);
+    let large = s.run(off.clone()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    databrain_app::api::set_results_spill(&s.st.engine, dir.path());
+    s.st.engine.outputs().set_budget(0); // the 16 MB floor: 8 MB a statement
+    let small = s.run(off).await.unwrap();
+    // One part alone fits in the statement's memory.
+    let alone = "with a as (@\"Sales DB\" select id, s, amount from wide) select count(*) from a";
+    let mut one = req(&s.sales, "m2", alone);
+    one.pushdown = Some(false);
+    s.run(one).await.unwrap();
+    let single: Vec<_> = s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "m2" && o.part.is_some() && o.active).collect();
+    assert_eq!(single.iter().filter(|o| o.spilled).count(), 0, "{:?}", single.iter().map(|o| (o.bytes, o.spilled)).collect::<Vec<_>>());
+    assert!(small[0].error.is_none(), "{:?}", small[0].error);
+    assert_eq!(s.rows(&small[0]), s.rows(&large[0]));
+    assert_eq!(small[0].result.as_ref().unwrap().columns, large[0].result.as_ref().unwrap().columns);
+    let parts: Vec<_> = s.st.engine.outputs().list().into_iter().filter(|o| o.tab_id == "m1" && o.part.is_some() && o.active).collect();
+    assert_eq!(parts.len(), 2);
+    // On disk: one alone fits (above), together they don't (both may go
+    // when they pass the cap at once).
+    assert!(parts.iter().any(|o| o.spilled), "{:?}", parts.iter().map(|o| (o.bytes, o.spilled)).collect::<Vec<_>>());
+    assert!(parts.iter().all(|o| !o.truncated));
+}
+
 /// A CTE that names its columns reads a part's columns by place: kept types
 /// whose names come in another order now (the table was made again) are
 /// old, and the run is done again with them read anew.

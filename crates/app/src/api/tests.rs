@@ -2105,9 +2105,38 @@ async fn cost_preview_is_refused_without_an_estimate() {
         ssh: None,
     };
     let p = save_profile(&st, "c", cfg, None);
-    let e = estimate_cost(&st, &p.id, "tab", "select 1", &Default::default()).await.unwrap_err();
+    let e = estimate_cost(&st, &p.id, "tab", "select 1", &Default::default(), false).await.unwrap_err();
     assert_eq!(e.kind, "unsupported", "{}", e.message);
     assert!(e.message.contains("SQLite"), "{}", e.message);
+}
+
+/// A combined query's cost preview: each part on its own connection (here
+/// SQLite, which gives no estimate: said per part), parameters bound in
+/// each part's dialect, on any tab; no sum when nothing was estimated.
+#[tokio::test]
+async fn cost_of_a_combined_query_is_per_part() {
+    let (st, _sink, dir) = state();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join("p.db").to_string_lossy().into());
+    let p = save_profile(&st, "shop", c, None);
+    exec(&st, &p.id, "create table t (id int)").await;
+    let params = std::collections::HashMap::from([("n".to_string(), databrain_connector_core::sql::ParamValue { value: "3".into(), raw: false })]);
+    let e = estimate_cost(&st, &p.id, "tab", "with a as (@shop select id from t where id > :n), b as (@shop select 1 x) select * from a, b", &params, false)
+        .await
+        .unwrap();
+    assert_eq!(e.parts.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert!(e.parts.iter().all(|x| x.connection == "shop" && x.bytes.is_none() && x.note.as_deref().is_some_and(|n| n.contains("SQLite"))), "{e:?}");
+    assert_eq!(e.bytes, None);
+    // A `@` that isn't a part (in a string, a BigQuery parameter): estimated as any statement.
+    let plain = estimate_cost(&st, &p.id, "tab", "with u as (select 'a@b.com' x) select * from u", &Default::default(), false).await.unwrap_err();
+    assert_eq!(plain.kind, "unsupported", "{}", plain.message);
+    assert!(plain.message.contains("SQLite gives no cost estimate"), "{}", plain.message);
+    // One statement at a time.
+    let two = estimate_cost(&st, &p.id, "tab", "with a as (@shop select 1 x) select * from a; select 2", &Default::default(), false).await.unwrap_err();
+    assert!(two.message.contains("one statement at a time"), "{}", two.message);
+    // A part that writes is refused as a run would refuse it.
+    let w = estimate_cost(&st, &p.id, "tab", "with a as (@shop delete from t returning id) select * from a", &Default::default(), false).await.unwrap_err();
+    assert!(w.message.contains("must be a query that only reads"), "{}", w.message);
 }
 
 /// Settings → Results memory: automatic from the computer's memory, or a
